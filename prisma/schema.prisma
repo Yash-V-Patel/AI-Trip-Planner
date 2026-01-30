@@ -1,0 +1,292 @@
+// prisma/schema.prisma
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+model User {
+  id        String   @id @default(cuid())
+  email     String   @unique
+  name      String?
+  password  String
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  
+  trips     Trip[]
+  
+  @@map("users")
+}
+
+model Trip {
+  id          String   @id @default(cuid())
+  title       String
+  destination String
+  description String?
+  
+  // Trip details
+  startDate   DateTime
+  endDate     DateTime
+  budget      Float?
+  travelers   Int      @default(1)
+  
+  // AI-generated content
+  itinerary   Json?    // Store AI-generated itinerary as JSON
+  recommendations Json? // Store AI recommendations
+  
+  // User preferences
+  interests   String[] // Array of interests
+  
+  // Status
+  status      TripStatus @default(PLANNING)
+  
+  // Timestamps
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+  
+  // Relations
+  userId      String
+  user        User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  
+  // Trip components
+  activities  Activity[]
+  hotels      Hotel[]
+  transports  Transport[]
+  stores      Store[]
+  
+  @@index([userId])
+  @@map("trips")
+}
+
+model Activity {
+  id          String   @id @default(cuid())
+  title       String
+  description String?
+  
+  // Activity details
+  date        DateTime
+  startTime   String?
+  endTime     String?
+  location    String?
+  cost        Float?   @default(0)
+  
+  // Category
+  category    ActivityCategory @default(SIGHTSEEING)
+  
+  // AI-generated
+  aiNotes     String?
+  
+  // Timestamps
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+  
+  // Relations
+  tripId      String
+  trip        Trip     @relation(fields: [tripId], references: [id], onDelete: Cascade)
+  
+  @@index([tripId])
+  @@map("activities")
+}
+
+model Hotel {
+  id            String   @id @default(cuid())
+  name          String
+  description   String?
+  
+  // Hotel details
+  checkIn       DateTime
+  checkOut      DateTime
+  address       String
+  city          String
+  country       String
+  rating        Float?   @default(0)
+  pricePerNight Float?
+  totalCost     Float?
+  
+  // Contact
+  phone         String?
+  email         String?
+  website       String?
+  
+  // Amenities
+  amenities     String[]
+  
+  // Room details
+  roomType      String
+  roomNumber    String?
+  
+  // Status
+  bookingStatus BookingStatus @default(PENDING)
+  
+  // AI-generated
+  aiNotes       String?
+  
+  // Timestamps
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+  
+  // Relations
+  tripId        String
+  trip          Trip     @relation(fields: [tripId], references: [id], onDelete: Cascade)
+  
+  @@index([tripId])
+  @@map("hotels")
+}
+
+model Transport {
+  id          String   @id @default(cuid())
+  type        TransportType @default(TAXI)
+  serviceName String?  // e.g., Uber, Local Taxi, etc.
+  
+  // Transport details
+  pickupLocation   String
+  dropoffLocation  String
+  pickupTime       DateTime
+  estimatedArrival DateTime?
+  
+  // Vehicle details
+  vehicleType      String?  // e.g., Sedan, SUV, Bike
+  vehicleNumber    String?
+  driverName       String?
+  driverContact    String?
+  
+  // Pricing
+  estimatedFare    Float?
+  actualFare       Float?
+  paymentMethod    PaymentMethod?
+  isPaid           Boolean @default(false)
+  
+  // Status
+  status          TransportStatus @default(BOOKED)
+  
+  // AI-generated
+  aiNotes         String?
+  alternatives    Json?    // Store alternative transport options
+  
+  // Timestamps
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+  
+  // Relations
+  tripId          String
+  trip            Trip     @relation(fields: [tripId], references: [id], onDelete: Cascade)
+  
+  @@index([tripId])
+  @@map("transports")
+}
+
+model Store {
+  id          String   @id @default(cuid())
+  name        String
+  description String?
+  
+  // Store details
+  type        StoreType @default(SHOPPING)
+  address     String
+  city        String
+  country     String
+  category    String?   // e.g., Electronics, Clothing, Souvenirs
+  
+  // Shopping details
+  items       Json?     // Store shopping list as JSON
+  budget      Float?
+  spent       Float?    @default(0)
+  
+  // Timing
+  plannedDate DateTime
+  duration    Int?      // Duration in minutes
+  
+  // Status
+  status      StoreStatus @default(PLANNED)
+  
+  // AI-generated
+  aiNotes     String?
+  recommendations Json?  // Store product recommendations
+  
+  // Timestamps
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+  
+  // Relations
+  tripId      String
+  trip        Trip     @relation(fields: [tripId], references: [id], onDelete: Cascade)
+  
+  @@index([tripId])
+  @@map("stores")
+}
+
+// Enums
+enum TripStatus {
+  PLANNING
+  ONGOING
+  COMPLETED
+  CANCELLED
+}
+
+enum ActivityCategory {
+  SIGHTSEEING
+  FOOD
+  ACCOMMODATION
+  TRANSPORTATION
+  ACTIVITY
+  SHOPPING
+  OTHER
+}
+
+enum BookingStatus {
+  PENDING
+  CONFIRMED
+  CANCELLED
+  CHECKED_IN
+  CHECKED_OUT
+}
+
+enum TransportType {
+  TAXI
+  BUS
+  TRAIN
+  FLIGHT
+  FERRY
+  CAR_RENTAL
+  BICYCLE
+  WALKING
+  OTHER
+}
+
+enum TransportStatus {
+  BOOKED
+  CONFIRMED
+  ON_THE_WAY
+  ARRIVED
+  CANCELLED
+  DELAYED
+  COMPLETED
+}
+
+enum PaymentMethod {
+  CASH
+  CARD
+  DIGITAL_WALLET
+  ONLINE_PAYMENT
+  VOUCHER
+}
+
+enum StoreType {
+  SHOPPING
+  SUPERMARKET
+  DEPARTMENT_STORE
+  BOUTIQUE
+  SOUVENIR_SHOP
+  ELECTRONICS
+  BOOKSTORE
+  OTHER
+}
+
+enum StoreStatus {
+  PLANNED
+  VISITED
+  PURCHASED
+  CANCELLED
+}
