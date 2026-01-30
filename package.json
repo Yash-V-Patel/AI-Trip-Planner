@@ -1,0 +1,24 @@
+{
+  "name": "ai-trip-planner",
+  "version": "1.0.0",
+  "description": "First commit from Yash Patel",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Yash-V-Patel/AI-Trip-Planner.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "bugs": {
+    "url": "https://github.com/Yash-V-Patel/AI-Trip-Planner/issues"
+  },
+  "homepage": "https://github.com/Yash-V-Patel/AI-Trip-Planner#readme",
+  "dependencies": {
+    "express": "^5.2.1"
+  }
+}
