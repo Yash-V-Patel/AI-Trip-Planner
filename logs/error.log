@@ -1,0 +1,176 @@
+[22/Feb/2026:11:42:27 +0530] [UNCAUGHT_EXCEPTION] Cannot set headers after they are sent to the client
+Error [ERR_HTTP_HEADERS_SENT]: Cannot set headers after they are sent to the client
+    at ServerResponse.setHeader (node:_http_outgoing:642:11)
+    at C:\Users\patel\OneDrive\Desktop\My-Project\Major-project\myproject\AI-Trip-Planner\server.js:290:9
+    at AsyncResource.runInAsyncScope (node:async_hooks:213:14)
+    at listener (C:\Users\patel\OneDrive\Desktop\My-Project\Major-project\myproject\AI-Trip-Planner\node_modules\on-finished\index.js:170:15)
+    at onFinish (C:\Users\patel\OneDrive\Desktop\My-Project\Major-project\myproject\AI-Trip-Planner\node_modules\on-finished\index.js:101:5)
+    at callback (C:\Users\patel\OneDrive\Desktop\My-Project\Major-project\myproject\AI-Trip-Planner\node_modules\ee-first\index.js:55:10)
+    at ServerResponse.onevent (C:\Users\patel\OneDrive\Desktop\My-Project\Major-project\myproject\AI-Trip-Planner\node_modules\ee-first\index.js:93:5)
+    at ServerResponse.emit (node:events:520:35)
+    at onFinish (node:_http_outgoing:1026:10)
+    at callback (node:internal/streams/writable:764:21)
+[22/Feb/2026:11:42:55 +0530] [UNCAUGHT_EXCEPTION] Cannot set headers after they are sent to the client
+Error [ERR_HTTP_HEADERS_SENT]: Cannot set headers after they are sent to the client
+    at ServerResponse.setHeader (node:_http_outgoing:642:11)
+    at C:\Users\patel\OneDrive\Desktop\My-Project\Major-project\myproject\AI-Trip-Planner\server.js:290:9
+    at AsyncResource.runInAsyncScope (node:async_hooks:213:14)
+    at listener (C:\Users\patel\OneDrive\Desktop\My-Project\Major-project\myproject\AI-Trip-Planner\node_modules\on-finished\index.js:170:15)
+    at onFinish (C:\Users\patel\OneDrive\Desktop\My-Project\Major-project\myproject\AI-Trip-Planner\node_modules\on-finished\index.js:101:5)
+    at callback (C:\Users\patel\OneDrive\Desktop\My-Project\Major-project\myproject\AI-Trip-Planner\node_modules\ee-first\index.js:55:10)
+    at ServerResponse.onevent (C:\Users\patel\OneDrive\Desktop\My-Project\Major-project\myproject\AI-Trip-Planner\node_modules\ee-first\index.js:93:5)
+    at ServerResponse.emit (node:events:520:35)
+    at onFinish (node:_http_outgoing:1026:10)
+    at callback (node:internal/streams/writable:764:21)
+[22/Feb/2026:11:48:16 +0530] [ERROR] POST /api/auth/register 500 Unknown error
+[22/Feb/2026:11:50:36 +0530] [ERROR] POST /api/auth/register 500 Unknown error
+[22/Feb/2026:11:53:58 +0530] [ERROR] POST /api/auth/register 500 Unknown error
+[22/Feb/2026:11:57:27 +0530] [ERROR] POST /api/auth/register 500 Unknown error
+[22/Feb/2026:12:00:38 +0530] [ERROR] POST /api/auth/register 500 Unknown error
+[22/Feb/2026:12:08:24 +0530] [ERROR] POST /api/auth/register 500 Unknown error
+[22/Feb/2026:12:16:07 +0530] [ERROR] POST /api/auth/register 409 Unknown error
+[22/Feb/2026:12:16:14 +0530] [ERROR] POST /api/auth/register 500 Unknown error
+[22/Feb/2026:12:17:00 +0530] [ERROR] POST /api/auth/register 409 Unknown error
+[22/Feb/2026:12:17:32 +0530] [ERROR] POST /api/auth/register 500 Unknown error
+[22/Feb/2026:12:20:41 +0530] [ERROR] POST /api/auth/register 500 Unknown error
+[22/Feb/2026:12:25:40 +0530] [ERROR] POST /api/auth/register 409 Unknown error
+[22/Feb/2026:12:25:57 +0530] [ERROR] POST /api/auth/register 409 Unknown error
+[22/Feb/2026:12:26:09 +0530] [ERROR] POST /api/auth/register 500 Unknown error
+[22/Feb/2026:12:31:01 +0530] [ERROR] POST /api/auth/register 409 Unknown error
+[22/Feb/2026:12:31:34 +0530] [ERROR] POST /api/auth/register 500 Unknown error
+[22/Feb/2026:12:35:43 +0530] [ERROR] POST /api/auth/register 409 Unknown error
+[22/Feb/2026:12:36:02 +0530] [ERROR] POST /api/auth/register 500 Unknown error
+[22/Feb/2026:12:41:34 +0530] [ERROR] POST /api/auth/register 409 Unknown error
+[22/Feb/2026:12:42:04 +0530] [ERROR] POST /api/auth/register 500 Unknown error
+[22/Feb/2026:12:59:39 +0530] [ERROR] POST /api/auth/register 500 Unknown error
+[22/Feb/2026:13:07:01 +0530] [ERROR] POST /api/auth/register 409 Unknown error
+[22/Feb/2026:13:07:23 +0530] [ERROR] POST /api/auth/register 500 Unknown error
+[22/Feb/2026:13:17:46 +0530] [ERROR] POST /api/auth/register 409 Unknown error
+[22/Feb/2026:13:29:06 +0530] [ERROR] POST /api/auth/change-password 500 Unknown error
+[22/Feb/2026:13:29:43 +0530] [ERROR] POST /api/auth/change-password 500 Unknown error
+[22/Feb/2026:13:30:55 +0530] [ERROR] POST /api/auth/change-password&id=cmlxg44jf0000v3fkrieaasyg PostmanRuntime/7.51.1 Route not found: POST /api/auth/change-password&id=cmlxg44jf0000v3fkrieaasyg
+Error: Route not found: POST /api/auth/change-password&id=cmlxg44jf0000v3fkrieaasyg
+    at C:\Users\patel\OneDrive\Desktop\My-Project\Major-project\myproject\AI-Trip-Planner\server.js:287:17
+    at Layer.handleRequest (C:\Users\patel\OneDrive\Desktop\My-Project\Major-project\myproject\AI-Trip-Planner\node_modules\router\lib\layer.js:152:17)
+    at trimPrefix (C:\Users\patel\OneDrive\Desktop\My-Project\Major-project\myproject\AI-Trip-Planner\node_modules\router\index.js:342:13)
+    at C:\Users\patel\OneDrive\Desktop\My-Project\Major-project\myproject\AI-Trip-Planner\node_modules\router\index.js:297:9
+    at processParams (C:\Users\patel\OneDrive\Desktop\My-Project\Major-project\myproject\AI-Trip-Planner\node_modules\router\index.js:582:12)
+    at next (C:\Users\patel\OneDrive\Desktop\My-Project\Major-project\myproject\AI-Trip-Planner\node_modules\router\index.js:291:5)
+    at C:\Users\patel\OneDrive\Desktop\My-Project\Major-project\myproject\AI-Trip-Planner\node_modules\router\index.js:688:15
+    at next (C:\Users\patel\OneDrive\Desktop\My-Project\Major-project\myproject\AI-Trip-Planner\node_modules\router\index.js:276:14)
+    at router.handle (C:\Users\patel\OneDrive\Desktop\My-Project\Major-project\myproject\AI-Trip-Planner\node_modules\router\index.js:186:3)
+    at router (C:\Users\patel\OneDrive\Desktop\My-Project\Major-project\myproject\AI-Trip-Planner\node_modules\router\index.js:60:12)
+[22/Feb/2026:13:30:55 +0530] [ERROR] POST /api/auth/change-password&id=cmlxg44jf0000v3fkrieaasyg 404 Route not found: POST /api/auth/change-password&id=cmlxg44jf0000v3fkrieaasyg
+[22/Feb/2026:13:31:09 +0530] [ERROR] POST /api/auth/change-password?id=cmlxg44jf0000v3fkrieaasyg 500 Unknown error
+[22/Feb/2026:13:33:01 +0530] [ERROR] POST /api/auth/change-password?id=cmlxg44jf0000v3fkrieaasyg 500 Unknown error
+[22/Feb/2026:13:33:09 +0530] [ERROR] POST /api/auth/change-password?id=cmlxg44jf0000v3fkrieaasyg 500 Unknown error
+[22/Feb/2026:13:41:25 +0530] [ERROR] POST /api/auth/change-password?id=cmlxg44jf0000v3fkrieaasyg 500 Unknown error
+[22/Feb/2026:13:41:43 +0530] [ERROR] POST /api/auth/change-password 500 Unknown error
+[22/Feb/2026:13:45:20 +0530] [ERROR] POST /api/auth/change-password 500 Unknown error
+[22/Feb/2026:14:05:53 +0530] [ERROR] POST /api/auth/register 500 Unknown error
+[22/Feb/2026:14:05:58 +0530] [ERROR] POST /api/auth/register 500 Unknown error
+[22/Feb/2026:14:09:21 +0530] [ERROR] POST /api/auth/register 500 Unknown error
+[22/Feb/2026:14:10:38 +0530] [ERROR] POST /api/auth/register 500 Unknown error
+[22/Feb/2026:14:16:25 +0530] [ERROR] POST /api/auth/logout 500 Unknown error
+[22/Feb/2026:14:17:16 +0530] [ERROR] POST /api/auth/logout 500 Unknown error
+[22/Feb/2026:14:41:10 +0530] [ERROR] POST /api/auth/logout 500 Unknown error
+[22/Feb/2026:14:41:22 +0530] [ERROR] POST /api/auth/change-password 500 Unknown error
+[22/Feb/2026:14:42:28 +0530] [ERROR] POST /api/auth/change-password 401 Unknown error
+[22/Feb/2026:14:42:59 +0530] [ERROR] POST /api/auth/logout 401 Unknown error
+[22/Feb/2026:14:47:14 +0530] [ERROR] GET /api/users/profile 500 Unknown error
+[22/Feb/2026:16:02:04 +0530] [ERROR] POST /api/accommodations 500 Unknown error
+[22/Feb/2026:16:05:57 +0530] [ERROR] POST /api/accommodations 403 Unknown error
+[22/Feb/2026:16:44:59 +0530] [ERROR] POST /api/vendor/apply PostmanRuntime/7.51.1 Route not found: POST /api/vendor/apply
+Error: Route not found: POST /api/vendor/apply
+    at C:\Users\patel\OneDrive\Desktop\My-Project\Major-project\myproject\AI-Trip-Planner\server.js:289:17
+    at Layer.handleRequest (C:\Users\patel\OneDrive\Desktop\My-Project\Major-project\myproject\AI-Trip-Planner\node_modules\router\lib\layer.js:152:17)
+    at trimPrefix (C:\Users\patel\OneDrive\Desktop\My-Project\Major-project\myproject\AI-Trip-Planner\node_modules\router\index.js:342:13)
+    at C:\Users\patel\OneDrive\Desktop\My-Project\Major-project\myproject\AI-Trip-Planner\node_modules\router\index.js:297:9
+    at processParams (C:\Users\patel\OneDrive\Desktop\My-Project\Major-project\myproject\AI-Trip-Planner\node_modules\router\index.js:582:12)
+    at next (C:\Users\patel\OneDrive\Desktop\My-Project\Major-project\myproject\AI-Trip-Planner\node_modules\router\index.js:291:5)
+    at C:\Users\patel\OneDrive\Desktop\My-Project\Major-project\myproject\AI-Trip-Planner\server.js:249:3
+    at Layer.handleRequest (C:\Users\patel\OneDrive\Desktop\My-Project\Major-project\myproject\AI-Trip-Planner\node_modules\router\lib\layer.js:152:17)
+    at trimPrefix (C:\Users\patel\OneDrive\Desktop\My-Project\Major-project\myproject\AI-Trip-Planner\node_modules\router\index.js:342:13)
+    at C:\Users\patel\OneDrive\Desktop\My-Project\Major-project\myproject\AI-Trip-Planner\node_modules\router\index.js:297:9
+[22/Feb/2026:16:44:59 +0530] [ERROR] POST /api/vendor/apply 404 Route not found: POST /api/vendor/apply
+[22/Feb/2026:17:09:28 +0530] [ERROR] POST /api/auth/register 409 Unknown error
+[22/Feb/2026:17:13:16 +0530] [ERROR] POST /api/auth/login 401 Unknown error
+[22/Feb/2026:17:15:20 +0530] [ERROR] POST /api/auth/login 400 Unknown error
+[22/Feb/2026:17:15:26 +0530] [ERROR] POST /api/auth/login 400 Unknown error
+[22/Feb/2026:17:19:26 +0530] [ERROR] POST /api/auth/login 500 Unknown error
+[22/Feb/2026:17:21:58 +0530] [ERROR] POST /api/auth/login 500 Unknown error
+[22/Feb/2026:17:31:48 +0530] [ERROR] POST /api/auth/login 500 Unknown error
+[22/Feb/2026:17:35:45 +0530] [ERROR] POST /api/admin/vendor-applications/cmlxoe5hu0006v3ccmtnepke2/approve PostmanRuntime/7.51.1 Route not found: POST /api/admin/vendor-applications/cmlxoe5hu0006v3ccmtnepke2/approve
+Error: Route not found: POST /api/admin/vendor-applications/cmlxoe5hu0006v3ccmtnepke2/approve
+    at C:\Users\patel\OneDrive\Desktop\My-Project\Major-project\myproject\AI-Trip-Planner\server.js:292:17
+    at Layer.handleRequest (C:\Users\patel\OneDrive\Desktop\My-Project\Major-project\myproject\AI-Trip-Planner\node_modules\router\lib\layer.js:152:17)
+    at trimPrefix (C:\Users\patel\OneDrive\Desktop\My-Project\Major-project\myproject\AI-Trip-Planner\node_modules\router\index.js:342:13)
+    at C:\Users\patel\OneDrive\Desktop\My-Project\Major-project\myproject\AI-Trip-Planner\node_modules\router\index.js:297:9
+    at processParams (C:\Users\patel\OneDrive\Desktop\My-Project\Major-project\myproject\AI-Trip-Planner\node_modules\router\index.js:582:12)
+    at next (C:\Users\patel\OneDrive\Desktop\My-Project\Major-project\myproject\AI-Trip-Planner\node_modules\router\index.js:291:5)
+    at C:\Users\patel\OneDrive\Desktop\My-Project\Major-project\myproject\AI-Trip-Planner\server.js:251:3
+    at Layer.handleRequest (C:\Users\patel\OneDrive\Desktop\My-Project\Major-project\myproject\AI-Trip-Planner\node_modules\router\lib\layer.js:152:17)
+    at trimPrefix (C:\Users\patel\OneDrive\Desktop\My-Project\Major-project\myproject\AI-Trip-Planner\node_modules\router\index.js:342:13)
+    at C:\Users\patel\OneDrive\Desktop\My-Project\Major-project\myproject\AI-Trip-Planner\node_modules\router\index.js:297:9
+[22/Feb/2026:17:35:45 +0530] [ERROR] POST /api/admin/vendor-applications/cmlxoe5hu0006v3ccmtnepke2/approve 404 Route not found: POST /api/admin/vendor-applications/cmlxoe5hu0006v3ccmtnepke2/approve
+[22/Feb/2026:17:37:51 +0530] [ERROR] GET /api/admin/vendors PostmanRuntime/7.51.1 Route not found: GET /api/admin/vendors
+Error: Route not found: GET /api/admin/vendors
+    at C:\Users\patel\OneDrive\Desktop\My-Project\Major-project\myproject\AI-Trip-Planner\server.js:292:17
+    at Layer.handleRequest (C:\Users\patel\OneDrive\Desktop\My-Project\Major-project\myproject\AI-Trip-Planner\node_modules\router\lib\layer.js:152:17)
+    at trimPrefix (C:\Users\patel\OneDrive\Desktop\My-Project\Major-project\myproject\AI-Trip-Planner\node_modules\router\index.js:342:13)
+    at C:\Users\patel\OneDrive\Desktop\My-Project\Major-project\myproject\AI-Trip-Planner\node_modules\router\index.js:297:9
+    at processParams (C:\Users\patel\OneDrive\Desktop\My-Project\Major-project\myproject\AI-Trip-Planner\node_modules\router\index.js:582:12)
+    at next (C:\Users\patel\OneDrive\Desktop\My-Project\Major-project\myproject\AI-Trip-Planner\node_modules\router\index.js:291:5)
+    at C:\Users\patel\OneDrive\Desktop\My-Project\Major-project\myproject\AI-Trip-Planner\server.js:251:3
+    at Layer.handleRequest (C:\Users\patel\OneDrive\Desktop\My-Project\Major-project\myproject\AI-Trip-Planner\node_modules\router\lib\layer.js:152:17)
+    at trimPrefix (C:\Users\patel\OneDrive\Desktop\My-Project\Major-project\myproject\AI-Trip-Planner\node_modules\router\index.js:342:13)
+    at C:\Users\patel\OneDrive\Desktop\My-Project\Major-project\myproject\AI-Trip-Planner\node_modules\router\index.js:297:9
+[22/Feb/2026:17:37:51 +0530] [ERROR] GET /api/admin/vendors 404 Route not found: GET /api/admin/vendors
+[22/Feb/2026:17:39:51 +0530] [ERROR] POST /api/vendor/admin/vendor-applications/cmlxoe5hu0006v3ccmtnepke2/approve PostmanRuntime/7.51.1 Route not found: POST /api/vendor/admin/vendor-applications/cmlxoe5hu0006v3ccmtnepke2/approve
+Error: Route not found: POST /api/vendor/admin/vendor-applications/cmlxoe5hu0006v3ccmtnepke2/approve
+    at C:\Users\patel\OneDrive\Desktop\My-Project\Major-project\myproject\AI-Trip-Planner\server.js:292:17
+    at Layer.handleRequest (C:\Users\patel\OneDrive\Desktop\My-Project\Major-project\myproject\AI-Trip-Planner\node_modules\router\lib\layer.js:152:17)
+    at trimPrefix (C:\Users\patel\OneDrive\Desktop\My-Project\Major-project\myproject\AI-Trip-Planner\node_modules\router\index.js:342:13)
+    at C:\Users\patel\OneDrive\Desktop\My-Project\Major-project\myproject\AI-Trip-Planner\node_modules\router\index.js:297:9
+    at processParams (C:\Users\patel\OneDrive\Desktop\My-Project\Major-project\myproject\AI-Trip-Planner\node_modules\router\index.js:582:12)
+    at next (C:\Users\patel\OneDrive\Desktop\My-Project\Major-project\myproject\AI-Trip-Planner\node_modules\router\index.js:291:5)
+    at C:\Users\patel\OneDrive\Desktop\My-Project\Major-project\myproject\AI-Trip-Planner\node_modules\router\index.js:688:15
+    at next (C:\Users\patel\OneDrive\Desktop\My-Project\Major-project\myproject\AI-Trip-Planner\node_modules\router\index.js:276:14)
+    at AuthMiddleware.authenticate (C:\Users\patel\OneDrive\Desktop\My-Project\Major-project\myproject\AI-Trip-Planner\src\middleware\auth.middleware.js:92:16)
+    at process.processTicksAndRejections (node:internal/process/task_queues:103:5)
+[22/Feb/2026:17:39:51 +0530] [ERROR] POST /api/vendor/admin/vendor-applications/cmlxoe5hu0006v3ccmtnepke2/approve 404 Route not found: POST /api/vendor/admin/vendor-applications/cmlxoe5hu0006v3ccmtnepke2/approve
+[22/Feb/2026:17:40:09 +0530] [ERROR] POST /api/vendor/admin/vendor-applications/cmlxoe5hu0006v3ccmtnepke2/approve PostmanRuntime/7.51.1 Route not found: POST /api/vendor/admin/vendor-applications/cmlxoe5hu0006v3ccmtnepke2/approve
+Error: Route not found: POST /api/vendor/admin/vendor-applications/cmlxoe5hu0006v3ccmtnepke2/approve
+    at C:\Users\patel\OneDrive\Desktop\My-Project\Major-project\myproject\AI-Trip-Planner\server.js:292:17
+    at Layer.handleRequest (C:\Users\patel\OneDrive\Desktop\My-Project\Major-project\myproject\AI-Trip-Planner\node_modules\router\lib\layer.js:152:17)
+    at trimPrefix (C:\Users\patel\OneDrive\Desktop\My-Project\Major-project\myproject\AI-Trip-Planner\node_modules\router\index.js:342:13)
+    at C:\Users\patel\OneDrive\Desktop\My-Project\Major-project\myproject\AI-Trip-Planner\node_modules\router\index.js:297:9
+    at processParams (C:\Users\patel\OneDrive\Desktop\My-Project\Major-project\myproject\AI-Trip-Planner\node_modules\router\index.js:582:12)
+    at next (C:\Users\patel\OneDrive\Desktop\My-Project\Major-project\myproject\AI-Trip-Planner\node_modules\router\index.js:291:5)
+    at C:\Users\patel\OneDrive\Desktop\My-Project\Major-project\myproject\AI-Trip-Planner\node_modules\router\index.js:688:15
+    at next (C:\Users\patel\OneDrive\Desktop\My-Project\Major-project\myproject\AI-Trip-Planner\node_modules\router\index.js:276:14)
+    at AuthMiddleware.authenticate (C:\Users\patel\OneDrive\Desktop\My-Project\Major-project\myproject\AI-Trip-Planner\src\middleware\auth.middleware.js:92:16)
+    at process.processTicksAndRejections (node:internal/process/task_queues:103:5)
+[22/Feb/2026:17:40:09 +0530] [ERROR] POST /api/vendor/admin/vendor-applications/cmlxoe5hu0006v3ccmtnepke2/approve 404 Route not found: POST /api/vendor/admin/vendor-applications/cmlxoe5hu0006v3ccmtnepke2/approve
+[22/Feb/2026:17:40:48 +0530] [ERROR] POST /api/vendor/apply 400 Unknown error
+[22/Feb/2026:17:47:26 +0530] [ERROR] POST /api/admin/vendor-applications/cmlxpo2ed0007v3oovu0rgbl6/approve PostmanRuntime/7.51.1 Route not found: POST /api/admin/vendor-applications/cmlxpo2ed0007v3oovu0rgbl6/approve
+Error: Route not found: POST /api/admin/vendor-applications/cmlxpo2ed0007v3oovu0rgbl6/approve
+    at C:\Users\patel\OneDrive\Desktop\My-Project\Major-project\myproject\AI-Trip-Planner\server.js:292:17
+    at Layer.handleRequest (C:\Users\patel\OneDrive\Desktop\My-Project\Major-project\myproject\AI-Trip-Planner\node_modules\router\lib\layer.js:152:17)
+    at trimPrefix (C:\Users\patel\OneDrive\Desktop\My-Project\Major-project\myproject\AI-Trip-Planner\node_modules\router\index.js:342:13)
+    at C:\Users\patel\OneDrive\Desktop\My-Project\Major-project\myproject\AI-Trip-Planner\node_modules\router\index.js:297:9
+    at processParams (C:\Users\patel\OneDrive\Desktop\My-Project\Major-project\myproject\AI-Trip-Planner\node_modules\router\index.js:582:12)
+    at next (C:\Users\patel\OneDrive\Desktop\My-Project\Major-project\myproject\AI-Trip-Planner\node_modules\router\index.js:291:5)
+    at C:\Users\patel\OneDrive\Desktop\My-Project\Major-project\myproject\AI-Trip-Planner\server.js:251:3
+    at Layer.handleRequest (C:\Users\patel\OneDrive\Desktop\My-Project\Major-project\myproject\AI-Trip-Planner\node_modules\router\lib\layer.js:152:17)
+    at trimPrefix (C:\Users\patel\OneDrive\Desktop\My-Project\Major-project\myproject\AI-Trip-Planner\node_modules\router\index.js:342:13)
+    at C:\Users\patel\OneDrive\Desktop\My-Project\Major-project\myproject\AI-Trip-Planner\node_modules\router\index.js:297:9
+[22/Feb/2026:17:47:26 +0530] [ERROR] POST /api/admin/vendor-applications/cmlxpo2ed0007v3oovu0rgbl6/approve 404 Route not found: POST /api/admin/vendor-applications/cmlxpo2ed0007v3oovu0rgbl6/approve
+[22/Feb/2026:17:49:02 +0530] [ERROR] POST /api/vendor/admin/applications/cmlxpo2ed0007v3oovu0rgbl6/approve 500 Unknown error
+[22/Feb/2026:17:50:29 +0530] [ERROR] POST /api/vendor/admin/applications/cmlxpo2ed0007v3oovu0rgbl6/approve 400 Unknown error
+[22/Feb/2026:17:51:26 +0530] [ERROR] POST /api/vendor/apply 400 Unknown error
+[22/Feb/2026:18:05:00 +0530] [ERROR] POST /api/vendor/apply 400 Unknown error
+[22/Feb/2026:18:10:18 +0530] [ERROR] POST /api/vendor/apply 400 Unknown error
+[22/Feb/2026:18:17:36 +0530] [ERROR] POST /api/accommodations/%7BaccommodationId%7D/rooms 403 Unknown error
+[22/Feb/2026:18:18:11 +0530] [ERROR] POST /api/accommodations/%7BaccommodationId%7D/rooms 403 Unknown error
+[22/Feb/2026:18:19:52 +0530] [ERROR] POST /api/accommodations/%7BaccommodationId%7D/services 403 Unknown error

@@ -1,0 +1,100 @@
+model
+  schema 1.1
+
+type user
+
+type superadmin
+  relations
+    define can_manage_all: [user]
+
+type vendor
+  relations
+    define can_manage_own_accommodations: [user]
+    define superadmin_access: [user]
+
+type profile
+  relations
+    define can_edit: owner
+    define can_view: owner
+    define owner: [user]
+
+type travelplan
+  relations
+    define can_delete: owner or superadmin_access
+    define can_edit: owner or editor or superadmin_access
+    define can_share: owner or superadmin_access
+    define can_suggest: owner or editor or suggester or superadmin_access
+    define can_view: owner or viewer or editor or suggester or superadmin_access
+    define editor: [user]
+    define owner: [user]
+    define suggester: [user]
+    define superadmin_access: [user]
+    define viewer: [user]
+
+type accommodation
+  relations
+    define can_delete: owner or superadmin_access
+    define can_edit: owner or manager or editor or superadmin_access
+    define can_manage_rooms: owner or manager or superadmin_access
+    define can_manage_services: owner or manager or superadmin_access
+    define can_update: owner or manager or superadmin_access
+    define can_view: owner or manager or editor or viewer or superadmin_access
+    define editor: [user]
+    define manager: [user]
+    define owner: [user, vendor#can_manage_own_accommodations]
+    define superadmin_access: [user]
+    define viewer: [user]
+
+type accommodationroom
+  relations
+    define can_delete: owner or manager from parent_accommodation or superadmin_access
+    define can_edit: owner or editor from parent_accommodation or superadmin_access
+    define can_view: owner or viewer from parent_accommodation or superadmin_access
+    define owner: [user]
+    define parent_accommodation: [accommodation]
+    define superadmin_access: [user]
+
+type accommodationservice
+  relations
+    define can_delete: owner or manager from parent_accommodation or superadmin_access
+    define can_edit: owner or editor from parent_accommodation or superadmin_access
+    define can_view: owner or viewer from parent_accommodation or superadmin_access
+    define owner: [user]
+    define parent_accommodation: [accommodation]
+    define superadmin_access: [user]
+
+type accommodationbooking
+  relations
+    define can_cancel: owner or editor from parent_travelplan or superadmin_access from parent_travelplan or superadmin_access
+    define can_edit: owner or editor from parent_travelplan or superadmin_access from parent_travelplan or superadmin_access
+    define can_view: owner or viewer from parent_travelplan or editor from parent_travelplan or suggester from parent_travelplan or superadmin_access from parent_travelplan or superadmin_access
+    define owner: [user]
+    define parent_travelplan: [travelplan]
+    define superadmin_access: [user]
+
+type transportationbooking
+  relations
+    define can_cancel: owner or editor from parent_travelplan or superadmin_access from parent_travelplan or superadmin_access
+    define can_edit: owner or editor from parent_travelplan or superadmin_access from parent_travelplan or superadmin_access
+    define can_view: owner or viewer from parent_travelplan or editor from parent_travelplan or suggester from parent_travelplan or superadmin_access from parent_travelplan or superadmin_access
+    define owner: [user]
+    define parent_travelplan: [travelplan]
+    define superadmin_access: [user]
+
+type shoppingvisit
+  relations
+    define can_cancel: owner or editor from parent_travelplan or superadmin_access from parent_travelplan or superadmin_access
+    define can_edit: owner or editor from parent_travelplan or superadmin_access from parent_travelplan or superadmin_access
+    define can_view: owner or viewer from parent_travelplan or editor from parent_travelplan or suggester from parent_travelplan or superadmin_access from parent_travelplan or superadmin_access
+    define owner: [user]
+    define parent_travelplan: [travelplan]
+    define superadmin_access: [user]
+
+type travelexperience
+  relations
+    define can_cancel: owner or editor from parent_travelplan or superadmin_access from parent_travelplan or superadmin_access
+    define can_edit: owner or editor from parent_travelplan or superadmin_access from parent_travelplan or superadmin_access
+    define can_view: owner or viewer from parent_travelplan or editor from parent_travelplan or suggester from parent_travelplan or superadmin_access from parent_travelplan or superadmin_access
+    define owner: [user]
+    define parent_travelplan: [travelplan]
+    define superadmin_access: [user]

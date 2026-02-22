@@ -1,249 +1,746 @@
 // prisma/schema.prisma
 generator client {
-  provider = "prisma-client-js"
+  provider   = "prisma-client-js"
+  engineType = "library"
 }
 
 datasource db {
   provider = "postgresql"
+  url      = env("DATABASE_URL")
 }
+
+// ==================== CORE MODELS ====================
 
 model User {
   id        String   @id @default(cuid())
   email     String   @unique
   name      String?
+  phone     String // Changed from Int to String
   password  String
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
-  
-  trips     Trip[]
-  
-  @@map("users")
+  createdAt DateTime @default(now()) @db.Timestamptz(3)
+  updatedAt DateTime @updatedAt @db.Timestamptz(3)
+
+  // Email verification
+  emailVerified           Boolean   @default(false)
+  emailVerificationToken  String?   @unique
+  emailVerificationExpiry DateTime? @db.Timestamptz(3)
+
+  // Password reset
+  resetPasswordToken  String?   @unique
+  resetPasswordExpiry DateTime? @db.Timestamptz(3)
+
+  travelPlans       TravelPlan[]
+  refreshTokens     RefreshToken[]
+  profile           Profile?
+  vendorApplication VendorApplication[]
+  accommodation     Accommodation[]
 }
 
-model Trip {
-  id          String   @id @default(cuid())
+model Profile {
+  id String @id @default(cuid())
+
+  // Personal Information
+  dateOfBirth    DateTime? @db.Timestamptz(3) // UTC timestamp - just the date part will be stored as UTC midnight
+  gender         String? // Use Gender enum
+  nationality    String?
+  profilePicture String?
+  bio            String?
+
+  // Contact Information
+  address                  String?
+  city                     String?
+  country                  String?
+  postalCode               String?
+  emergencyContactName     String?
+  emergencyContactPhone    String?
+  emergencyContactRelation String?
+
+  // Preferences
+  language String  @default("en")
+  currency String  @default("USD")
+  timezone String? // Still needed for user's local time display
+
+  // Travel Preferences
+  dietaryRestrictions  String[]
+  mobilityNeeds        String[]
+  accessibilityNeeds   String[]
+  preferredTravelStyle String? // Use TravelStyle enum
+  travelCompanionPref  String? // Use TravelCompanion enum
+  interests            String[]
+
+  // Communication Preferences
+  emailNotifications Boolean @default(true)
+  pushNotifications  Boolean @default(true)
+  smsNotifications   Boolean @default(false)
+  marketingEmails    Boolean @default(false)
+
+  // Account Details
+  emailVerified    Boolean @default(false)
+  twoFactorEnabled Boolean @default(false)
+  accountStatus    String  @default("ACTIVE") // Use AccountStatus enum
+
+  // Social Media Links
+  twitterHandle   String?
+  instagramHandle String?
+  facebookProfile String?
+  linkedInProfile String?
+
+  // Loyalty Programs
+  loyaltyPrograms Json?
+  travelMemberIds Json?
+
+  // Statistics
+  totalTripsPlanned    Int      @default(0)
+  totalTripsCompleted  Int      @default(0)
+  countriesVisited     String[]
+  favoriteDestinations String[]
+
+  // Metadata
+  lastLogin            DateTime? @db.Timestamptz(3) // UTC timestamp
+  lastActive           DateTime? @db.Timestamptz(3) // UTC timestamp
+  accountDeactivatedAt DateTime? @db.Timestamptz(3) // UTC timestamp
+  deactivationReason   String?
+
+  // Timestamps
+  createdAt DateTime @default(now()) @db.Timestamptz(3) // UTC timestamp
+  updatedAt DateTime @updatedAt @db.Timestamptz(3) // UTC timestamp
+
+  // Relations
+  userId String @unique
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([nationality])
+  @@index([accountStatus])
+  @@map("profiles")
+}
+
+model TravelPlan {
+  id          String  @id @default(cuid())
   title       String
   destination String
   description String?
-  
-  // Trip details
-  startDate   DateTime
-  endDate     DateTime
-  budget      Float?
-  travelers   Int      @default(1)
-  
+
+  // Travel details - Store as UTC timestamps
+  startDate DateTime @db.Timestamptz(3) // UTC timestamp
+  endDate   DateTime @db.Timestamptz(3) // UTC timestamp
+  budget    Float?
+  travelers Int      @default(1)
+
   // AI-generated content
-  itinerary   Json?    // Store AI-generated itinerary as JSON
-  recommendations Json? // Store AI recommendations
-  
+  itinerary       Json?
+  recommendations Json?
+
   // User preferences
-  interests   String[] // Array of interests
-  
+  interests String[]
+
   // Status
-  status      TripStatus @default(PLANNING)
-  
+  status TravelPlanStatus @default(PLANNING)
+
   // Timestamps
-  createdAt   DateTime @default(now())
-  updatedAt   DateTime @updatedAt
-  
+  createdAt DateTime @default(now()) @db.Timestamptz(3) // UTC timestamp
+  updatedAt DateTime @updatedAt @db.Timestamptz(3) // UTC timestamp
+
   // Relations
-  userId      String
-  user        User     @relation(fields: [userId], references: [id], onDelete: Cascade)
-  
-  // Trip components
-  activities  Activity[]
-  hotels      Hotel[]
-  transports  Transport[]
-  stores      Store[]
-  
+  userId String
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  // Travel components
+  experiences       TravelExperience[]
+  accommodations    AccommodationBooking[]
+  transportServices TransportationBooking[]
+  shoppingVisits    ShoppingVisit[]
+
+  // Validation: Ensure endDate is after startDate (should be handled in application logic)
   @@index([userId])
-  @@map("trips")
+  @@map("travel_plans")
 }
 
-model Activity {
-  id          String   @id @default(cuid())
-  title       String
+model VendorApplication {
+  id     String @id @default(cuid())
+  userId String
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  // Business details
+  businessName    String
+  businessAddress String
+  businessPhone   String
+  businessEmail   String
+  taxId           String?
+
+  // Documents
+  documents      String[] // URLs to uploaded documents
+  additionalInfo String?
+
+  // Status
+  status          ApplicationStatus @default(PENDING)
+  reviewedBy      String? // SuperAdmin ID who reviewed
+  reviewedAt      DateTime?
+  rejectionReason String?
+
+  // Timestamps
+  createdAt DateTime @default(now()) @db.Timestamptz(3)
+  updatedAt DateTime @updatedAt @db.Timestamptz(3)
+
+  @@index([status])
+  @@index([userId])
+  @@map("vendor_applications")
+}
+
+enum ApplicationStatus {
+  PENDING
+  APPROVED
+  REJECTED
+}
+
+// ==================== ACCOMMODATION MODELS ====================
+
+model Accommodation {
+  id          String  @id @default(cuid())
+  name        String  @unique
   description String?
-  
-  // Activity details
-  date        DateTime
-  startTime   String?
-  endTime     String?
-  location    String?
-  cost        Float?   @default(0)
-  
-  // Category
-  category    ActivityCategory @default(SIGHTSEEING)
-  
-  // AI-generated
-  aiNotes     String?
-  
-  // Timestamps
-  createdAt   DateTime @default(now())
-  updatedAt   DateTime @updatedAt
-  
-  // Relations
-  tripId      String
-  trip        Trip     @relation(fields: [tripId], references: [id], onDelete: Cascade)
-  
-  @@index([tripId])
-  @@map("activities")
-}
 
-model Hotel {
-  id            String   @id @default(cuid())
-  name          String
-  description   String?
-  
-  // Hotel details
-  checkIn       DateTime
-  checkOut      DateTime
-  address       String
-  city          String
-  country       String
-  rating        Float?   @default(0)
-  pricePerNight Float?
-  totalCost     Float?
-  
+  // Location
+  address   String
+  city      String
+  country   String
+  latitude  Float?
+  longitude Float?
+
   // Contact
-  phone         String?
-  email         String?
-  website       String?
-  
+  phone   String?
+  email   String?
+  website String?
+
+  // Details
+  starRating        Int?              @default(3)
+  overallRating     Float?            @default(0)
+  vendorId          String
+  vendor            User              @relation(fields: [vendorId], references: [id])
+  accommodationType AccommodationType @default(HOTEL)
+  priceCategory     PriceCategory     @default(MIDRANGE)
+
   // Amenities
-  amenities     String[]
-  
+  amenities String[]
+  images    String[]
+
+  // Policies - Store times in ISO format (HH:MM:SS) since they're recurring daily times
+  checkInTime  String? // Format: "14:00:00"
+  checkOutTime String? // Format: "11:00:00"
+  policies     Json?
+
+  // Status
+  isActive   Boolean @default(true)
+  isVerified Boolean @default(false)
+
+  // Timestamps
+  createdAt DateTime @default(now()) @db.Timestamptz(3) // UTC timestamp
+  updatedAt DateTime @updatedAt @db.Timestamptz(3) // UTC timestamp
+
+  // Relations
+  rooms    AccommodationRoom[]
+  services AccommodationService[]
+  bookings AccommodationBooking[]
+
+  @@index([city])
+  @@index([country])
+  @@index([accommodationType])
+  @@map("accommodations")
+}
+
+model AccommodationRoom {
+  id          String   @id @default(cuid())
+  roomNumber  String
+  roomType    RoomType
+  description String?
+
   // Room details
-  roomType      String
-  roomNumber    String?
-  
-  // Status
-  bookingStatus BookingStatus @default(PENDING)
-  
-  // AI-generated
-  aiNotes       String?
-  
-  // Timestamps
-  createdAt     DateTime @default(now())
-  updatedAt     DateTime @updatedAt
-  
+  beds         Int     @default(1)
+  maxOccupancy Int     @default(2)
+  hasView      Boolean @default(false)
+  hasBalcony   Boolean @default(false)
+  floor        Int?
+
+  // Amenities
+  roomAmenities String[]
+  basePrice     Float
+  isAvailable   Boolean  @default(true)
+
   // Relations
-  tripId        String
-  trip          Trip     @relation(fields: [tripId], references: [id], onDelete: Cascade)
-  
-  @@index([tripId])
-  @@map("hotels")
+  accommodationId String
+  accommodation   Accommodation @relation(fields: [accommodationId], references: [id], onDelete: Cascade)
+
+  // Timestamps
+  createdAt DateTime @default(now()) @db.Timestamptz(3) // UTC timestamp
+  updatedAt DateTime @updatedAt @db.Timestamptz(3) // UTC timestamp
+
+  // Booking relation (fix: this should be many-to-many or one-to-many, not one-to-one)
+  bookings AccommodationBooking[] // Changed from single relation to array
+
+  @@index([accommodationId])
+  @@index([roomType])
+  @@map("accommodation_rooms")
 }
 
-model Transport {
-  id          String   @id @default(cuid())
-  type        TransportType @default(TAXI)
-  serviceName String?  // e.g., Uber, Local Taxi, etc.
-  
-  // Transport details
-  pickupLocation   String
-  dropoffLocation  String
-  pickupTime       DateTime
-  estimatedArrival DateTime?
-  
-  // Vehicle details
-  vehicleType      String?  // e.g., Sedan, SUV, Bike
-  vehicleNumber    String?
-  driverName       String?
-  driverContact    String?
-  
-  // Pricing
-  estimatedFare    Float?
-  actualFare       Float?
-  paymentMethod    PaymentMethod?
-  isPaid           Boolean @default(false)
-  
-  // Status
-  status          TransportStatus @default(BOOKED)
-  
-  // AI-generated
-  aiNotes         String?
-  alternatives    Json?    // Store alternative transport options
-  
-  // Timestamps
-  createdAt       DateTime @default(now())
-  updatedAt       DateTime @updatedAt
-  
-  // Relations
-  tripId          String
-  trip            Trip     @relation(fields: [tripId], references: [id], onDelete: Cascade)
-  
-  @@index([tripId])
-  @@map("transports")
-}
-
-model Store {
-  id          String   @id @default(cuid())
+model AccommodationService {
+  id          String          @id @default(cuid())
   name        String
   description String?
-  
-  // Store details
-  type        StoreType @default(SHOPPING)
-  address     String
-  city        String
-  country     String
-  category    String?   // e.g., Electronics, Clothing, Souvenirs
-  
-  // Shopping details
-  items       Json?     // Store shopping list as JSON
-  budget      Float?
-  spent       Float?    @default(0)
-  
-  // Timing
-  plannedDate DateTime
-  duration    Int?      // Duration in minutes
-  
-  // Status
-  status      StoreStatus @default(PLANNED)
-  
-  // AI-generated
-  aiNotes     String?
-  recommendations Json?  // Store product recommendations
-  
-  // Timestamps
-  createdAt   DateTime @default(now())
-  updatedAt   DateTime @updatedAt
-  
+  category    ServiceCategory
+
+  // Service details
+  price       Float?
+  isIncluded  Boolean @default(false)
+  isAvailable Boolean @default(true)
+
+  // Timing - Store as strings since they're recurring daily times
+  availableStartTime String? // Format: "09:00:00"
+  availableEndTime   String? // Format: "17:00:00"
+  daysAvailable      String[] // Days of week: ["MONDAY", "TUESDAY", etc.]
+
+  // Location
+  locationInAccommodation String?
+
   // Relations
-  tripId      String
-  trip        Trip     @relation(fields: [tripId], references: [id], onDelete: Cascade)
-  
-  @@index([tripId])
-  @@map("stores")
+  accommodationId String
+  accommodation   Accommodation @relation(fields: [accommodationId], references: [id], onDelete: Cascade)
+
+  // Timestamps
+  createdAt DateTime @default(now()) @db.Timestamptz(3) // UTC timestamp
+  updatedAt DateTime @updatedAt @db.Timestamptz(3) // UTC timestamp
+
+  @@index([accommodationId])
+  @@index([category])
+  @@map("accommodation_services")
 }
 
-// Enums
-enum TripStatus {
+model AccommodationBooking {
+  id String @id @default(cuid())
+
+  // Booking details - Store as UTC timestamps
+  checkInDate  DateTime @db.Timestamptz(3) // UTC timestamp
+  checkOutDate DateTime @db.Timestamptz(3) // UTC timestamp
+  totalNights  Int
+  totalGuests  Int      @default(1)
+
+  // Room details
+  roomType            RoomType
+  selectedRoomNumbers String[]
+
+  // Pricing
+  pricePerNight Float
+  taxes         Float? @default(0)
+  serviceFee    Float? @default(0)
+  totalCost     Float
+
+  // Guest information
+  guestName       String
+  guestEmail      String
+  guestPhone      String?
+  specialRequests String?
+
+  // Payment
+  paymentStatus PaymentStatus  @default(PENDING)
+  paymentMethod PaymentMethod?
+  transactionId String?
+
+  // Status
+  bookingStatus      BookingStatus @default(PENDING)
+  cancellationPolicy String?
+
+  // AI-generated
+  aiNotes String?
+
+  // Timestamps
+  createdAt DateTime @default(now()) @db.Timestamptz(3) // UTC timestamp
+  updatedAt DateTime @updatedAt @db.Timestamptz(3) // UTC timestamp
+
+  // Relations
+  travelPlanId String
+  travelPlan   TravelPlan @relation(fields: [travelPlanId], references: [id], onDelete: Cascade)
+
+  accommodationId String
+  accommodation   Accommodation @relation(fields: [accommodationId], references: [id])
+
+  rooms AccommodationRoom[] // Many-to-many relation through join table would be better, but this works
+
+  // Validation: Ensure checkOutDate is after checkInDate (handle in app logic)
+  @@index([travelPlanId])
+  @@index([accommodationId])
+  @@index([bookingStatus])
+  @@map("accommodation_bookings")
+}
+
+// ==================== TRANSPORTATION MODELS ====================
+
+model TransportationProvider {
+  id          String  @id @default(cuid())
+  name        String  @unique
+  description String?
+
+  // Provider details
+  providerType  TransportationProviderType
+  serviceArea   String[]
+  contactNumber String?
+  email         String?
+  website       String?
+
+  // Ratings
+  rating     Float? @default(0)
+  totalTrips Int?   @default(0)
+
+  // Pricing
+  baseFare      Float?
+  perKmRate     Float?
+  perMinuteRate Float?
+
+  // Availability - Store operating hours as JSON since it's complex
+  isAvailable    Boolean @default(true)
+  operatingHours Json? // Store as JSON with days and time ranges
+
+  // Vehicles
+  vehicleTypes String[]
+
+  // Status
+  isVerified Boolean @default(false)
+
+  // Timestamps
+  createdAt DateTime @default(now()) @db.Timestamptz(3) // UTC timestamp
+  updatedAt DateTime @updatedAt @db.Timestamptz(3) // UTC timestamp
+
+  // Relations
+  vendorId    String
+  vendor      User     @relation(fields: [vendorId], references: [id])
+
+  vehicles TransportationVehicle[]
+  bookings TransportationBooking[]
+
+  @@index([providerType])
+  @@index([name])
+  @@map("transportation_providers")
+}
+
+model TransportationVehicle {
+  id            String @id @default(cuid())
+  vehicleNumber String @unique
+  vehicleType   String
+
+  // Vehicle details
+  make     String?
+  model    String?
+  year     Int?
+  color    String?
+  capacity Int     @default(4)
+
+  // Amenities
+  amenities String[]
+
+  // Driver info
+  driverName    String?
+  driverContact String?
+  driverRating  Float?  @default(0)
+
+  // Status
+  isAvailable     Boolean @default(true)
+  currentLocation Json? // Store as JSON with lat/long and timestamp
+
+  // Relations
+  providerId String
+  provider   TransportationProvider @relation(fields: [providerId], references: [id], onDelete: Cascade)
+
+  // Timestamps
+  createdAt DateTime @default(now()) @db.Timestamptz(3) // UTC timestamp
+  updatedAt DateTime @updatedAt @db.Timestamptz(3) // UTC timestamp
+
+  // Relations
+  bookings TransportationBooking[]
+
+  @@index([providerId])
+  @@index([vehicleType])
+  @@map("transportation_vehicles")
+}
+
+model TransportationBooking {
+  id String @id @default(cuid())
+
+  // Booking details - Store as UTC timestamps
+  serviceType       TransportationServiceType
+  pickupLocation    String
+  dropoffLocation   String
+  pickupTime        DateTime                  @db.Timestamptz(3) // UTC timestamp
+  estimatedArrival  DateTime?                 @db.Timestamptz(3) // UTC timestamp
+  actualPickupTime  DateTime?                 @db.Timestamptz(3) // UTC timestamp
+  actualDropoffTime DateTime?                 @db.Timestamptz(3) // UTC timestamp
+
+  // Vehicle and driver
+  vehicleType   String?
+  vehicleNumber String?
+  driverName    String?
+  driverContact String?
+
+  // Passenger info
+  numberOfPassengers Int     @default(1)
+  specialRequests    String?
+
+  // Pricing
+  estimatedFare Float?
+  actualFare    Float?
+  paymentMethod PaymentMethod?
+  isPaid        Boolean        @default(false)
+  paymentStatus PaymentStatus  @default(PENDING)
+
+  // Status
+  status TransportationStatus @default(BOOKED)
+
+  // AI-generated
+  aiNotes      String?
+  alternatives Json?
+
+  // Timestamps
+  createdAt DateTime @default(now()) @db.Timestamptz(3) // UTC timestamp
+  updatedAt DateTime @updatedAt @db.Timestamptz(3) // UTC timestamp
+
+  // Relations
+  travelPlanId String
+  travelPlan   TravelPlan @relation(fields: [travelPlanId], references: [id], onDelete: Cascade)
+
+  providerId String?
+  provider   TransportationProvider? @relation(fields: [providerId], references: [id])
+
+  vehicleId String?
+  vehicle   TransportationVehicle? @relation(fields: [vehicleId], references: [id])
+
+  // Validation: Ensure estimatedArrival is after pickupTime (handle in app logic)
+  @@index([travelPlanId])
+  @@index([providerId])
+  @@index([status])
+  @@index([pickupTime])
+  @@map("transportation_bookings")
+}
+
+// ==================== SHOPPING MODELS ====================
+
+model RetailStore {
+  id          String  @id @default(cuid())
+  name        String
+  description String?
+
+  // Store details
+  storeType RetailStoreType @default(SHOPPING_MALL)
+  address   String
+  city      String
+  country   String
+  category  String?
+
+  // Contact
+  phone   String?
+  email   String?
+  website String?
+
+  // Store information - Store opening hours as JSON since it's complex
+  openingHours Json? // Store as JSON with days and time ranges
+  rating       Float?      @default(0)
+  priceRange   PriceRange?
+
+  // Products
+  products Json?
+
+  // Images
+  images String[]
+
+  // Status
+  isActive Boolean @default(true)
+
+  // Timestamps
+  createdAt DateTime @default(now()) @db.Timestamptz(3) // UTC timestamp
+  updatedAt DateTime @updatedAt @db.Timestamptz(3) // UTC timestamp
+
+  // Relations
+  visits ShoppingVisit[]
+
+  @@index([city])
+  @@index([country])
+  @@index([storeType])
+  @@index([category])
+  @@map("retail_stores")
+}
+
+model ShoppingVisit {
+  id String @id @default(cuid())
+
+  // Visit details - Store as UTC timestamps
+  plannedDate     DateTime  @db.Timestamptz(3) // UTC timestamp
+  actualVisitDate DateTime? @db.Timestamptz(3) // UTC timestamp
+  duration        Int? // Duration in minutes
+
+  // Shopping intent
+  purpose      String?
+  plannedItems Json?
+
+  // Status
+  status ShoppingVisitStatus @default(PLANNED)
+
+  // AI-generated
+  aiNotes         String?
+  recommendations Json?
+
+  // Timestamps
+  createdAt DateTime @default(now()) @db.Timestamptz(3) // UTC timestamp
+  updatedAt DateTime @updatedAt @db.Timestamptz(3) // UTC timestamp
+
+  // Relations
+  travelPlanId String
+  travelPlan   TravelPlan @relation(fields: [travelPlanId], references: [id], onDelete: Cascade)
+
+  storeId String
+  store   RetailStore @relation(fields: [storeId], references: [id])
+
+  @@index([travelPlanId])
+  @@index([storeId])
+  @@index([plannedDate])
+  @@map("shopping_visits")
+}
+
+// ==================== EXPERIENCE MODELS ====================
+
+model TravelExperience {
+  id          String  @id @default(cuid())
+  title       String
+  description String?
+
+  // Experience details - Store date as UTC timestamp
+  date      DateTime @db.Timestamptz(3) // UTC timestamp
+  startTime String? // Format: "14:30:00" - since it's a recurring time within the date
+  endTime   String? // Format: "16:30:00"
+  location  String?
+  cost      Float?   @default(0)
+
+  // Category
+  category ExperienceCategory @default(SIGHTSEEING)
+
+  // AI-generated
+  aiNotes String?
+
+  // Timestamps
+  createdAt DateTime @default(now()) @db.Timestamptz(3) // UTC timestamp
+  updatedAt DateTime @updatedAt @db.Timestamptz(3) // UTC timestamp
+
+  // Relations
+  travelPlanId String
+  travelPlan   TravelPlan @relation(fields: [travelPlanId], references: [id], onDelete: Cascade)
+
+  @@index([travelPlanId])
+  @@map("travel_experiences")
+}
+
+model RefreshToken {
+  id        String   @id @default(cuid())
+  token     String   @unique
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  expiresAt DateTime @db.Timestamptz(3) // UTC timestamp
+  createdAt DateTime @default(now()) @db.Timestamptz(3) // UTC timestamp
+  isRevoked Boolean  @default(false)
+
+  @@index([userId])
+  @@index([token])
+  @@map("refresh_tokens")
+}
+
+// ==================== ENUMS ====================
+
+// Travel Plan enums
+enum TravelPlanStatus {
   PLANNING
   ONGOING
   COMPLETED
   CANCELLED
 }
 
-enum ActivityCategory {
+enum ExperienceCategory {
   SIGHTSEEING
-  FOOD
-  ACCOMMODATION
-  TRANSPORTATION
-  ACTIVITY
+  DINING
+  ENTERTAINMENT
+  ADVENTURE
+  CULTURAL
+  RELAXATION
   SHOPPING
   OTHER
 }
 
+// Accommodation enums
+enum AccommodationType {
+  HOTEL
+  RESORT
+  MOTEL
+  HOSTEL
+  BED_BREAKFAST
+  VACATION_RENTAL
+  APARTMENT
+  GUEST_HOUSE
+}
+
+enum PriceCategory {
+  BUDGET
+  MIDRANGE
+  LUXURY
+  BOUTIQUE
+}
+
+enum RoomType {
+  SINGLE
+  DOUBLE
+  TWIN
+  TRIPLE
+  SUITE
+  DELUXE
+  FAMILY
+  PRESIDENTIAL
+}
+
+enum ServiceCategory {
+  DINING
+  WELLNESS
+  ENTERTAINMENT
+  BUSINESS
+  TRANSPORTATION
+  HOUSEKEEPING
+  CONCIERGE
+  OTHER
+}
+
+// Booking enums
 enum BookingStatus {
   PENDING
   CONFIRMED
   CANCELLED
   CHECKED_IN
   CHECKED_OUT
+  NO_SHOW
 }
 
-enum TransportType {
+enum PaymentStatus {
+  PENDING
+  PAID
+  REFUNDED
+  FAILED
+  PARTIALLY_PAID
+}
+
+// Transportation enums
+enum TransportationProviderType {
+  TAXI_SERVICE
+  RIDE_SHARING
+  CAR_RENTAL
+  BUS_COMPANY
+  TRAIN_SERVICE
+  AIRLINE
+  FERRY_SERVICE
+  BICYCLE_RENTAL
+  OTHER
+}
+
+enum TransportationServiceType {
   TAXI
   BUS
   TRAIN
@@ -255,7 +752,7 @@ enum TransportType {
   OTHER
 }
 
-enum TransportStatus {
+enum TransportationStatus {
   BOOKED
   CONFIRMED
   ON_THE_WAY
@@ -273,20 +770,62 @@ enum PaymentMethod {
   VOUCHER
 }
 
-enum StoreType {
-  SHOPPING
-  SUPERMARKET
+// Retail enums
+enum RetailStoreType {
+  SHOPPING_MALL
   DEPARTMENT_STORE
   BOUTIQUE
   SOUVENIR_SHOP
   ELECTRONICS
   BOOKSTORE
+  SUPERMARKET
   OTHER
 }
 
-enum StoreStatus {
+enum ShoppingVisitStatus {
   PLANNED
   VISITED
-  PURCHASED
+  SKIPPED
   CANCELLED
+}
+
+enum PriceRange {
+  BUDGET
+  MODERATE
+  EXPENSIVE
+  LUXURY
+}
+
+enum Gender {
+  MALE
+  FEMALE
+  OTHER
+  PREFER_NOT_TO_SAY
+}
+
+enum AccountStatus {
+  ACTIVE
+  SUSPENDED
+  DEACTIVATED
+  BANNED
+}
+
+enum TravelStyle {
+  LUXURY
+  BUDGET
+  ADVENTURE
+  RELAXATION
+  CULTURAL
+  BUSINESS
+  FAMILY_FRIENDLY
+  BACKPACKING
+}
+
+enum TravelCompanion {
+  SOLO
+  COUPLE
+  FAMILY
+  FRIENDS
+  GROUP_TOUR
+  BUSINESS_COLLEAGUES
 }

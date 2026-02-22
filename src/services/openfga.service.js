@@ -1,0 +1,1374 @@
+const { OpenFgaClient } = require("@openfga/sdk");
+
+class OpenFGAService {
+  constructor() {
+    this.client = null;
+    this.storeId = null;
+    this.modelId = null;
+    this.initialized = false;
+    this.initializing = false;
+  }
+
+  /**
+   * Check if OpenFGA service is available and initialized
+   */
+  async isAvailable() {
+    try {
+      if (!this.initialized) {
+        return false;
+      }
+      await this.client.readAuthorizationModels();
+      return true;
+    } catch (error) {
+      console.error("OpenFGA availability check failed:", error.message);
+      return false;
+    }
+  }
+
+  async initialize() {
+    if (this.initialized) return true;
+    if (this.initializing) {
+      // Wait for initialization to complete
+      while (this.initializing) {
+        await new Promise((resolve) => setTimeout(resolve, 100));
+      }
+      return this.initialized;
+    }
+
+    this.initializing = true;
+
+    try {
+      const apiUrl = process.env.OPENFGA_API_URL || "http://localhost:8080";
+
+      // Create client without store first
+      const fgaClient = new OpenFgaClient({
+        apiUrl,
+      });
+
+      // Check if store exists or create new one
+      console.log("Checking for existing OpenFGA stores...");
+      const stores = await fgaClient.listStores();
+      let store = stores.stores.find((s) => s.name === "AI-trip-planner");
+
+      if (!store) {
+        console.log("Creating new OpenFGA store...");
+        store = await fgaClient.createStore({
+          name: "AI-trip-planner",
+        });
+      } else {
+        console.log("Found existing OpenFGA store");
+      }
+
+      this.storeId = store.id;
+      console.log(`✓ OpenFGA Store ID: ${this.storeId}`);
+
+      // Initialize client with store ID
+      this.client = new OpenFgaClient({
+        apiUrl,
+        storeId: this.storeId,
+      });
+
+      // Check if authorization model exists
+      console.log("Checking for existing authorization models...");
+      const models = await this.client.readAuthorizationModels();
+
+      if (models.authorization_models.length > 0) {
+        // Use the latest model
+        this.modelId = models.authorization_models[0].id;
+        console.log(`✓ Using existing authorization model: ${this.modelId}`);
+      } else {
+        // Create new authorization model with the updated schema
+        console.log("Creating new authorization model...");
+
+        const model = await this.client.writeAuthorizationModel({
+          schema_version: "1.1",
+          type_definitions: [
+            {
+              type: "user",
+            },
+            {
+              type: "superadmin",
+              relations: {
+                can_manage_all: { this: {} },
+              },
+              metadata: {
+                relations: {
+                  can_manage_all: {
+                    directly_related_user_types: [{ type: "user" }],
+                  },
+                },
+              },
+            },
+            {
+              type: "vendor",
+              relations: {
+                can_manage_own_accommodations: { this: {} },
+                superadmin_access: { this: {} },
+              },
+              metadata: {
+                relations: {
+                  can_manage_own_accommodations: {
+                    directly_related_user_types: [{ type: "user" }],
+                  },
+                  superadmin_access: {
+                    directly_related_user_types: [{ type: "user" }],
+                  },
+                },
+              },
+            },
+            {
+              type: "profile",
+              relations: {
+                owner: { this: {} },
+                can_view: {
+                  union: {
+                    child: [{ computedUserset: { relation: "owner" } }],
+                  },
+                },
+                can_edit: {
+                  union: {
+                    child: [{ computedUserset: { relation: "owner" } }],
+                  },
+                },
+              },
+              metadata: {
+                relations: {
+                  owner: { directly_related_user_types: [{ type: "user" }] },
+                },
+              },
+            },
+            {
+              type: "travelplan",
+              relations: {
+                owner: { this: {} },
+                viewer: { this: {} },
+                editor: { this: {} },
+                suggester: { this: {} },
+                superadmin_access: { this: {} },
+                can_view: {
+                  union: {
+                    child: [
+                      { computedUserset: { relation: "owner" } },
+                      { computedUserset: { relation: "viewer" } },
+                      { computedUserset: { relation: "editor" } },
+                      { computedUserset: { relation: "suggester" } },
+                      { computedUserset: { relation: "superadmin_access" } },
+                    ],
+                  },
+                },
+                can_edit: {
+                  union: {
+                    child: [
+                      { computedUserset: { relation: "owner" } },
+                      { computedUserset: { relation: "editor" } },
+                      { computedUserset: { relation: "superadmin_access" } },
+                    ],
+                  },
+                },
+                can_suggest: {
+                  union: {
+                    child: [
+                      { computedUserset: { relation: "owner" } },
+                      { computedUserset: { relation: "editor" } },
+                      { computedUserset: { relation: "suggester" } },
+                      { computedUserset: { relation: "superadmin_access" } },
+                    ],
+                  },
+                },
+                can_delete: {
+                  union: {
+                    child: [
+                      { computedUserset: { relation: "owner" } },
+                      { computedUserset: { relation: "superadmin_access" } },
+                    ],
+                  },
+                },
+                can_share: {
+                  union: {
+                    child: [
+                      { computedUserset: { relation: "owner" } },
+                      { computedUserset: { relation: "superadmin_access" } },
+                    ],
+                  },
+                },
+              },
+              metadata: {
+                relations: {
+                  owner: { directly_related_user_types: [{ type: "user" }] },
+                  viewer: { directly_related_user_types: [{ type: "user" }] },
+                  editor: { directly_related_user_types: [{ type: "user" }] },
+                  suggester: {
+                    directly_related_user_types: [{ type: "user" }],
+                  },
+                  superadmin_access: {
+                    directly_related_user_types: [{ type: "user" }],
+                  },
+                },
+              },
+            },
+            {
+              type: "accommodation",
+              relations: {
+                owner: { this: {} },
+                manager: { this: {} },
+                editor: { this: {} },
+                viewer: { this: {} },
+                superadmin_access: { this: {} },
+                can_view: {
+                  union: {
+                    child: [
+                      { computedUserset: { relation: "owner" } },
+                      { computedUserset: { relation: "manager" } },
+                      { computedUserset: { relation: "editor" } },
+                      { computedUserset: { relation: "viewer" } },
+                      { computedUserset: { relation: "superadmin_access" } },
+                    ],
+                  },
+                },
+                can_edit: {
+                  union: {
+                    child: [
+                      { computedUserset: { relation: "owner" } },
+                      { computedUserset: { relation: "manager" } },
+                      { computedUserset: { relation: "editor" } },
+                      { computedUserset: { relation: "superadmin_access" } },
+                    ],
+                  },
+                },
+                can_update: {
+                  union: {
+                    child: [
+                      { computedUserset: { relation: "owner" } },
+                      { computedUserset: { relation: "manager" } },
+                      { computedUserset: { relation: "superadmin_access" } },
+                    ],
+                  },
+                },
+                can_manage_rooms: {
+                  union: {
+                    child: [
+                      { computedUserset: { relation: "owner" } },
+                      { computedUserset: { relation: "manager" } },
+                      { computedUserset: { relation: "superadmin_access" } },
+                    ],
+                  },
+                },
+                can_manage_services: {
+                  union: {
+                    child: [
+                      { computedUserset: { relation: "owner" } },
+                      { computedUserset: { relation: "manager" } },
+                      { computedUserset: { relation: "superadmin_access" } },
+                    ],
+                  },
+                },
+                can_delete: {
+                  union: {
+                    child: [
+                      { computedUserset: { relation: "owner" } },
+                      { computedUserset: { relation: "superadmin_access" } },
+                    ],
+                  },
+                },
+              },
+              metadata: {
+                relations: {
+                  owner: { directly_related_user_types: [{ type: "user" }, { type: "vendor#can_manage_own_accommodations" }] },
+                  manager: { directly_related_user_types: [{ type: "user" }] },
+                  editor: { directly_related_user_types: [{ type: "user" }] },
+                  viewer: { directly_related_user_types: [{ type: "user" }] },
+                  superadmin_access: { directly_related_user_types: [{ type: "user" }] },
+                },
+              },
+            },
+            {
+              type: "accommodationroom",
+              relations: {
+                owner: { this: {} },
+                parent_accommodation: { this: {} },
+                superadmin_access: { this: {} },
+                can_view: {
+                  union: {
+                    child: [
+                      { computedUserset: { relation: "owner" } },
+                      {
+                        tupleToUserset: {
+                          tupleset: { object: "parent_accommodation" },
+                          computedUserset: { relation: "viewer" },
+                        },
+                      },
+                      { computedUserset: { relation: "superadmin_access" } },
+                    ],
+                  },
+                },
+                can_edit: {
+                  union: {
+                    child: [
+                      { computedUserset: { relation: "owner" } },
+                      {
+                        tupleToUserset: {
+                          tupleset: { object: "parent_accommodation" },
+                          computedUserset: { relation: "editor" },
+                        },
+                      },
+                      { computedUserset: { relation: "superadmin_access" } },
+                    ],
+                  },
+                },
+                can_delete: {
+                  union: {
+                    child: [
+                      { computedUserset: { relation: "owner" } },
+                      {
+                        tupleToUserset: {
+                          tupleset: { object: "parent_accommodation" },
+                          computedUserset: { relation: "manager" },
+                        },
+                      },
+                      { computedUserset: { relation: "superadmin_access" } },
+                    ],
+                  },
+                },
+              },
+              metadata: {
+                relations: {
+                  owner: { directly_related_user_types: [{ type: "user" }] },
+                  parent_accommodation: { directly_related_user_types: [{ type: "accommodation" }] },
+                  superadmin_access: { directly_related_user_types: [{ type: "user" }] },
+                },
+              },
+            },
+            {
+              type: "accommodationservice",
+              relations: {
+                owner: { this: {} },
+                parent_accommodation: { this: {} },
+                superadmin_access: { this: {} },
+                can_view: {
+                  union: {
+                    child: [
+                      { computedUserset: { relation: "owner" } },
+                      {
+                        tupleToUserset: {
+                          tupleset: { object: "parent_accommodation" },
+                          computedUserset: { relation: "viewer" },
+                        },
+                      },
+                      { computedUserset: { relation: "superadmin_access" } },
+                    ],
+                  },
+                },
+                can_edit: {
+                  union: {
+                    child: [
+                      { computedUserset: { relation: "owner" } },
+                      {
+                        tupleToUserset: {
+                          tupleset: { object: "parent_accommodation" },
+                          computedUserset: { relation: "editor" },
+                        },
+                      },
+                      { computedUserset: { relation: "superadmin_access" } },
+                    ],
+                  },
+                },
+                can_delete: {
+                  union: {
+                    child: [
+                      { computedUserset: { relation: "owner" } },
+                      {
+                        tupleToUserset: {
+                          tupleset: { object: "parent_accommodation" },
+                          computedUserset: { relation: "manager" },
+                        },
+                      },
+                      { computedUserset: { relation: "superadmin_access" } },
+                    ],
+                  },
+                },
+              },
+              metadata: {
+                relations: {
+                  owner: { directly_related_user_types: [{ type: "user" }] },
+                  parent_accommodation: { directly_related_user_types: [{ type: "accommodation" }] },
+                  superadmin_access: { directly_related_user_types: [{ type: "user" }] },
+                },
+              },
+            },
+            {
+              type: "accommodationbooking",
+              relations: {
+                owner: { this: {} },
+                parent_travelplan: { this: {} },
+                superadmin_access: { this: {} },
+                can_view: {
+                  union: {
+                    child: [
+                      { computedUserset: { relation: "owner" } },
+                      {
+                        tupleToUserset: {
+                          tupleset: { object: "parent_travelplan" },
+                          computedUserset: { relation: "viewer" },
+                        },
+                      },
+                      {
+                        tupleToUserset: {
+                          tupleset: { object: "parent_travelplan" },
+                          computedUserset: { relation: "editor" },
+                        },
+                      },
+                      {
+                        tupleToUserset: {
+                          tupleset: { object: "parent_travelplan" },
+                          computedUserset: { relation: "suggester" },
+                        },
+                      },
+                      {
+                        tupleToUserset: {
+                          tupleset: { object: "parent_travelplan" },
+                          computedUserset: { relation: "superadmin_access" },
+                        },
+                      },
+                      { computedUserset: { relation: "superadmin_access" } },
+                    ],
+                  },
+                },
+                can_edit: {
+                  union: {
+                    child: [
+                      { computedUserset: { relation: "owner" } },
+                      {
+                        tupleToUserset: {
+                          tupleset: { object: "parent_travelplan" },
+                          computedUserset: { relation: "editor" },
+                        },
+                      },
+                      {
+                        tupleToUserset: {
+                          tupleset: { object: "parent_travelplan" },
+                          computedUserset: { relation: "superadmin_access" },
+                        },
+                      },
+                      { computedUserset: { relation: "superadmin_access" } },
+                    ],
+                  },
+                },
+                can_cancel: {
+                  union: {
+                    child: [
+                      { computedUserset: { relation: "owner" } },
+                      {
+                        tupleToUserset: {
+                          tupleset: { object: "parent_travelplan" },
+                          computedUserset: { relation: "editor" },
+                        },
+                      },
+                      {
+                        tupleToUserset: {
+                          tupleset: { object: "parent_travelplan" },
+                          computedUserset: { relation: "superadmin_access" },
+                        },
+                      },
+                      { computedUserset: { relation: "superadmin_access" } },
+                    ],
+                  },
+                },
+              },
+              metadata: {
+                relations: {
+                  owner: { directly_related_user_types: [{ type: "user" }] },
+                  parent_travelplan: { directly_related_user_types: [{ type: "travelplan" }] },
+                  superadmin_access: { directly_related_user_types: [{ type: "user" }] },
+                },
+              },
+            },
+            {
+              type: "transportationbooking",
+              relations: {
+                owner: { this: {} },
+                parent_travelplan: { this: {} },
+                superadmin_access: { this: {} },
+                can_view: {
+                  union: {
+                    child: [
+                      { computedUserset: { relation: "owner" } },
+                      {
+                        tupleToUserset: {
+                          tupleset: { object: "parent_travelplan" },
+                          computedUserset: { relation: "viewer" },
+                        },
+                      },
+                      {
+                        tupleToUserset: {
+                          tupleset: { object: "parent_travelplan" },
+                          computedUserset: { relation: "editor" },
+                        },
+                      },
+                      {
+                        tupleToUserset: {
+                          tupleset: { object: "parent_travelplan" },
+                          computedUserset: { relation: "suggester" },
+                        },
+                      },
+                      {
+                        tupleToUserset: {
+                          tupleset: { object: "parent_travelplan" },
+                          computedUserset: { relation: "superadmin_access" },
+                        },
+                      },
+                      { computedUserset: { relation: "superadmin_access" } },
+                    ],
+                  },
+                },
+                can_edit: {
+                  union: {
+                    child: [
+                      { computedUserset: { relation: "owner" } },
+                      {
+                        tupleToUserset: {
+                          tupleset: { object: "parent_travelplan" },
+                          computedUserset: { relation: "editor" },
+                        },
+                      },
+                      {
+                        tupleToUserset: {
+                          tupleset: { object: "parent_travelplan" },
+                          computedUserset: { relation: "superadmin_access" },
+                        },
+                      },
+                      { computedUserset: { relation: "superadmin_access" } },
+                    ],
+                  },
+                },
+                can_cancel: {
+                  union: {
+                    child: [
+                      { computedUserset: { relation: "owner" } },
+                      {
+                        tupleToUserset: {
+                          tupleset: { object: "parent_travelplan" },
+                          computedUserset: { relation: "editor" },
+                        },
+                      },
+                      {
+                        tupleToUserset: {
+                          tupleset: { object: "parent_travelplan" },
+                          computedUserset: { relation: "superadmin_access" },
+                        },
+                      },
+                      { computedUserset: { relation: "superadmin_access" } },
+                    ],
+                  },
+                },
+              },
+              metadata: {
+                relations: {
+                  owner: { directly_related_user_types: [{ type: "user" }] },
+                  parent_travelplan: { directly_related_user_types: [{ type: "travelplan" }] },
+                  superadmin_access: { directly_related_user_types: [{ type: "user" }] },
+                },
+              },
+            },
+            {
+              type: "shoppingvisit",
+              relations: {
+                owner: { this: {} },
+                parent_travelplan: { this: {} },
+                superadmin_access: { this: {} },
+                can_view: {
+                  union: {
+                    child: [
+                      { computedUserset: { relation: "owner" } },
+                      {
+                        tupleToUserset: {
+                          tupleset: { object: "parent_travelplan" },
+                          computedUserset: { relation: "viewer" },
+                        },
+                      },
+                      {
+                        tupleToUserset: {
+                          tupleset: { object: "parent_travelplan" },
+                          computedUserset: { relation: "editor" },
+                        },
+                      },
+                      {
+                        tupleToUserset: {
+                          tupleset: { object: "parent_travelplan" },
+                          computedUserset: { relation: "suggester" },
+                        },
+                      },
+                      {
+                        tupleToUserset: {
+                          tupleset: { object: "parent_travelplan" },
+                          computedUserset: { relation: "superadmin_access" },
+                        },
+                      },
+                      { computedUserset: { relation: "superadmin_access" } },
+                    ],
+                  },
+                },
+                can_edit: {
+                  union: {
+                    child: [
+                      { computedUserset: { relation: "owner" } },
+                      {
+                        tupleToUserset: {
+                          tupleset: { object: "parent_travelplan" },
+                          computedUserset: { relation: "editor" },
+                        },
+                      },
+                      {
+                        tupleToUserset: {
+                          tupleset: { object: "parent_travelplan" },
+                          computedUserset: { relation: "superadmin_access" },
+                        },
+                      },
+                      { computedUserset: { relation: "superadmin_access" } },
+                    ],
+                  },
+                },
+                can_cancel: {
+                  union: {
+                    child: [
+                      { computedUserset: { relation: "owner" } },
+                      {
+                        tupleToUserset: {
+                          tupleset: { object: "parent_travelplan" },
+                          computedUserset: { relation: "editor" },
+                        },
+                      },
+                      {
+                        tupleToUserset: {
+                          tupleset: { object: "parent_travelplan" },
+                          computedUserset: { relation: "superadmin_access" },
+                        },
+                      },
+                      { computedUserset: { relation: "superadmin_access" } },
+                    ],
+                  },
+                },
+              },
+              metadata: {
+                relations: {
+                  owner: { directly_related_user_types: [{ type: "user" }] },
+                  parent_travelplan: { directly_related_user_types: [{ type: "travelplan" }] },
+                  superadmin_access: { directly_related_user_types: [{ type: "user" }] },
+                },
+              },
+            },
+            {
+              type: "travelexperience",
+              relations: {
+                owner: { this: {} },
+                parent_travelplan: { this: {} },
+                superadmin_access: { this: {} },
+                can_view: {
+                  union: {
+                    child: [
+                      { computedUserset: { relation: "owner" } },
+                      {
+                        tupleToUserset: {
+                          tupleset: { object: "parent_travelplan" },
+                          computedUserset: { relation: "viewer" },
+                        },
+                      },
+                      {
+                        tupleToUserset: {
+                          tupleset: { object: "parent_travelplan" },
+                          computedUserset: { relation: "editor" },
+                        },
+                      },
+                      {
+                        tupleToUserset: {
+                          tupleset: { object: "parent_travelplan" },
+                          computedUserset: { relation: "suggester" },
+                        },
+                      },
+                      {
+                        tupleToUserset: {
+                          tupleset: { object: "parent_travelplan" },
+                          computedUserset: { relation: "superadmin_access" },
+                        },
+                      },
+                      { computedUserset: { relation: "superadmin_access" } },
+                    ],
+                  },
+                },
+                can_edit: {
+                  union: {
+                    child: [
+                      { computedUserset: { relation: "owner" } },
+                      {
+                        tupleToUserset: {
+                          tupleset: { object: "parent_travelplan" },
+                          computedUserset: { relation: "editor" },
+                        },
+                      },
+                      {
+                        tupleToUserset: {
+                          tupleset: { object: "parent_travelplan" },
+                          computedUserset: { relation: "superadmin_access" },
+                        },
+                      },
+                      { computedUserset: { relation: "superadmin_access" } },
+                    ],
+                  },
+                },
+                can_cancel: {
+                  union: {
+                    child: [
+                      { computedUserset: { relation: "owner" } },
+                      {
+                        tupleToUserset: {
+                          tupleset: { object: "parent_travelplan" },
+                          computedUserset: { relation: "editor" },
+                        },
+                      },
+                      {
+                        tupleToUserset: {
+                          tupleset: { object: "parent_travelplan" },
+                          computedUserset: { relation: "superadmin_access" },
+                        },
+                      },
+                      { computedUserset: { relation: "superadmin_access" } },
+                    ],
+                  },
+                },
+              },
+              metadata: {
+                relations: {
+                  owner: { directly_related_user_types: [{ type: "user" }] },
+                  parent_travelplan: { directly_related_user_types: [{ type: "travelplan" }] },
+                  superadmin_access: { directly_related_user_types: [{ type: "user" }] },
+                },
+              },
+            },
+          ],
+        });
+
+        this.modelId = model.authorization_model_id;
+        console.log(`✓ Created new authorization model: ${this.modelId}`);
+      }
+
+      // Update client with model ID
+      this.client = new OpenFgaClient({
+        apiUrl,
+        storeId: this.storeId,
+        authorizationModelId: this.modelId,
+      });
+
+      this.initialized = true;
+      console.log("✓ OpenFGA service fully initialized");
+
+      // Save to environment for future use
+      process.env.OPENFGA_STORE_ID = this.storeId;
+      process.env.OPENFGA_MODEL_ID = this.modelId;
+
+      return true;
+    } catch (error) {
+      console.error("❌ OpenFGA initialization failed:", error.message);
+      this.initialized = false;
+      throw error;
+    } finally {
+      this.initializing = false;
+    }
+  }
+
+  async ensureInitialized() {
+    if (!this.initialized) {
+      await this.initialize();
+    }
+    return this.client;
+  }
+
+  // ==================== VENDOR RELATIONS ====================
+
+  /**
+   * Assign vendor role to user
+   */
+  async assignVendorRole(userId) {
+    const client = await this.ensureInitialized();
+    return client.writeTuples([
+      {
+        user: `user:${userId}`,
+        relation: "can_manage_own_accommodations",
+        object: "vendor:global",
+      },
+    ]);
+  }
+
+  /**
+   * Remove vendor role from user
+   */
+  async removeVendorRole(userId) {
+    const client = await this.ensureInitialized();
+    return client.deleteTuples([
+      {
+        user: `user:${userId}`,
+        relation: "can_manage_own_accommodations",
+        object: "vendor:global",
+      },
+    ]);
+  }
+
+  /**
+   * Check if user is a vendor
+   */
+  async isVendor(userId) {
+    return this.checkPermission(userId, "can_manage_own_accommodations", "vendor:global");
+  }
+
+  // ==================== SUPERADMIN RELATIONS ====================
+
+  async assignSuperAdmin(userId) {
+    const client = await this.ensureInitialized();
+    return client.writeTuples([
+      {
+        user: `user:${userId}`,
+        relation: "can_manage_all",
+        object: "superadmin:global",
+      },
+    ]);
+  }
+
+  async removeSuperAdmin(userId) {
+    const client = await this.ensureInitialized();
+    return client.deleteTuples([
+      {
+        user: `user:${userId}`,
+        relation: "can_manage_all",
+        object: "superadmin:global",
+      },
+    ]);
+  }
+
+  // ==================== PROFILE RELATIONS ====================
+
+  async createProfileRelations(userId, profileId) {
+    const client = await this.ensureInitialized();
+    return client.writeTuples([
+      {
+        user: `user:${userId}`,
+        relation: "owner",
+        object: `profile:${profileId}`,
+      },
+    ]);
+  }
+
+  // ==================== TRAVEL PLAN RELATIONS ====================
+
+  async createTravelPlanRelations(userId, planId) {
+    const client = await this.ensureInitialized();
+    return client.writeTuples([
+      {
+        user: `user:${userId}`,
+        relation: "owner",
+        object: `travelplan:${planId}`,
+      },
+    ]);
+  }
+
+  async shareTravelPlan(planId, userId, permission) {
+    const client = await this.ensureInitialized();
+    return client.writeTuples([
+      {
+        user: `user:${userId}`,
+        relation: permission, // 'viewer', 'editor', or 'suggester'
+        object: `travelplan:${planId}`,
+      },
+    ]);
+  }
+
+  async revokeTravelPlanAccess(planId, userId, permission) {
+    const client = await this.ensureInitialized();
+    return client.deleteTuples([
+      {
+        user: `user:${userId}`,
+        relation: permission,
+        object: `travelplan:${planId}`,
+      },
+    ]);
+  }
+
+  async grantSuperadminAccess(planId, adminId) {
+    const client = await this.ensureInitialized();
+    return client.writeTuples([
+      {
+        user: `user:${adminId}`,
+        relation: "superadmin_access",
+        object: `travelplan:${planId}`,
+      },
+    ]);
+  }
+
+  // ==================== ACCOMMODATION RELATIONS ====================
+
+  /**
+   * Create accommodation owner relations
+   */
+  async createAccommodationRelations(userId, accommodationId) {
+    const client = await this.ensureInitialized();
+    return client.writeTuples([
+      {
+        user: `user:${userId}`,
+        relation: "owner",
+        object: `accommodation:${accommodationId}`,
+      },
+    ]);
+  }
+
+  /**
+   * Add manager to accommodation
+   */
+  async addAccommodationManager(accommodationId, managerId) {
+    const client = await this.ensureInitialized();
+    return client.writeTuples([
+      {
+        user: `user:${managerId}`,
+        relation: "manager",
+        object: `accommodation:${accommodationId}`,
+      },
+    ]);
+  }
+
+  /**
+   * Add editor to accommodation
+   */
+  async addAccommodationEditor(accommodationId, editorId) {
+    const client = await this.ensureInitialized();
+    return client.writeTuples([
+      {
+        user: `user:${editorId}`,
+        relation: "editor",
+        object: `accommodation:${accommodationId}`,
+      },
+    ]);
+  }
+
+  /**
+   * Add viewer to accommodation
+   */
+  async addAccommodationViewer(accommodationId, viewerId) {
+    const client = await this.ensureInitialized();
+    return client.writeTuples([
+      {
+        user: `user:${viewerId}`,
+        relation: "viewer",
+        object: `accommodation:${accommodationId}`,
+      },
+    ]);
+  }
+
+  /**
+   * Remove user from accommodation role
+   */
+  async removeAccommodationUser(accommodationId, userId, relation) {
+    const client = await this.ensureInitialized();
+    return client.deleteTuples([
+      {
+        user: `user:${userId}`,
+        relation,
+        object: `accommodation:${accommodationId}`,
+      },
+    ]);
+  }
+
+  // ==================== ROOM RELATIONS ====================
+
+  /**
+   * Create room relations (linked to parent accommodation)
+   */
+  async createRoomRelations(ownerId, roomId, accommodationId) {
+    const client = await this.ensureInitialized();
+    return client.writeTuples([
+      {
+        user: `user:${ownerId}`,
+        relation: "owner",
+        object: `accommodationroom:${roomId}`,
+      },
+      {
+        user: `accommodation:${accommodationId}`,
+        relation: "parent_accommodation",
+        object: `accommodationroom:${roomId}`,
+      },
+    ]);
+  }
+
+  // ==================== SERVICE RELATIONS ====================
+
+  /**
+   * Create service relations (linked to parent accommodation)
+   */
+  async createServiceRelations(ownerId, serviceId, accommodationId) {
+    const client = await this.ensureInitialized();
+    return client.writeTuples([
+      {
+        user: `user:${ownerId}`,
+        relation: "owner",
+        object: `accommodationservice:${serviceId}`,
+      },
+      {
+        user: `accommodation:${accommodationId}`,
+        relation: "parent_accommodation",
+        object: `accommodationservice:${serviceId}`,
+      },
+    ]);
+  }
+
+  // ==================== BOOKING RELATIONS ====================
+
+  async createAccommodationBookingRelations(userId, bookingId, planId) {
+    const client = await this.ensureInitialized();
+    return client.writeTuples([
+      {
+        user: `user:${userId}`,
+        relation: "owner",
+        object: `accommodationbooking:${bookingId}`,
+      },
+      {
+        user: `travelplan:${planId}`,
+        relation: "parent_travelplan",
+        object: `accommodationbooking:${bookingId}`,
+      },
+    ]);
+  }
+
+  async createTransportationBookingRelations(userId, bookingId, planId) {
+    const client = await this.ensureInitialized();
+    return client.writeTuples([
+      {
+        user: `user:${userId}`,
+        relation: "owner",
+        object: `transportationbooking:${bookingId}`,
+      },
+      {
+        user: `travelplan:${planId}`,
+        relation: "parent_travelplan",
+        object: `transportationbooking:${bookingId}`,
+      },
+    ]);
+  }
+
+  async createShoppingVisitRelations(userId, visitId, planId) {
+    const client = await this.ensureInitialized();
+    return client.writeTuples([
+      {
+        user: `user:${userId}`,
+        relation: "owner",
+        object: `shoppingvisit:${visitId}`,
+      },
+      {
+        user: `travelplan:${planId}`,
+        relation: "parent_travelplan",
+        object: `shoppingvisit:${visitId}`,
+      },
+    ]);
+  }
+
+  async createTravelExperienceRelations(userId, experienceId, planId) {
+    const client = await this.ensureInitialized();
+    return client.writeTuples([
+      {
+        user: `user:${userId}`,
+        relation: "owner",
+        object: `travelexperience:${experienceId}`,
+      },
+      {
+        user: `travelplan:${planId}`,
+        relation: "parent_travelplan",
+        object: `travelexperience:${experienceId}`,
+      },
+    ]);
+  }
+
+  // ==================== PERMISSION CHECKS ====================
+
+  async checkPermission(userId, relation, object) {
+    try {
+      const client = await this.ensureInitialized();
+      const response = await client.check({
+        user: `user:${userId}`,
+        relation,
+        object,
+      });
+      return response.allowed;
+    } catch (error) {
+      console.error("OpenFGA check error:", error);
+      return false;
+    }
+  }
+
+  async checkSuperAdmin(userId) {
+    return this.checkPermission(userId, "can_manage_all", "superadmin:global");
+  }
+
+  // ==================== TRAVEL PLAN PERMISSION CHECKS ====================
+
+  async canViewTravelPlan(userId, planId) {
+    return this.checkPermission(userId, "can_view", `travelplan:${planId}`);
+  }
+
+  async canEditTravelPlan(userId, planId) {
+    return this.checkPermission(userId, "can_edit", `travelplan:${planId}`);
+  }
+
+  async canSuggestTravelPlan(userId, planId) {
+    return this.checkPermission(userId, "can_suggest", `travelplan:${planId}`);
+  }
+
+  async canDeleteTravelPlan(userId, planId) {
+    return this.checkPermission(userId, "can_delete", `travelplan:${planId}`);
+  }
+
+  async canShareTravelPlan(userId, planId) {
+    return this.checkPermission(userId, "can_share", `travelplan:${planId}`);
+  }
+
+  // ==================== ACCOMMODATION PERMISSION CHECKS ====================
+
+  async canViewAccommodation(userId, accommodationId) {
+    return this.checkPermission(userId, "can_view", `accommodation:${accommodationId}`);
+  }
+
+  async canEditAccommodation(userId, accommodationId) {
+    return this.checkPermission(userId, "can_edit", `accommodation:${accommodationId}`);
+  }
+
+  async canUpdateAccommodation(userId, accommodationId) {
+    return this.checkPermission(userId, "can_update", `accommodation:${accommodationId}`);
+  }
+
+  async canManageAccommodationRooms(userId, accommodationId) {
+    return this.checkPermission(userId, "can_manage_rooms", `accommodation:${accommodationId}`);
+  }
+
+  async canManageAccommodationServices(userId, accommodationId) {
+    return this.checkPermission(userId, "can_manage_services", `accommodation:${accommodationId}`);
+  }
+
+  async canDeleteAccommodation(userId, accommodationId) {
+    return this.checkPermission(userId, "can_delete", `accommodation:${accommodationId}`);
+  }
+
+  // ==================== ROOM PERMISSION CHECKS ====================
+
+  async canViewRoom(userId, roomId) {
+    return this.checkPermission(userId, "can_view", `accommodationroom:${roomId}`);
+  }
+
+  async canEditRoom(userId, roomId) {
+    return this.checkPermission(userId, "can_edit", `accommodationroom:${roomId}`);
+  }
+
+  async canDeleteRoom(userId, roomId) {
+    return this.checkPermission(userId, "can_delete", `accommodationroom:${roomId}`);
+  }
+
+  // ==================== SERVICE PERMISSION CHECKS ====================
+
+  async canViewService(userId, serviceId) {
+    return this.checkPermission(userId, "can_view", `accommodationservice:${serviceId}`);
+  }
+
+  async canEditService(userId, serviceId) {
+    return this.checkPermission(userId, "can_edit", `accommodationservice:${serviceId}`);
+  }
+
+  async canDeleteService(userId, serviceId) {
+    return this.checkPermission(userId, "can_delete", `accommodationservice:${serviceId}`);
+  }
+  // ==================== TRANSPORTATION PROVIDER RELATIONS ====================
+
+/**
+ * Create transportation provider relations
+ */
+async createTransportationProviderRelations(userId, providerId) {
+  const client = await this.ensureInitialized();
+  return client.writeTuples([
+    {
+      user: `user:${userId}`,
+      relation: "owner",
+      object: `transportationprovider:${providerId}`,
+    },
+  ]);
+}
+
+/**
+ * Add manager to transportation provider
+ */
+async addTransportationProviderManager(providerId, managerId) {
+  const client = await this.ensureInitialized();
+  return client.writeTuples([
+    {
+      user: `user:${managerId}`,
+      relation: "manager",
+      object: `transportationprovider:${providerId}`,
+    },
+  ]);
+}
+
+// ==================== VEHICLE RELATIONS ====================
+
+/**
+ * Create vehicle relations (linked to parent provider)
+ */
+async createTransportationVehicleRelations(ownerId, vehicleId, providerId) {
+  const client = await this.ensureInitialized();
+  return client.writeTuples([
+    {
+      user: `user:${ownerId}`,
+      relation: "owner",
+      object: `transportationvehicle:${vehicleId}`,
+    },
+    {
+      user: `transportationprovider:${providerId}`,
+      relation: "parent_provider",
+      object: `transportationvehicle:${vehicleId}`,
+    },
+  ]);
+}
+
+// ==================== BOOKING RELATIONS ====================
+
+async createTransportationBookingRelations(userId, bookingId, planId) {
+  const client = await this.ensureInitialized();
+  return client.writeTuples([
+    {
+      user: `user:${userId}`,
+      relation: "owner",
+      object: `transportationbooking:${bookingId}`,
+    },
+    {
+      user: `travelplan:${planId}`,
+      relation: "parent_travelplan",
+      object: `transportationbooking:${bookingId}`,
+    },
+  ]);
+}
+
+// ==================== TRANSPORTATION PERMISSION CHECKS ====================
+
+async canViewTransportationProvider(userId, providerId) {
+  return this.checkPermission(userId, "can_view", `transportationprovider:${providerId}`);
+}
+
+async canEditTransportationProvider(userId, providerId) {
+  return this.checkPermission(userId, "can_edit", `transportationprovider:${providerId}`);
+}
+
+async canUpdateTransportationProvider(userId, providerId) {
+  return this.checkPermission(userId, "can_update", `transportationprovider:${providerId}`);
+}
+
+async canDeleteTransportationProvider(userId, providerId) {
+  return this.checkPermission(userId, "can_delete", `transportationprovider:${providerId}`);
+}
+
+async canManageProviderVehicles(userId, providerId) {
+  return this.checkPermission(userId, "can_manage_vehicles", `transportationprovider:${providerId}`);
+}
+
+// Vehicle permission checks
+async canViewTransportationVehicle(userId, vehicleId) {
+  return this.checkPermission(userId, "can_view", `transportationvehicle:${vehicleId}`);
+}
+
+async canEditTransportationVehicle(userId, vehicleId) {
+  return this.checkPermission(userId, "can_edit", `transportationvehicle:${vehicleId}`);
+}
+
+async canDeleteTransportationVehicle(userId, vehicleId) {
+  return this.checkPermission(userId, "can_delete", `transportationvehicle:${vehicleId}`);
+}
+
+// Booking permission checks
+async canViewTransportationBooking(userId, bookingId) {
+  return this.checkPermission(userId, "can_view", `transportationbooking:${bookingId}`);
+}
+
+async canEditTransportationBooking(userId, bookingId) {
+  return this.checkPermission(userId, "can_edit", `transportationbooking:${bookingId}`);
+}
+
+async canCancelTransportationBooking(userId, bookingId) {
+  return this.checkPermission(userId, "can_cancel", `transportationbooking:${bookingId}`);
+}
+
+  // ==================== BOOKING PERMISSION CHECKS ====================
+
+  async canViewAccommodationBooking(userId, bookingId) {
+    return this.checkPermission(userId, "can_view", `accommodationbooking:${bookingId}`);
+  }
+
+  async canEditAccommodationBooking(userId, bookingId) {
+    return this.checkPermission(userId, "can_edit", `accommodationbooking:${bookingId}`);
+  }
+
+  async canCancelAccommodationBooking(userId, bookingId) {
+    return this.checkPermission(userId, "can_cancel", `accommodationbooking:${bookingId}`);
+  }
+
+  // ==================== UTILITY METHODS ====================
+
+  // List accessible objects
+  async listAccessibleTravelPlans(userId, relation = "can_view") {
+    try {
+      const client = await this.ensureInitialized();
+      const response = await client.listObjects({
+        user: `user:${userId}`,
+        relation,
+        type: "travelplan",
+      });
+      return response.objects;
+    } catch (error) {
+      console.error("OpenFGA listObjects error:", error);
+      return [];
+    }
+  }
+
+  // Batch checks
+  async batchCheckPermissions(checks) {
+    try {
+      const client = await this.ensureInitialized();
+      const formattedChecks = checks.map(({ userId, relation, object }) => ({
+        user: `user:${userId}`,
+        relation,
+        object,
+      }));
+
+      const results = await client.batchCheck(formattedChecks);
+      return results;
+    } catch (error) {
+      console.error("OpenFGA batchCheck error:", error);
+      return checks.map(() => ({ allowed: false }));
+    }
+  }
+
+  // Read tuples
+  async readTuples(query) {
+    const client = await this.ensureInitialized();
+    return client.read(query);
+  }
+
+  // Delete tuples
+  async deleteTuples(tuples) {
+    const client = await this.ensureInitialized();
+    return client.deleteTuples(tuples);
+  }
+
+  // Get store info
+  async getStoreInfo() {
+    return {
+      storeId: this.storeId,
+      modelId: this.modelId,
+      initialized: this.initialized,
+    };
+  }
+
+  // Check if service is initialized
+  isInitialized() {
+    return this.initialized;
+  }
+}
+
+module.exports = new OpenFGAService();
