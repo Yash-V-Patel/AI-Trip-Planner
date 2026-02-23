@@ -29,18 +29,28 @@ model User {
   resetPasswordToken  String?   @unique
   resetPasswordExpiry DateTime? @db.Timestamptz(3)
 
-  travelPlans       TravelPlan[]
-  refreshTokens     RefreshToken[]
-  profile           Profile?
-  vendorApplication VendorApplication[]
-  accommodation     Accommodation[]
+  // Relations
+  travelPlans             TravelPlan[]
+  refreshTokens           RefreshToken[]
+  profile                 Profile?
+  vendorApplications      VendorApplication[]
+  vendor                  Vendor? // One-to-one with vendor
+  accommodations          Accommodation[] // As vendor
+  transportationProviders TransportationProvider[] // As vendor
+  travelPackages          TravelPackage[] // As vendor
+  vendorExperiences       VendorExperience[] // As vendor
+  vendorReviews           VendorReview[] // Reviews given
+  transactions            Transaction[] // As vendor
+  vendorTeamMembers       VendorTeamMember[]
+
+  @@map("users")
 }
 
 model Profile {
   id String @id @default(cuid())
 
   // Personal Information
-  dateOfBirth    DateTime? @db.Timestamptz(3) // UTC timestamp - just the date part will be stored as UTC midnight
+  dateOfBirth    DateTime? @db.Timestamptz(3)
   gender         String? // Use Gender enum
   nationality    String?
   profilePicture String?
@@ -58,7 +68,7 @@ model Profile {
   // Preferences
   language String  @default("en")
   currency String  @default("USD")
-  timezone String? // Still needed for user's local time display
+  timezone String?
 
   // Travel Preferences
   dietaryRestrictions  String[]
@@ -96,14 +106,14 @@ model Profile {
   favoriteDestinations String[]
 
   // Metadata
-  lastLogin            DateTime? @db.Timestamptz(3) // UTC timestamp
-  lastActive           DateTime? @db.Timestamptz(3) // UTC timestamp
-  accountDeactivatedAt DateTime? @db.Timestamptz(3) // UTC timestamp
+  lastLogin            DateTime? @db.Timestamptz(3)
+  lastActive           DateTime? @db.Timestamptz(3)
+  accountDeactivatedAt DateTime? @db.Timestamptz(3)
   deactivationReason   String?
 
   // Timestamps
-  createdAt DateTime @default(now()) @db.Timestamptz(3) // UTC timestamp
-  updatedAt DateTime @updatedAt @db.Timestamptz(3) // UTC timestamp
+  createdAt DateTime @default(now()) @db.Timestamptz(3)
+  updatedAt DateTime @updatedAt @db.Timestamptz(3)
 
   // Relations
   userId String @unique
@@ -121,9 +131,9 @@ model TravelPlan {
   destination String
   description String?
 
-  // Travel details - Store as UTC timestamps
-  startDate DateTime @db.Timestamptz(3) // UTC timestamp
-  endDate   DateTime @db.Timestamptz(3) // UTC timestamp
+  // Travel details
+  startDate DateTime @db.Timestamptz(3)
+  endDate   DateTime @db.Timestamptz(3)
   budget    Float?
   travelers Int      @default(1)
 
@@ -138,27 +148,234 @@ model TravelPlan {
   status TravelPlanStatus @default(PLANNING)
 
   // Timestamps
-  createdAt DateTime @default(now()) @db.Timestamptz(3) // UTC timestamp
-  updatedAt DateTime @updatedAt @db.Timestamptz(3) // UTC timestamp
+  createdAt DateTime @default(now()) @db.Timestamptz(3)
+  updatedAt DateTime @updatedAt @db.Timestamptz(3)
 
   // Relations
   userId String
   user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
 
   // Travel components
-  experiences       TravelExperience[]
-  accommodations    AccommodationBooking[]
-  transportServices TransportationBooking[]
-  shoppingVisits    ShoppingVisit[]
+  experiences           TravelExperience[]
+  accommodations        AccommodationBooking[]
+  transportServices     TransportationBooking[]
+  shoppingVisits        ShoppingVisit[]
+  travelPackageBookings TravelPackageBooking[]
+  experienceBookings    ExperienceBooking[]
 
-  // Validation: Ensure endDate is after startDate (should be handled in application logic)
   @@index([userId])
   @@map("travel_plans")
 }
 
+// ==================== VENDOR MANAGEMENT ====================
+
+enum VendorType {
+  ACCOMMODATION_PROVIDER
+  TRANSPORTATION_PROVIDER
+  TRAVEL_AGENCY
+  EXPERIENCE_PROVIDER
+  SHOPPING_VENDOR
+  RESTAURANT
+  OTHER
+}
+
+enum VendorVerificationStatus {
+  PENDING
+  DOCUMENTS_SUBMITTED
+  UNDER_REVIEW
+  VERIFIED
+  REJECTED
+  SUSPENDED
+}
+
+enum VendorSubscriptionPlan {
+  FREE
+  BASIC
+  PREMIUM
+  ENTERPRISE
+}
+
+model Vendor {
+  id     String @id @default(cuid())
+  userId String @unique
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  // Business Information
+  businessName      String
+  businessRegNumber String?      @unique
+  taxId             String?
+  vendorType        VendorType[]
+  businessAddress   String
+  businessPhone     String
+  businessEmail     String
+  website           String?
+  description       String?
+  logo              String?
+  coverImage        String?
+
+  // Verification
+  verificationStatus VendorVerificationStatus @default(PENDING)
+  verifiedAt         DateTime?
+  verifiedBy         String? // SuperAdmin ID
+  verificationNotes  String?
+
+  // Commission & Fees
+  commissionRate     Float                  @default(10) // Platform commission percentage
+  subscriptionPlan   VendorSubscriptionPlan @default(FREE)
+  subscriptionExpiry DateTime?
+  autoRenew          Boolean                @default(true)
+
+  // Ratings & Reviews
+  overallRating Float @default(0)
+  totalReviews  Int   @default(0)
+
+  // Payment & Payout
+  payoutMethod     String? // 'BANK_TRANSFER', 'PAYPAL', 'STRIPE'
+  payoutDetails    Json? // Store encrypted payout details
+  minimumPayout    Float   @default(100)
+  balance          Float   @default(0)
+  lifetimeEarnings Float   @default(0)
+
+  // Settings
+  isActive       Boolean   @default(true)
+  isFeatured     Boolean   @default(false)
+  featuredUntil  DateTime?
+  maxListings    Int       @default(100)
+  maxTeamMembers Int       @default(1)
+
+  // Social Media
+  facebookUrl  String?
+  instagramUrl String?
+  twitterUrl   String?
+  linkedInUrl  String?
+
+  // Metadata
+  lastLoginAt      DateTime?
+  lastActivityAt   DateTime?
+  suspensionReason String?
+  suspendedUntil   DateTime?
+
+  // Timestamps
+  createdAt DateTime @default(now()) @db.Timestamptz(3)
+  updatedAt DateTime @updatedAt @db.Timestamptz(3)
+
+  // Relations
+  documents    VendorDocument[]
+  teamMembers  VendorTeamMember[]
+  reviews      VendorReview[]
+  transactions Transaction[]
+  payouts      Payout[]
+
+  // Service listings
+  accommodations          Accommodation[]
+  transportationProviders TransportationProvider[]
+  travelPackages          TravelPackage[]
+  experiences             VendorExperience[]
+  retailStores            RetailStore[]
+
+  @@index([vendorType])
+  @@index([verificationStatus])
+  @@index([overallRating])
+  @@index([isFeatured])
+  @@map("vendors")
+}
+
+model VendorDocument {
+  id       String @id @default(cuid())
+  vendorId String
+  vendor   Vendor @relation(fields: [vendorId], references: [id], onDelete: Cascade)
+
+  documentType   String // 'BUSINESS_LICENSE', 'TAX_CERT', 'ID_PROOF', 'INSURANCE'
+  documentUrl    String
+  documentNumber String?
+  issueDate      DateTime?
+  expiryDate     DateTime?
+  issuingCountry String?
+
+  isVerified      Boolean   @default(false)
+  verifiedAt      DateTime?
+  verifiedBy      String?
+  rejectionReason String?
+
+  // Metadata
+  fileSize Int?
+  mimeType String?
+
+  createdAt DateTime @default(now()) @db.Timestamptz(3)
+  updatedAt DateTime @updatedAt @db.Timestamptz(3)
+
+  @@index([vendorId])
+  @@index([documentType])
+  @@map("vendor_documents")
+}
+
+model VendorTeamMember {
+  id       String @id @default(cuid())
+  vendorId String
+  vendor   Vendor @relation(fields: [vendorId], references: [id], onDelete: Cascade)
+
+  userId String
+  user   User   @relation(fields: [userId], references: [id])
+
+  role        String // 'ADMIN', 'MANAGER', 'EDITOR', 'VIEWER'
+  permissions Json? // Granular permissions
+
+  isActive  Boolean   @default(true)
+  invitedAt DateTime?
+  joinedAt  DateTime?
+  invitedBy String?
+
+  createdAt DateTime @default(now()) @db.Timestamptz(3)
+  updatedAt DateTime @updatedAt @db.Timestamptz(3)
+
+  @@unique([vendorId, userId])
+  @@index([vendorId])
+  @@index([userId])
+  @@map("vendor_team_members")
+}
+
+model VendorReview {
+  id       String @id @default(cuid())
+  vendorId String
+  vendor   Vendor @relation(fields: [vendorId], references: [id], onDelete: Cascade)
+
+  userId String
+  user   User   @relation(fields: [userId], references: [id])
+
+  rating     Int       @default(5) // 1-5
+  title      String?
+  comment    String?
+  response   String? // Vendor response to review
+  responseAt DateTime?
+
+  // Metadata
+  isVerifiedPurchase Boolean @default(false)
+  travelPlanId       String?
+  bookingType        String? // 'ACCOMMODATION', 'TRANSPORTATION', 'PACKAGE'
+  bookingId          String?
+
+  // Helpfulness
+  helpfulCount Int     @default(0)
+  reportCount  Int     @default(0)
+  isHidden     Boolean @default(false)
+
+  createdAt          DateTime          @default(now()) @db.Timestamptz(3)
+  updatedAt          DateTime          @updatedAt @db.Timestamptz(3)
+  travelPackage      TravelPackage?    @relation(fields: [travelPackageId], references: [id])
+  travelPackageId    String?
+  vendorExperience   VendorExperience? @relation(fields: [vendorExperienceId], references: [id])
+  vendorExperienceId String?
+
+  @@unique([vendorId, userId])
+  @@index([vendorId])
+  @@index([rating])
+  @@index([createdAt])
+  @@map("vendor_reviews")
+}
+
 model VendorApplication {
   id     String @id @default(cuid())
-  userId String
+  userId String @unique
   user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
 
   // Business details
@@ -167,6 +384,7 @@ model VendorApplication {
   businessPhone   String
   businessEmail   String
   taxId           String?
+  vendorTypes     VendorType[]
 
   // Documents
   documents      String[] // URLs to uploaded documents
@@ -177,6 +395,7 @@ model VendorApplication {
   reviewedBy      String? // SuperAdmin ID who reviewed
   reviewedAt      DateTime?
   rejectionReason String?
+  approvedTypes   VendorType[] // Which vendor types were approved
 
   // Timestamps
   createdAt DateTime @default(now()) @db.Timestamptz(3)
@@ -216,7 +435,7 @@ model Accommodation {
   starRating        Int?              @default(3)
   overallRating     Float?            @default(0)
   vendorId          String
-  vendor            User              @relation(fields: [vendorId], references: [id])
+  vendor            Vendor            @relation(fields: [vendorId], references: [id])
   accommodationType AccommodationType @default(HOTEL)
   priceCategory     PriceCategory     @default(MIDRANGE)
 
@@ -224,27 +443,38 @@ model Accommodation {
   amenities String[]
   images    String[]
 
-  // Policies - Store times in ISO format (HH:MM:SS) since they're recurring daily times
-  checkInTime  String? // Format: "14:00:00"
-  checkOutTime String? // Format: "11:00:00"
-  policies     Json?
+  // Policies
+  checkInTime        String? // Format: "14:00:00"
+  checkOutTime       String? // Format: "11:00:00"
+  policies           Json?
+  cancellationPolicy String?
 
   // Status
-  isActive   Boolean @default(true)
-  isVerified Boolean @default(false)
+  isActive      Boolean   @default(true)
+  isVerified    Boolean   @default(false)
+  isFeatured    Boolean   @default(false)
+  featuredUntil DateTime?
+
+  // Stats
+  totalBookings Int @default(0)
+  totalReviews  Int @default(0)
 
   // Timestamps
-  createdAt DateTime @default(now()) @db.Timestamptz(3) // UTC timestamp
-  updatedAt DateTime @updatedAt @db.Timestamptz(3) // UTC timestamp
+  createdAt DateTime @default(now()) @db.Timestamptz(3)
+  updatedAt DateTime @updatedAt @db.Timestamptz(3)
 
   // Relations
   rooms    AccommodationRoom[]
   services AccommodationService[]
   bookings AccommodationBooking[]
+  user     User?                  @relation(fields: [userId], references: [id])
+  userId   String?
 
   @@index([city])
   @@index([country])
   @@index([accommodationType])
+  @@index([vendorId])
+  @@index([isFeatured])
   @@map("accommodations")
 }
 
@@ -394,29 +624,37 @@ model TransportationProvider {
   perKmRate     Float?
   perMinuteRate Float?
 
-  // Availability - Store operating hours as JSON since it's complex
+  // Availability
   isAvailable    Boolean @default(true)
-  operatingHours Json? // Store as JSON with days and time ranges
+  operatingHours Json?
 
   // Vehicles
   vehicleTypes String[]
 
   // Status
-  isVerified Boolean @default(false)
+  isVerified    Boolean   @default(false)
+  isFeatured    Boolean   @default(false)
+  featuredUntil DateTime?
+
+  // Stats
+  totalBookings Int @default(0)
 
   // Timestamps
-  createdAt DateTime @default(now()) @db.Timestamptz(3) // UTC timestamp
-  updatedAt DateTime @updatedAt @db.Timestamptz(3) // UTC timestamp
+  createdAt DateTime @default(now()) @db.Timestamptz(3)
+  updatedAt DateTime @updatedAt @db.Timestamptz(3)
 
   // Relations
-  vendorId    String
-  vendor      User     @relation(fields: [vendorId], references: [id])
+  vendorId String
+  vendor   Vendor @relation(fields: [vendorId], references: [id])
 
   vehicles TransportationVehicle[]
   bookings TransportationBooking[]
+  user     User?                   @relation(fields: [userId], references: [id])
+  userId   String?
 
   @@index([providerType])
   @@index([name])
+  @@index([vendorId])
   @@map("transportation_providers")
 }
 
@@ -518,6 +756,350 @@ model TransportationBooking {
   @@map("transportation_bookings")
 }
 
+// ==================== TRAVEL PACKAGE MODELS ====================
+
+model TravelPackage {
+  id       String @id @default(cuid())
+  vendorId String
+  vendor   Vendor @relation(fields: [vendorId], references: [id])
+
+  name         String
+  description  String?
+  duration     Int // Duration in days
+  destinations String[] // Array of destinations
+
+  // Pricing
+  basePrice  Float
+  currency   String @default("USD")
+  discount   Float? @default(0)
+  finalPrice Float?
+
+  // Inclusions
+  includes Json? // What's included in the package
+  excludes Json? // What's not included
+
+  // Media
+  images String[]
+  video  String?
+
+  // Itinerary
+  itinerary Json? // Day-wise itinerary
+
+  // Availability
+  startDate     DateTime?
+  endDate       DateTime?
+  isRecurring   Boolean   @default(true)
+  availableDays String[] // Days of week when available
+
+  // Capacity
+  minTravelers Int @default(1)
+  maxTravelers Int @default(20)
+
+  // Status
+  isActive      Boolean   @default(true)
+  isFeatured    Boolean   @default(false)
+  featuredUntil DateTime?
+
+  // Stats
+  totalBookings Int   @default(0)
+  averageRating Float @default(0)
+  totalReviews  Int   @default(0)
+
+  // Timestamps
+  createdAt DateTime @default(now()) @db.Timestamptz(3)
+  updatedAt DateTime @updatedAt @db.Timestamptz(3)
+
+  // Relations
+  bookings TravelPackageBooking[]
+  reviews  VendorReview[] // Reviews for this package
+  user     User?                  @relation(fields: [userId], references: [id])
+  userId   String?
+
+  @@index([vendorId])
+  @@index([isActive])
+  @@index([isFeatured])
+  @@index([destinations])
+  @@map("travel_packages")
+}
+
+model TravelPackageBooking {
+  id           String        @id @default(cuid())
+  packageId    String
+  package      TravelPackage @relation(fields: [packageId], references: [id])
+  travelPlanId String
+  travelPlan   TravelPlan    @relation(fields: [travelPlanId], references: [id])
+
+  bookingDate       DateTime @default(now()) @db.Timestamptz(3)
+  startDate         DateTime @db.Timestamptz(3)
+  endDate           DateTime @db.Timestamptz(3)
+  numberOfTravelers Int      @default(1)
+
+  // Pricing
+  basePrice   Float
+  discount    Float? @default(0)
+  finalAmount Float
+  currency    String @default("USD")
+
+  // Guest information
+  leadGuestName   String
+  leadGuestEmail  String
+  leadGuestPhone  String?
+  specialRequests String?
+
+  // Status
+  status        BookingStatus  @default(PENDING)
+  paymentStatus PaymentStatus  @default(PENDING)
+  paymentMethod PaymentMethod?
+  transactionId String?
+
+  // Timestamps
+  createdAt DateTime @default(now()) @db.Timestamptz(3)
+  updatedAt DateTime @updatedAt @db.Timestamptz(3)
+
+  // Relations
+  transactions Transaction[]
+
+  @@index([packageId])
+  @@index([travelPlanId])
+  @@index([status])
+  @@map("travel_package_bookings")
+}
+
+// ==================== VENDOR EXPERIENCE MODELS ====================
+
+model VendorExperience {
+  id       String @id @default(cuid())
+  vendorId String
+  vendor   Vendor @relation(fields: [vendorId], references: [id])
+
+  name        String
+  description String?
+  category    ExperienceCategory
+
+  // Location
+  location     String
+  city         String
+  country      String
+  latitude     Float?
+  longitude    Float?
+  meetingPoint String?
+
+  // Pricing
+  pricePerPerson Float
+  currency       String @default("USD")
+  childPrice     Float?
+  groupDiscount  Json? // Discount for groups
+
+  // Duration
+  durationHours Float
+  startTime     String?
+  endTime       String?
+
+  // Capacity
+  minParticipants Int @default(1)
+  maxParticipants Int @default(20)
+
+  // Inclusions
+  includes     String[]
+  excludes     String[]
+  whatToBring  String[]
+  restrictions String?
+
+  // Media
+  images String[]
+  video  String?
+
+  // Availability
+  availableDays  String[] // Days of week
+  availableDates Json? // Specific available dates
+  blackoutDates  Json? // Unavailable dates
+
+  // Status
+  isActive      Boolean   @default(true)
+  isFeatured    Boolean   @default(false)
+  featuredUntil DateTime?
+
+  // Stats
+  totalBookings Int   @default(0)
+  averageRating Float @default(0)
+  totalReviews  Int   @default(0)
+
+  // Timestamps
+  createdAt DateTime @default(now()) @db.Timestamptz(3)
+  updatedAt DateTime @updatedAt @db.Timestamptz(3)
+
+  // Relations
+  bookings ExperienceBooking[]
+  reviews  VendorReview[] // Reviews for this experience
+  user     User?               @relation(fields: [userId], references: [id])
+  userId   String?
+
+  @@index([vendorId])
+  @@index([city])
+  @@index([category])
+  @@index([isFeatured])
+  @@map("vendor_experiences")
+}
+
+model ExperienceBooking {
+  id           String           @id @default(cuid())
+  experienceId String
+  experience   VendorExperience @relation(fields: [experienceId], references: [id])
+  travelPlanId String
+  travelPlan   TravelPlan       @relation(fields: [travelPlanId], references: [id])
+
+  bookingDate          DateTime @default(now()) @db.Timestamptz(3)
+  experienceDate       DateTime @db.Timestamptz(3)
+  numberOfParticipants Int      @default(1)
+  numberOfChildren     Int      @default(0)
+
+  // Pricing
+  unitPrice   Float
+  childPrice  Float?
+  totalAmount Float
+  currency    String @default("USD")
+
+  // Guest information
+  leadGuestName   String
+  leadGuestEmail  String
+  leadGuestPhone  String?
+  specialRequests String?
+
+  // Status
+  status        BookingStatus  @default(PENDING)
+  paymentStatus PaymentStatus  @default(PENDING)
+  paymentMethod PaymentMethod?
+  transactionId String?
+
+  // Timestamps
+  createdAt DateTime @default(now()) @db.Timestamptz(3)
+  updatedAt DateTime @updatedAt @db.Timestamptz(3)
+
+  // Relations
+  transactions Transaction[]
+
+  @@index([experienceId])
+  @@index([travelPlanId])
+  @@index([experienceDate])
+  @@map("experience_bookings")
+}
+
+// ==================== FINANCIAL MODELS ====================
+
+enum TransactionStatus {
+  PENDING
+  PROCESSING
+  COMPLETED
+  FAILED
+  REFUNDED
+  CANCELLED
+}
+
+enum PayoutStatus {
+  PENDING
+  PROCESSING
+  COMPLETED
+  FAILED
+  CANCELLED
+}
+
+model Transaction {
+  id       String @id @default(cuid())
+  vendorId String
+  vendor   Vendor @relation(fields: [vendorId], references: [id])
+
+  amount    Float
+  fee       Float // Platform fee
+  netAmount Float // Amount after fee
+  currency  String            @default("USD")
+  status    TransactionStatus @default(PENDING)
+
+  // Related entities
+  bookingType String // 'ACCOMMODATION', 'TRANSPORTATION', 'PACKAGE', 'EXPERIENCE'
+  bookingId   String
+
+  // Payment
+  paymentMethod    PaymentMethod?
+  paymentReference String?
+  paymentDetails   Json?
+
+  // Refund
+  refundAmount Float?
+  refundReason String?
+  refundedAt   DateTime?
+
+  // Metadata
+  description String?
+  metadata    Json?
+
+  // Timestamps
+  createdAt   DateTime  @default(now()) @db.Timestamptz(3)
+  updatedAt   DateTime  @updatedAt @db.Timestamptz(3)
+  completedAt DateTime?
+
+  // Relations
+  payout                 Payout?               @relation(fields: [payoutId], references: [id])
+  user                   User?                 @relation(fields: [userId], references: [id])
+  userId                 String?
+  travelPackageBooking   TravelPackageBooking? @relation(fields: [travelPackageBookingId], references: [id])
+  travelPackageBookingId String?
+  experienceBooking      ExperienceBooking?    @relation(fields: [experienceBookingId], references: [id])
+  experienceBookingId    String?
+  payoutId               String?
+
+  @@index([vendorId])
+  @@index([status])
+  @@index([bookingId])
+  @@index([createdAt])
+  @@map("transactions")
+}
+
+model Payout {
+  id       String @id @default(cuid())
+  vendorId String
+  vendor   Vendor @relation(fields: [vendorId], references: [id])
+
+  amount    Float
+  fee       Float? // Payout processing fee
+  netAmount Float
+  currency  String       @default("USD")
+  status    PayoutStatus @default(PENDING)
+
+  // Payout method
+  payoutMethod  String // 'BANK_TRANSFER', 'PAYPAL', 'STRIPE'
+  payoutDetails Json? // Store payout destination details
+
+  // Transactions included
+  transactionIds String[]
+
+  // Processing
+  processorResponse  Json?
+  processorReference String?
+  processedAt        DateTime?
+  failureReason      String?
+
+  // Bank details (encrypted)
+  bankName      String?
+  accountNumber String?
+  accountName   String?
+  routingNumber String?
+  swiftCode     String?
+
+  // Timestamps
+  requestedAt DateTime  @default(now()) @db.Timestamptz(3)
+  completedAt DateTime?
+  createdAt   DateTime  @default(now()) @db.Timestamptz(3)
+  updatedAt   DateTime  @updatedAt @db.Timestamptz(3)
+
+  // Relations
+  transactions Transaction[]
+
+  @@index([vendorId])
+  @@index([status])
+  @@index([requestedAt])
+  @@map("payouts")
+}
+
 // ==================== SHOPPING MODELS ====================
 
 model RetailStore {
@@ -532,13 +1114,17 @@ model RetailStore {
   country   String
   category  String?
 
+  // Location coordinates - ADD THESE FIELDS
+  latitude  Float?   // Add this
+  longitude Float?   // Add this
+
   // Contact
   phone   String?
   email   String?
   website String?
 
-  // Store information - Store opening hours as JSON since it's complex
-  openingHours Json? // Store as JSON with days and time ranges
+  // Store information
+  openingHours Json?
   rating       Float?      @default(0)
   priceRange   PriceRange?
 
@@ -549,11 +1135,14 @@ model RetailStore {
   images String[]
 
   // Status
-  isActive Boolean @default(true)
+  isActive   Boolean @default(true)
+  isVerified Boolean @default(false)
+  vendorId   String? // Optional - stores can be independent or vendor-owned
+  vendor     Vendor? @relation(fields: [vendorId], references: [id])
 
   // Timestamps
-  createdAt DateTime @default(now()) @db.Timestamptz(3) // UTC timestamp
-  updatedAt DateTime @updatedAt @db.Timestamptz(3) // UTC timestamp
+  createdAt DateTime @default(now()) @db.Timestamptz(3)
+  updatedAt DateTime @updatedAt @db.Timestamptz(3)
 
   // Relations
   visits ShoppingVisit[]
@@ -561,7 +1150,7 @@ model RetailStore {
   @@index([city])
   @@index([country])
   @@index([storeType])
-  @@index([category])
+  @@index([vendorId])
   @@map("retail_stores")
 }
 

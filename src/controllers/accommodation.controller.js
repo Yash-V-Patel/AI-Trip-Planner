@@ -43,11 +43,22 @@ class AccommodationController {
     try {
       switch (requiredPermission) {
         case "edit":
-          return await openfgaService.canEditTravelPlan?.(userId, travelPlanId) || false;
+          return (
+            (await openfgaService.canEditTravelPlan?.(userId, travelPlanId)) ||
+            false
+          );
         case "view":
-          return await openfgaService.canViewTravelPlan?.(userId, travelPlanId) || false;
+          return (
+            (await openfgaService.canViewTravelPlan?.(userId, travelPlanId)) ||
+            false
+          );
         case "suggest":
-          return await openfgaService.canSuggestTravelPlan?.(userId, travelPlanId) || false;
+          return (
+            (await openfgaService.canSuggestTravelPlan?.(
+              userId,
+              travelPlanId,
+            )) || false
+          );
         default:
           return false;
       }
@@ -63,15 +74,16 @@ class AccommodationController {
   async checkIsVendor(userId) {
     try {
       if (!userId) return false;
-      
-      // Check if user has vendor role in OpenFGA
-      const isVendor = await openfgaService.checkPermission?.(
-        userId,
-        "can_manage_own_accommodations",
-        "vendor:global"
-      ) || false;
-      
-      return isVendor;
+
+      const vendor = await prisma.vendor.findUnique({
+        where: {
+          userId,
+          verificationStatus: "VERIFIED",
+          isActive: true,
+        },
+      });
+
+      return !!vendor;
     } catch (error) {
       console.error("Error checking vendor status:", error);
       return false;
@@ -94,40 +106,66 @@ class AccommodationController {
         return isVendor;
       }
 
-      // For existing accommodations, check if user is the vendor who owns it
+      // For existing accommodations, first get the vendor record for this user
+      const vendor = await prisma.vendor.findUnique({
+        where: { userId: user?.id },
+      });
+
+      if (!vendor) return false;
+
+      // Get the accommodation to check ownership
       const accommodation = await prisma.accommodation.findUnique({
         where: { id: accommodationId },
-        select: { vendorId: true }
+        select: { vendorId: true },
       });
 
       if (!accommodation) return false;
 
       // If user is the vendor who owns this accommodation
-      if (accommodation.vendorId === user?.id) {
-        // Vendors can do everything except delete (maybe allow delete if no bookings)
+      if (accommodation.vendorId === vendor.id) {
         if (action === "delete") {
           // Check if accommodation has any active bookings
           const activeBookings = await prisma.accommodationBooking.count({
             where: {
               accommodationId,
-              bookingStatus: { in: ['PENDING', 'CONFIRMED', 'CHECKED_IN'] }
-            }
+              bookingStatus: { in: ["PENDING", "CONFIRMED", "CHECKED_IN"] },
+            },
           });
-          return activeBookings === 0; // Can only delete if no active bookings
+          return activeBookings === 0;
         }
         return true; // Vendors can view, edit, update their own
       }
 
-      // Check OpenFGA permissions for other cases (managers, editors, etc.)
+      // Check OpenFGA permissions for other cases
       switch (action) {
         case "delete":
-          return await openfgaService.canDeleteAccommodation?.(user?.id, accommodationId) || false;
+          return (
+            (await openfgaService.canDeleteAccommodation?.(
+              user?.id,
+              accommodationId,
+            )) || false
+          );
         case "update":
-          return await openfgaService.canUpdateAccommodation?.(user?.id, accommodationId) || false;
+          return (
+            (await openfgaService.canUpdateAccommodation?.(
+              user?.id,
+              accommodationId,
+            )) || false
+          );
         case "edit":
-          return await openfgaService.canEditAccommodation?.(user?.id, accommodationId) || false;
+          return (
+            (await openfgaService.canEditAccommodation?.(
+              user?.id,
+              accommodationId,
+            )) || false
+          );
         case "view":
-          return await openfgaService.canViewAccommodation?.(user?.id, accommodationId) || false;
+          return (
+            (await openfgaService.canViewAccommodation?.(
+              user?.id,
+              accommodationId,
+            )) || false
+          );
         default:
           return false;
       }
@@ -150,7 +188,7 @@ class AccommodationController {
       // First check if user is the vendor who owns this accommodation
       const accommodation = await prisma.accommodation.findUnique({
         where: { id: accommodationId },
-        select: { vendorId: true }
+        select: { vendorId: true },
       });
 
       if (accommodation?.vendorId === user?.id) {
@@ -161,20 +199,28 @@ class AccommodationController {
         // Check specific room permissions
         switch (action) {
           case "delete":
-            return await openfgaService.canDeleteRoom?.(user?.id, roomId) || false;
+            return (
+              (await openfgaService.canDeleteRoom?.(user?.id, roomId)) || false
+            );
           case "edit":
-            return await openfgaService.canEditRoom?.(user?.id, roomId) || false;
+            return (
+              (await openfgaService.canEditRoom?.(user?.id, roomId)) || false
+            );
           case "view":
-            return await openfgaService.canViewRoom?.(user?.id, roomId) || false;
+            return (
+              (await openfgaService.canViewRoom?.(user?.id, roomId)) || false
+            );
           default:
             return false;
         }
       } else {
         // Check if user can manage rooms in this accommodation
-        return await openfgaService.canManageAccommodationRooms?.(
-          user?.id,
-          accommodationId,
-        ) || false;
+        return (
+          (await openfgaService.canManageAccommodationRooms?.(
+            user?.id,
+            accommodationId,
+          )) || false
+        );
       }
     } catch (error) {
       console.error("Error in canManageRoom:", error);
@@ -187,7 +233,12 @@ class AccommodationController {
    * SuperAdmin always has access
    * Vendor can manage services in their own accommodations
    */
-  async canManageService(user, accommodationId, serviceId = null, action = "view") {
+  async canManageService(
+    user,
+    accommodationId,
+    serviceId = null,
+    action = "view",
+  ) {
     try {
       // SuperAdmin always has access
       if (user?.isSuperAdmin) return true;
@@ -195,7 +246,7 @@ class AccommodationController {
       // First check if user is the vendor who owns this accommodation
       const accommodation = await prisma.accommodation.findUnique({
         where: { id: accommodationId },
-        select: { vendorId: true }
+        select: { vendorId: true },
       });
 
       if (accommodation?.vendorId === user?.id) {
@@ -206,20 +257,31 @@ class AccommodationController {
         // Check specific service permissions
         switch (action) {
           case "delete":
-            return await openfgaService.canDeleteService?.(user?.id, serviceId) || false;
+            return (
+              (await openfgaService.canDeleteService?.(user?.id, serviceId)) ||
+              false
+            );
           case "edit":
-            return await openfgaService.canEditService?.(user?.id, serviceId) || false;
+            return (
+              (await openfgaService.canEditService?.(user?.id, serviceId)) ||
+              false
+            );
           case "view":
-            return await openfgaService.canViewService?.(user?.id, serviceId) || false;
+            return (
+              (await openfgaService.canViewService?.(user?.id, serviceId)) ||
+              false
+            );
           default:
             return false;
         }
       } else {
         // Check if user can manage services in this accommodation
-        return await openfgaService.canManageAccommodationServices?.(
-          user?.id,
-          accommodationId,
-        ) || false;
+        return (
+          (await openfgaService.canManageAccommodationServices?.(
+            user?.id,
+            accommodationId,
+          )) || false
+        );
       }
     } catch (error) {
       console.error("Error in canManageService:", error);
@@ -232,7 +294,6 @@ class AccommodationController {
   /**
    * Create a new accommodation
    * POST /api/accommodations
-   * Access: Vendors and SuperAdmins
    */
   async createAccommodation(req, res, next) {
     try {
@@ -241,7 +302,19 @@ class AccommodationController {
       if (!canManage) {
         return res.status(403).json({
           success: false,
-          message: 'Only approved vendors can create accommodations'
+          message: "Only approved vendors can create accommodations",
+        });
+      }
+
+      // Get the vendor record
+      const vendor = await prisma.vendor.findUnique({
+        where: { userId: req.user.id },
+      });
+
+      if (!vendor) {
+        return res.status(403).json({
+          success: false,
+          message: "Vendor record not found",
         });
       }
 
@@ -252,126 +325,191 @@ class AccommodationController {
         accommodationData.phone = String(accommodationData.phone);
       }
 
-      // Add vendorId to track ownership
-      accommodationData.vendorId = req.user.id;
+      // Add vendorId from the vendor record
+      accommodationData.vendorId = vendor.id;
 
       const accommodation = await prisma.accommodation.create({
         data: accommodationData,
         include: {
           rooms: true,
-          services: true
-        }
+          services: true,
+        },
       });
 
-      // Set up OpenFGA relations - make creator the owner
+      // Set up OpenFGA relations
       if (openfgaService.createAccommodationRelations) {
-        await openfgaService.createAccommodationRelations(req.user.id, accommodation.id);
+        await openfgaService.createAccommodationRelations(
+          req.user.id,
+          accommodation.id,
+        );
       }
 
       // Invalidate accommodations list cache
-      await redisService.client?.del('accommodations:list:*');
+      await redisService.client?.del("accommodations:list:*");
 
       res.status(201).json({
         success: true,
         data: accommodation,
-        message: 'Accommodation created successfully'
+        message: "Accommodation created successfully",
       });
     } catch (error) {
-      if (error.code === 'P2002' && error.meta?.target?.includes('name')) {
+      if (error.code === "P2002" && error.meta?.target?.includes("name")) {
         return res.status(409).json({
           success: false,
-          message: 'Accommodation with this name already exists'
+          message: "Accommodation with this name already exists",
         });
       }
       next(error);
     }
   }
+/**
+ * Get all accommodations with filtering
+ * GET /api/accommodations
+ * Access: Public
+ */
+async getAllAccommodations(req, res, next) {
+  try {
+    const {
+      location,     // New: search by location (city or area)
+      city,
+      country,
+      type,
+      minRating,
+      maxPrice,
+      search,
+      sortBy = 'createdAt',
+      sortOrder = 'desc',
+      page = 1,
+      limit = 10,
+    } = req.query;
 
-  /**
-   * Get all accommodations with filtering
-   * GET /api/accommodations
-   * Access: Public
-   */
-  async getAllAccommodations(req, res, next) {
-    try {
-      const {
-        city,
-        country,
-        type,
-        minRating,
-        maxPrice,
-        page = 1,
-        limit = 10,
-      } = req.query;
+    // Build filter
+    const where = {
+      isActive: true // Only show active accommodations
+    };
 
-      // Build cache key
-      const cacheKey = `accommodations:list:${city || ""}:${country || ""}:${type || ""}:${page}:${limit}`;
-
-      // Try cache first
-      let result = await redisService.client?.get(cacheKey);
-      if (result && !req.query.skipCache) {
-        return res.json({
-          success: true,
-          ...JSON.parse(result),
-          cached: true,
-        });
+    // NEW: Enhanced location search
+    if (location) {
+      // Search across multiple fields
+      where.OR = [
+        { city: { contains: location, mode: 'insensitive' } },
+        { address: { contains: location, mode: 'insensitive' } },
+        { name: { contains: location, mode: 'insensitive' } }
+      ];
+    } else {
+      // Original filters
+      if (city) {
+        where.city = {
+          contains: city,
+          mode: 'insensitive'
+        };
       }
+      
+      if (country) {
+        where.country = {
+          contains: country,
+          mode: 'insensitive'
+        };
+      }
+    }
+    
+    if (type) {
+      where.accommodationType = type;
+    }
+    
+    if (minRating) {
+      where.starRating = {
+        gte: parseInt(minRating)
+      };
+    }
+    
+    // Search by name or description
+    if (search) {
+      where.OR = [
+        { name: { contains: search, mode: 'insensitive' } },
+        { description: { contains: search, mode: 'insensitive' } }
+      ];
+    }
 
-      // Build filter
-      const where = {};
-      if (city) where.city = { contains: city, mode: "insensitive" };
-      if (country) where.country = { contains: country, mode: "insensitive" };
-      if (type) where.accommodationType = type;
-      if (minRating) where.starRating = { gte: parseInt(minRating) };
-      if (maxPrice)
-        where.priceCategory = this.getPriceCategoryFromMax(parseInt(maxPrice));
+    // Price filter (by price category)
+    if (maxPrice) {
+      const priceCategory = this.getPriceCategoryFromMax(parseInt(maxPrice));
+      where.priceCategory = priceCategory;
+    }
 
-      // Only show active accommodations to public
-      where.isActive = true;
+    const skip = (parseInt(page) - 1) * parseInt(limit);
 
-      const skip = (parseInt(page) - 1) * parseInt(limit);
+    // Build sorting
+    const orderBy = {};
+    orderBy[sortBy] = sortOrder;
 
-      const [accommodations, total] = await Promise.all([
-        prisma.accommodation.findMany({
-          where,
-          include: {
-            rooms: {
-              where: { isAvailable: true },
-              take: 5,
-            },
-            _count: {
-              select: {
-                rooms: true,
-                bookings: true,
-              },
+    console.log('Accommodation query where:', JSON.stringify(where, null, 2));
+
+    const [accommodations, total] = await Promise.all([
+      prisma.accommodation.findMany({
+        where,
+        include: {
+          rooms: {
+            where: { isAvailable: true },
+            take: 3,
+            select: {
+              id: true,
+              roomNumber: true,
+              roomType: true,
+              basePrice: true,
+              maxOccupancy: true,
+              isAvailable: true
+            }
+          },
+          _count: {
+            select: {
+              rooms: true,
+              bookings: true,
             },
           },
-          skip,
-          take: parseInt(limit),
-          orderBy: { createdAt: "desc" },
-        }),
-        prisma.accommodation.count({ where }),
-      ]);
-
-      const response = {
-        success: true,
-        data: accommodations,
-        pagination: {
-          page: parseInt(page),
-          limit: parseInt(limit),
-          total,
-          pages: Math.ceil(total / parseInt(limit)),
         },
-      };
+        skip,
+        take: parseInt(limit),
+        orderBy,
+      }),
+      prisma.accommodation.count({ where }),
+    ]);
 
-      // Cache for 10 minutes
-      await redisService.client?.setex(cacheKey, 600, JSON.stringify(response));
+    // Format the response
+    const formattedAccommodations = accommodations.map(acc => ({
+      ...acc,
+      availableRooms: acc.rooms.length,
+      cheapestRoom: acc.rooms.length > 0 
+        ? Math.min(...acc.rooms.map(r => r.basePrice)) 
+        : null,
+      roomTypes: [...new Set(acc.rooms.map(r => r.roomType))],
+    }));
 
-      res.json(response);
-    } catch (error) {
-      next(error);
-    }
+    const response = {
+      success: true,
+      data: formattedAccommodations,
+      pagination: {
+        page: parseInt(page),
+        limit: parseInt(limit),
+        total,
+        pages: Math.ceil(total / parseInt(limit)),
+      },
+      filters: {
+        location: location || null,
+        city: city || null,
+        country: country || null,
+        type: type || null,
+        minRating: minRating || null,
+        maxPrice: maxPrice || null,
+      }
+    };
+
+    res.json(response);
+  } catch (error) {
+    console.error('Error in getAllAccommodations:', error);
+    next(error);
   }
+}
 
   /**
    * Get accommodation by ID
@@ -423,7 +561,11 @@ class AccommodationController {
       }
 
       // Cache for 1 hour
-      await redisService.client?.setex(cacheKey, 3600, JSON.stringify(accommodation));
+      await redisService.client?.setex(
+        cacheKey,
+        3600,
+        JSON.stringify(accommodation),
+      );
 
       res.json({
         success: true,
@@ -444,11 +586,15 @@ class AccommodationController {
       const { id } = req.params;
 
       // Check permission
-      const canManage = await this.canManageAccommodation(req.user, id, 'update');
+      const canManage = await this.canManageAccommodation(
+        req.user,
+        id,
+        "update",
+      );
       if (!canManage) {
         return res.status(403).json({
           success: false,
-          message: 'You can only update your own accommodations'
+          message: "You can only update your own accommodations",
         });
       }
 
@@ -467,26 +613,26 @@ class AccommodationController {
         data: updateData,
         include: {
           rooms: true,
-          services: true
-        }
+          services: true,
+        },
       });
 
       // Invalidate caches
       await Promise.all([
         redisService.client?.del(`accommodation:${id}`),
-        redisService.client?.del('accommodations:list:*')
+        redisService.client?.del("accommodations:list:*"),
       ]);
 
       res.json({
         success: true,
         data: accommodation,
-        message: 'Accommodation updated successfully'
+        message: "Accommodation updated successfully",
       });
     } catch (error) {
-      if (error.code === 'P2025') {
+      if (error.code === "P2025") {
         return res.status(404).json({
           success: false,
-          message: 'Accommodation not found'
+          message: "Accommodation not found",
         });
       }
       next(error);
@@ -503,11 +649,16 @@ class AccommodationController {
       const { id } = req.params;
 
       // Check permission
-      const canManage = await this.canManageAccommodation(req.user, id, 'delete');
+      const canManage = await this.canManageAccommodation(
+        req.user,
+        id,
+        "delete",
+      );
       if (!canManage) {
         return res.status(403).json({
           success: false,
-          message: 'You can only delete your own accommodations with no active bookings'
+          message:
+            "You can only delete your own accommodations with no active bookings",
         });
       }
 
@@ -515,36 +666,37 @@ class AccommodationController {
       const activeBookings = await prisma.accommodationBooking.count({
         where: {
           accommodationId: id,
-          bookingStatus: { in: ['PENDING', 'CONFIRMED', 'CHECKED_IN'] }
-        }
+          bookingStatus: { in: ["PENDING", "CONFIRMED", "CHECKED_IN"] },
+        },
       });
 
       if (activeBookings > 0) {
         return res.status(400).json({
           success: false,
-          message: 'Cannot delete accommodation with active bookings. Deactivate it instead.'
+          message:
+            "Cannot delete accommodation with active bookings. Deactivate it instead.",
         });
       }
 
       await prisma.accommodation.delete({
-        where: { id }
+        where: { id },
       });
 
       // Invalidate caches
       await Promise.all([
         redisService.client?.del(`accommodation:${id}`),
-        redisService.client?.del('accommodations:list:*')
+        redisService.client?.del("accommodations:list:*"),
       ]);
 
       res.json({
         success: true,
-        message: 'Accommodation deleted successfully'
+        message: "Accommodation deleted successfully",
       });
     } catch (error) {
-      if (error.code === 'P2025') {
+      if (error.code === "P2025") {
         return res.status(404).json({
           success: false,
-          message: 'Accommodation not found'
+          message: "Accommodation not found",
         });
       }
       next(error);
@@ -563,11 +715,16 @@ class AccommodationController {
       const { accommodationId } = req.params;
 
       // Check permission
-      const canManage = await this.canManageRoom(req.user, accommodationId, null, 'edit');
+      const canManage = await this.canManageRoom(
+        req.user,
+        accommodationId,
+        null,
+        "edit",
+      );
       if (!canManage) {
         return res.status(403).json({
           success: false,
-          message: 'You can only add rooms to your own accommodations'
+          message: "You can only add rooms to your own accommodations",
         });
       }
 
@@ -576,13 +733,17 @@ class AccommodationController {
       const room = await prisma.accommodationRoom.create({
         data: {
           ...roomData,
-          accommodationId
-        }
+          accommodationId,
+        },
       });
 
       // Set up OpenFGA relations
       if (openfgaService.createRoomRelations) {
-        await openfgaService.createRoomRelations(req.user.id, room.id, accommodationId);
+        await openfgaService.createRoomRelations(
+          req.user.id,
+          room.id,
+          accommodationId,
+        );
       }
 
       // Invalidate accommodation cache
@@ -591,7 +752,7 @@ class AccommodationController {
       res.status(201).json({
         success: true,
         data: room,
-        message: 'Room added successfully'
+        message: "Room added successfully",
       });
     } catch (error) {
       next(error);
@@ -628,9 +789,9 @@ class AccommodationController {
         req.user,
         room.accommodation.id,
         roomId,
-        'edit'
+        "edit",
       );
-      
+
       if (!canManage) {
         return res.status(403).json({
           success: false,
@@ -692,9 +853,9 @@ class AccommodationController {
         req.user,
         room.accommodation.id,
         roomId,
-        'delete'
+        "delete",
       );
-      
+
       if (!canManage) {
         return res.status(403).json({
           success: false,
@@ -716,7 +877,8 @@ class AccommodationController {
       if (futureBookings > 0) {
         return res.status(400).json({
           success: false,
-          message: "Cannot delete room with future bookings. Mark it as unavailable instead.",
+          message:
+            "Cannot delete room with future bookings. Mark it as unavailable instead.",
         });
       }
 
@@ -754,24 +916,33 @@ class AccommodationController {
       const { accommodationId } = req.params;
 
       // Check permission
-      const canManage = await this.canManageService(req.user, accommodationId, null, 'edit');
+      const canManage = await this.canManageService(
+        req.user,
+        accommodationId,
+        null,
+        "edit",
+      );
       if (!canManage) {
         return res.status(403).json({
           success: false,
-          message: 'You can only add services to your own accommodations'
+          message: "You can only add services to your own accommodations",
         });
       }
 
       const service = await prisma.accommodationService.create({
         data: {
           ...req.body,
-          accommodationId
-        }
+          accommodationId,
+        },
       });
 
       // Set up OpenFGA relations
       if (openfgaService.createServiceRelations) {
-        await openfgaService.createServiceRelations(req.user.id, service.id, accommodationId);
+        await openfgaService.createServiceRelations(
+          req.user.id,
+          service.id,
+          accommodationId,
+        );
       }
 
       // Invalidate accommodation cache
@@ -780,7 +951,7 @@ class AccommodationController {
       res.status(201).json({
         success: true,
         data: service,
-        message: 'Service added successfully'
+        message: "Service added successfully",
       });
     } catch (error) {
       next(error);
@@ -817,9 +988,9 @@ class AccommodationController {
         req.user,
         service.accommodation.id,
         serviceId,
-        'edit'
+        "edit",
       );
-      
+
       if (!canManage) {
         return res.status(403).json({
           success: false,
@@ -833,7 +1004,9 @@ class AccommodationController {
       });
 
       // Invalidate accommodation cache
-      await redisService.client?.del(`accommodation:${service.accommodation.id}`);
+      await redisService.client?.del(
+        `accommodation:${service.accommodation.id}`,
+      );
 
       res.json({
         success: true,
@@ -881,9 +1054,9 @@ class AccommodationController {
         req.user,
         service.accommodation.id,
         serviceId,
-        'delete'
+        "delete",
       );
-      
+
       if (!canManage) {
         return res.status(403).json({
           success: false,
@@ -896,7 +1069,9 @@ class AccommodationController {
       });
 
       // Invalidate accommodation cache
-      await redisService.client?.del(`accommodation:${service.accommodation.id}`);
+      await redisService.client?.del(
+        `accommodation:${service.accommodation.id}`,
+      );
 
       res.json({
         success: true,
@@ -915,7 +1090,7 @@ class AccommodationController {
 
   // ==================== BOOKING MANAGEMENT ====================
   // ... (keep all booking methods as they were - they don't change with vendor role)
-  
+
   /**
    * Create accommodation booking
    * POST /api/travel-plans/:travelPlanId/accommodation-bookings
@@ -927,15 +1102,15 @@ class AccommodationController {
       const bookingData = req.body;
 
       // Check if user has permission to edit the travel plan
-      const canEdit = await openfgaService.canEditTravelPlan?.(
-        req.user.id,
-        travelPlanId,
-      ) || false;
-      
+      const canEdit =
+        (await openfgaService.canEditTravelPlan?.(req.user.id, travelPlanId)) ||
+        false;
+
       if (!canEdit && !req.user.isSuperAdmin) {
         return res.status(403).json({
           success: false,
-          message: "You do not have permission to add bookings to this travel plan",
+          message:
+            "You do not have permission to add bookings to this travel plan",
         });
       }
 
@@ -975,7 +1150,9 @@ class AccommodationController {
         });
       }
 
-      if (accommodation.rooms.length !== bookingData.selectedRoomNumbers.length) {
+      if (
+        accommodation.rooms.length !== bookingData.selectedRoomNumbers.length
+      ) {
         return res.status(400).json({
           success: false,
           message: "One or more selected rooms are not available",
@@ -1073,11 +1250,12 @@ class AccommodationController {
       }
 
       // Check permission
-      const canView = await openfgaService.canViewAccommodationBooking?.(
-        req.user.id,
-        bookingId,
-      ) || false;
-      
+      const canView =
+        (await openfgaService.canViewAccommodationBooking?.(
+          req.user.id,
+          bookingId,
+        )) || false;
+
       if (!canView && !req.user.isSuperAdmin) {
         return res.status(403).json({
           success: false,
@@ -1104,11 +1282,12 @@ class AccommodationController {
       const { bookingId } = req.params;
 
       // Check permission
-      const canEdit = await openfgaService.canEditAccommodationBooking?.(
-        req.user.id,
-        bookingId,
-      ) || false;
-      
+      const canEdit =
+        (await openfgaService.canEditAccommodationBooking?.(
+          req.user.id,
+          bookingId,
+        )) || false;
+
       if (!canEdit && !req.user.isSuperAdmin) {
         return res.status(403).json({
           success: false,
@@ -1129,7 +1308,9 @@ class AccommodationController {
       }
 
       // Don't allow updates to cancelled or completed bookings
-      if (["CANCELLED", "CHECKED_OUT", "NO_SHOW"].includes(booking.bookingStatus)) {
+      if (
+        ["CANCELLED", "CHECKED_OUT", "NO_SHOW"].includes(booking.bookingStatus)
+      ) {
         return res.status(400).json({
           success: false,
           message: `Cannot update booking with status: ${booking.bookingStatus}`,
@@ -1171,11 +1352,12 @@ class AccommodationController {
       const { bookingId } = req.params;
 
       // Check permission
-      const canCancel = await openfgaService.canCancelAccommodationBooking?.(
-        req.user.id,
-        bookingId,
-      ) || false;
-      
+      const canCancel =
+        (await openfgaService.canCancelAccommodationBooking?.(
+          req.user.id,
+          bookingId,
+        )) || false;
+
       if (!canCancel && !req.user.isSuperAdmin) {
         return res.status(403).json({
           success: false,
@@ -1200,7 +1382,8 @@ class AccommodationController {
         where: { id: bookingId },
         data: {
           bookingStatus: "CANCELLED",
-          paymentStatus: booking.paymentStatus === "PAID" ? "REFUNDED" : "PENDING",
+          paymentStatus:
+            booking.paymentStatus === "PAID" ? "REFUNDED" : "PENDING",
         },
       });
 
@@ -1268,7 +1451,9 @@ class AccommodationController {
         },
       });
 
-      const bookedRoomNumbers = bookedRooms.flatMap((b) => b.selectedRoomNumbers);
+      const bookedRoomNumbers = bookedRooms.flatMap(
+        (b) => b.selectedRoomNumbers,
+      );
 
       // Filter available rooms
       const availableRooms = rooms.filter(
@@ -1289,12 +1474,13 @@ class AccommodationController {
   /**
    * Get price category from max price
    */
-  getPriceCategoryFromMax(maxPrice) {
-    if (maxPrice < 100) return "BUDGET";
-    if (maxPrice < 300) return "MIDRANGE";
-    if (maxPrice < 500) return "LUXURY";
-    return "BOUTIQUE";
-  }
+getPriceCategoryFromMax(maxPrice) {
+  // Adjust these thresholds based on your actual pricing
+  if (maxPrice < 3000) return "BUDGET";      // Under ₹3000
+  if (maxPrice < 7000) return "MIDRANGE";    // ₹3000 - ₹7000
+  if (maxPrice < 15000) return "EXPENSIVE";  // ₹7000 - ₹15000
+  return "LUXURY";                            // Above ₹15000
+}
 }
 
 module.exports = new AccommodationController();

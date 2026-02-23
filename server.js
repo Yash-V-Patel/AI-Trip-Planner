@@ -17,7 +17,10 @@ const userRoutes = require('./src/routes/user.routes');
 const accommodationRoutes = require('./src/routes/accommodation.routes');
 const vendorRoutes = require('./src/routes/vendor.routes');
 const transportationRoutes = require('./src/routes/transportation.routes');
-// const travelPlanRoutes = require('./routes/travelplan.routes');
+const storeRoutes = require('./src/routes/store.routes');
+const travelPlanRoutes = require('./src/routes/travelplan.routes');
+const vendorExperienceRoutes = require('./src/routes/vendor-experience.routes');
+const travelerExperienceRoutes = require('./src/routes/traveler-experience.routes');
 
 // Import OpenFGA service (not the config initializer)
 const {createSuperAdmin} = require("./src/config/make-superadmin")
@@ -278,7 +281,10 @@ app.use('/api/users', userRoutes);
 app.use('/api/accommodations', accommodationRoutes);
 app.use('/api/vendor', vendorRoutes);
 app.use('/api/transportation', transportationRoutes);
-// app.use('/api/travel-plans', travelPlanRoutes);
+app.use('/api/stores', storeRoutes);
+app.use('/api/travel-plans', travelPlanRoutes);
+app.use('/api/vendor/experiences', vendorExperienceRoutes);  
+app.use('/api/experiences', travelerExperienceRoutes);
 
 // Test route for logging demonstration
 app.get("/api/test", (req, res) => {
