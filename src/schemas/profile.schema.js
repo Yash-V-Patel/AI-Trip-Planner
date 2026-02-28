@@ -134,21 +134,21 @@ const profileSchema = Joi.object({
     .pattern(/^@?([\w.]){1,30}$/)
     .messages({
       'string.pattern.base': 'Please provide a valid Instagram handle'
-    }),
+    }).optional(),
   
   facebookProfile: Joi.string()
     .uri()
     .max(200)
     .messages({
       'string.uri': 'Please provide a valid Facebook profile URL'
-    }),
+    }).optional(),
   
   linkedInProfile: Joi.string()
     .uri()
     .max(200)
     .messages({
       'string.uri': 'Please provide a valid LinkedIn profile URL'
-    }),
+    }).optional(),
 
   // Statistics
   totalTripsPlanned: Joi.number()

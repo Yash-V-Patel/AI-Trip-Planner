@@ -3,10 +3,37 @@ const { PrismaClient } = require("@prisma/client");
 const openfgaService = require("../services/openfga.service");
 const redisService = require("../services/redis.service");
 const { generateTokens, verifyRefreshToken } = require("../utils/jwt.utils");
-
+const jwt = require("jsonwebtoken")
 const prisma = new PrismaClient();
+const dotenv = require("dotenv");
+dotenv.config()
 
 class AuthController {
+
+async getCurrentUser(req, res) {
+  if (!req.user?.id) {
+    return res.status(401).json({ success: false, message: 'Not authenticated' });
+  }
+
+  const user = await prisma.user.findUnique({
+    where: { id: req.user.id },
+    include: { profile: true },
+  });
+
+  if (!user) {
+    return res.status(404).json({ success: false, message: 'User not found' });
+  }
+
+  const { password, ...safeUser } = user;
+
+  res.json({
+    success: true,
+    user: {
+      ...safeUser,
+      isSuperAdmin: await openfgaService.checkSuperAdmin(user.id),
+    },
+  });
+}
   async register(req, res, next) {
     try {
       const { email, password, name, phone } = req.body;
@@ -186,119 +213,87 @@ class AuthController {
       next(error);
     }
   }
-  async refreshToken(req, res, next) {
-    try {
-      const { refreshToken } = req.body;
-
-      // Verify refresh token
-      const decoded = verifyRefreshToken(refreshToken);
-      if (!decoded) {
-        return res.status(401).json({
-          success: false,
-          message: "Invalid refresh token",
-        });
-      }
-
-      // Check Redis for fingerprint (fast path)
-      const redisFingerprint = await redisService.validateRefreshToken(
-        decoded.userId,
-        refreshToken,
-      );
-
-      // If not in Redis, check database (slow path)
-      if (!redisFingerprint) {
-        const storedToken = await prisma.refreshToken.findFirst({
-          where: {
-            token: refreshToken,
-            userId: decoded.userId,
-            isRevoked: false,
-            expiresAt: { gt: new Date() },
-          },
-        });
-
-        if (!storedToken) {
-          return res.status(401).json({
-            success: false,
-            message: "Refresh token expired or revoked",
-          });
-        }
-
-        // Restore fingerprint in Redis for future requests
-        await redisService.storeRefreshTokenFingerprint(
-          decoded.userId,
-          refreshToken,
-          { restored: true },
-        );
-      }
-
-      // Generate new access token only (keep same refresh token)
-      const newAccessToken = jwt.sign(
-        { userId: decoded.userId, email: decoded.email },
-        process.env.JWT_ACCESS_SECRET,
-        { expiresIn: "1d" },
-      );
-
-      // Return new access token with existing refresh token
-      res.json({
-        success: true,
-        data: {
-          accessToken: newAccessToken,
-          refreshToken: refreshToken, // Return the same refresh token
-        },
+async refreshToken(req, res, next) {
+  try {
+    console.log('Refresh token request received');
+    const { refreshToken } = req.body;
+    
+    if (!refreshToken) {
+      console.log('No refresh token provided');
+      return res.status(400).json({
+        success: false,
+        message: "Refresh token is required",
       });
-    } catch (error) {
-      next(error);
     }
-  }
 
-  async logout(req, res, next) {
-    try {
-      const { refreshToken } = req.body;
-      const userId = req.user.id;
-
-      // Remove refresh token fingerprint from Redis
-      if (refreshToken) {
-        await redisService.removeRefreshTokenFingerprint(userId, refreshToken);
-
-        // Revoke in database
-        await prisma.refreshToken.updateMany({
-          where: {
-            token: refreshToken,
-            userId,
-          },
-          data: { isRevoked: true },
-        });
-
-        // Blacklist the access token
-        const authHeader = req.headers.authorization;
-        if (authHeader) {
-          const accessToken = authHeader.split(" ")[1];
-          // Blacklist for 1 day (access token expiry)
-          await redisService.blacklistAccessToken(accessToken, 24 * 60 * 60);
-        }
-      } else {
-        // Revoke all user's refresh tokens
-        await redisService.removeAllUserRefreshTokens(userId);
-
-        await prisma.refreshToken.updateMany({
-          where: { userId },
-          data: { isRevoked: true },
-        });
-      }
-
-      // Invalidate user cache
-      await redisService.invalidateUserCache(userId, req.user.email);
-      await redisService.invalidateProfile(userId);
-
-      res.json({
-        success: true,
-        message: "Logout successful",
+    console.log('Verifying refresh token');
+    const decoded = verifyRefreshToken(refreshToken);
+    if (!decoded) {
+      console.log('Invalid refresh token');
+      return res.status(401).json({
+        success: false,
+        message: "Invalid refresh token",
       });
-    } catch (error) {
-      next(error);
     }
-  }
 
+    console.log('Checking Redis for token validity');
+    const isValid = await redisService.validateRefreshToken(
+      decoded.userId,
+      refreshToken
+    );
+
+    if (!isValid) {
+      console.log('Token not found in Redis');
+      return res.status(401).json({
+        success: false,
+        message: "Refresh token expired or revoked",
+      });
+    }
+
+    console.log('Generating new tokens');
+    // Generate new access token
+    const newAccessToken = jwt.sign(
+      { userId: decoded.userId, email: decoded.email },
+      process.env.JWT_ACCESS_SECRET,
+      { expiresIn: "1d" }
+    );
+
+    console.log('Refresh token successful');
+    res.json({
+      success: true,
+      data: {
+        accessToken: newAccessToken,
+        refreshToken: refreshToken, // same refresh token
+      },
+    });
+  } catch (error) {
+    console.error('Refresh token error details:', error);
+    next(error);
+  }
+}
+async logout(req, res, next) {
+  try {
+    const { refreshToken } = req.body;
+    const userId = req.user.id;
+
+    if (refreshToken) {
+      await redisService.removeRefreshTokenFingerprint(userId, refreshToken);
+    } else {
+      await redisService.removeAllUserRefreshTokens(userId);
+    }
+
+    // Invalidate cache
+    await redisService.invalidateUserCache(userId, req.user.email);
+    await redisService.invalidateProfile(userId);
+
+    res.json({
+      success: true,
+      message: "Logout successful",
+    });
+  } catch (error) {
+    next(error);
+  }
+}
   async changePassword(req, res, next) {
     try {
       const { currentPassword, newPassword } = req.body;
@@ -509,6 +504,7 @@ class AuthController {
       next(error);
     }
   }
+
 
   // Resend verification email
   async resendVerificationEmail(req, res, next) {

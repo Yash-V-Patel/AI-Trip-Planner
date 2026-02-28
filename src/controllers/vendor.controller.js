@@ -1631,6 +1631,38 @@ class VendorController {
     }
   }
 
+async checkVendorStatus(req, res) {
+  try {
+    // 1. Check if req.user exists (It does, based on your log)
+    if (!req.user) {
+      return res.status(401).json({ success: false, message: "Unauthorized" });
+    }
+
+    // 2. Use 'id' instead of 'userId' to match the req object structure
+    const userId = req.user.id; 
+
+    const vendor = await prisma.vendor.findUnique({
+      where: {
+        userId: userId, // This refers to the column in your DB
+        // verificationStatus: "VERIFIED",
+        isActive: true,
+      },
+    });
+
+    if (vendor) {
+      return res.status(200).json({ success: true, data: vendor });
+    }
+
+    return res.status(200).json({
+      success: true,
+      data: { userId: userId, message: "Vendor Application is still in progress!" }
+    });
+  } catch (error) {
+    console.error("Error checking vendor status:", error);
+    return res.status(500).json({ success: false, message: "Internal server error" });
+  }
+}
+
   /**
    * Process payout (admin)
    * POST /api/admin/payouts/:payoutId/process

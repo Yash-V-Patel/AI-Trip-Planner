@@ -38,8 +38,14 @@
   },
   "homepage": "https://github.com/Yash-V-Patel/AI-Trip-Planner#readme",
   "dependencies": {
+    "@hocuspocus/provider": "^3.4.4",
     "@openfga/sdk": "^0.3.4",
     "@prisma/client": "^6.0.0",
+    "@socket.io/redis-adapter": "^8.3.0",
+    "@tiptap/extension-collaboration": "^3.20.0",
+    "@tiptap/extension-collaboration-caret": "^3.20.0",
+    "@tiptap/react": "^3.20.0",
+    "@tiptap/starter-kit": "^3.20.0",
     "axios": "^1.13.5",
     "bcrypt": "^6.0.0",
     "bcryptjs": "^3.0.2",
@@ -53,8 +59,13 @@
     "jsonwebtoken": "^9.0.2",
     "morgan": "^1.10.1",
     "on-finished": "^2.4.1",
-    "redis": "^5.10.0",
-    "uuid": "^11.0.5"
+    "redis": "^5.11.0",
+    "socket.io": "^4.8.3",
+    "socket.io-client": "^4.8.3",
+    "uuid": "^11.0.5",
+    "y-protocols": "^1.0.7",
+    "y-websocket": "^3.0.0",
+    "yjs": "^13.6.29"
   },
   "devDependencies": {
     "nodemon": "^3.1.11",

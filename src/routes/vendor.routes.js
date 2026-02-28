@@ -17,15 +17,25 @@ const {
   processPayoutSchema
 } = require('../schemas/vendor.schema');
 
+router.get('/test', (req, res) => {
+  res.status(200).json({
+    success: true,
+    message: "Hello World"
+  });
+})
+
+
 // ==================== ALL VENDOR ROUTES REQUIRE AUTH ====================
 router.use(authMiddleware.authenticate);
 
 // ==================== VENDOR PROFILE ====================
 
+router.get('/status', vendorController.checkVendorStatus);
 /**
  * Register as a vendor
  * POST /api/vendor/register
  */
+
 router.post(
   '/register',
   validate(registerVendorSchema),

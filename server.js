@@ -8,27 +8,32 @@ const fs = require("fs");
 const path = require("path");
 const os = require("os");
 const crypto = require("crypto");
+const { Server } = require("socket.io");
+const { createAdapter } = require("@socket.io/redis-adapter");
+const { createClient } = require("ioredis");
+const jwt = require("jsonwebtoken"); // <-- ADDED
 
 // Use chalk v4 (CommonJS compatible)
 const chalk = require("chalk");
 
 const authRoutes = require("./src/routes/auth.routes");
-const userRoutes = require('./src/routes/user.routes');
-const accommodationRoutes = require('./src/routes/accommodation.routes');
-const vendorRoutes = require('./src/routes/vendor.routes');
-const transportationRoutes = require('./src/routes/transportation.routes');
-const storeRoutes = require('./src/routes/store.routes');
-const travelPlanRoutes = require('./src/routes/travelplan.routes');
-const vendorExperienceRoutes = require('./src/routes/vendor-experience.routes');
-const travelerExperienceRoutes = require('./src/routes/traveler-experience.routes');
-
+const userRoutes = require("./src/routes/user.routes");
+const accommodationRoutes = require("./src/routes/accommodation.routes");
+const vendorRoutes = require("./src/routes/vendor.routes");
+const transportationRoutes = require("./src/routes/transportation.routes");
+const storeRoutes = require("./src/routes/store.routes");
+const travelPlanRoutes = require("./src/routes/travelplan.routes");
+const vendorExperienceRoutes = require("./src/routes/vendor-experience.routes");
+const travelerExperienceRoutes = require("./src/routes/traveler-experience.routes");
+const dashboardRoutes = require('./src/routes/dashboard.routes');
 // Import OpenFGA service (not the config initializer)
-const {createSuperAdmin} = require("./src/config/make-superadmin")
+const { createSuperAdmin } = require("./src/config/make-superadmin");
 const openfgaService = require("./src/services/openfga.service");
 const redisService = require("./src/services/redis.service");
 
 const app = express();
 const prisma = new PrismaClient();
+const httpServer = require("http").createServer(app);
 
 // Create logs directory if it doesn't exist
 const logsDir = path.join(__dirname, "logs");
@@ -224,7 +229,20 @@ const logger = new Logger();
 
 // Basic middleware
 app.use(helmet());
-app.use(cors());
+// Update this section:
+app.use(
+  cors({
+    origin: [
+      process.env.CLIENT_URL || "http://localhost:4000", // Your frontend URL
+      "http://localhost:3000",
+      "http://localhost:4000",
+      "http://localhost:5173",
+    ],
+    credentials: true,
+    methods: ["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"],
+    allowedHeaders: ["Content-Type", "Authorization"],
+  }),
+);
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
@@ -258,7 +276,7 @@ app.use((req, res, next) => {
 // ==================== ROUTES ====================
 
 // Health check with detailed info
-app.get("/health", (req, res) => {
+app.get("/api/health", (req, res) => {
   logger.logSystemInfo();
   res.json({
     status: "OK",
@@ -277,15 +295,15 @@ app.get("/health", (req, res) => {
 
 // API routes
 app.use("/api/auth", authRoutes);
-app.use('/api/users', userRoutes);
-app.use('/api/accommodations', accommodationRoutes);
-app.use('/api/vendor', vendorRoutes);
-app.use('/api/transportation', transportationRoutes);
-app.use('/api/stores', storeRoutes);
-app.use('/api/travel-plans', travelPlanRoutes);
-app.use('/api/vendor/experiences', vendorExperienceRoutes);  
-app.use('/api/experiences', travelerExperienceRoutes);
-
+app.use("/api/users", userRoutes);
+app.use("/api/accommodations", accommodationRoutes);
+app.use("/api/vendor", vendorRoutes);
+app.use("/api/transportation", transportationRoutes);
+app.use("/api/stores", storeRoutes);
+app.use("/api/travel-plans", travelPlanRoutes);
+app.use("/api/vendor/experiences", vendorExperienceRoutes);
+app.use("/api/experiences", travelerExperienceRoutes);
+app.use('/api/dashboard', dashboardRoutes);
 // Test route for logging demonstration
 app.get("/api/test", (req, res) => {
   res.json({ message: "Test successful" });
@@ -345,7 +363,10 @@ const PORT = process.env.PORT || 3003;
 // Initialize OpenFGA and start server
 async function startServer() {
   try {
-     if (process.env.CREATESUPERUSER){ createSuperAdmin(); }
+    if (process.env.CREATESUPERUSER) {
+      createSuperAdmin();
+    }
+
     // Test database connection
     await prisma.$connect();
     console.log(chalk.green("✓ Database connected successfully"));
@@ -373,14 +394,6 @@ async function startServer() {
           ),
         );
       }
-      try {
-        await redisService.init();
-        console.log(chalk.green("✓ Redis connected successfully"));
-      } catch (error) {
-        console.log(
-          chalk.yellow("⚠ Redis initialization failed:", error.message),
-        );
-      }
     } else {
       console.log(
         chalk.yellow(
@@ -389,8 +402,139 @@ async function startServer() {
       );
     }
 
+    // Initialize Redis (required for Socket.IO adapter)
+    try {
+      await redisService.init();
+      console.log(chalk.green("✓ Redis connected successfully"));
+
+      // --- Socket.IO setup (now after Redis is ready) ---
+      const pubClient = redisService.client;
+      const subClient = redisService.client.duplicate();
+
+      const io = new Server(httpServer, {
+        cors: {
+          origin: [
+            process.env.CLIENT_URL || "http://localhost:4000",
+            "http://localhost:3000",
+            "http://localhost:4000",
+          ],
+          credentials: true,
+        },
+        adapter: createAdapter(pubClient, subClient),
+      });
+
+      // Authentication middleware for Socket.IO
+      io.use(async (socket, next) => {
+        const token = socket.handshake.auth.token;
+        if (!token) {
+          return next(new Error("Authentication required"));
+        }
+        try {
+          const decoded = jwt.verify(token, process.env.JWT_ACCESS_SECRET);
+          socket.user = decoded; // { userId, email }
+          next();
+        } catch (err) {
+          next(new Error("Invalid token"));
+        }
+      });
+
+      // Namespace for collaborative travel plans
+      const collabNamespace = io.of("/collab");
+
+      collabNamespace.on("connection", (socket) => {
+        const { planId } = socket.handshake.query;
+        if (!planId) {
+          socket.disconnect();
+          return;
+        }
+
+        (async () => {
+          // Permission check: can this user view this travel plan?
+          const allowed = await openfgaService.canViewTravelPlan(
+            socket.user.userId,
+            planId,
+          );
+          if (!allowed) {
+            socket.emit(
+              "error",
+              "You do not have permission to edit this plan",
+            );
+            socket.disconnect();
+            return;
+          }
+          socket.join(`plan:${planId}`);
+          console.log(`User ${socket.user.userId} joined plan ${planId}`);
+        })();
+
+        socket.on("disconnect", () => {
+          console.log(`User ${socket.user.userId} left plan ${planId}`);
+        });
+      });
+      // ------------------------------------------------
+    } catch (error) {
+      console.log(
+        chalk.yellow("⚠ Redis initialization failed:", error.message),
+      );
+      console.log(
+        chalk.yellow(
+          "  Socket.IO will run without Redis adapter (in‑memory only)",
+        ),
+      );
+      // Still create Socket.IO server but without Redis adapter (fallback to default)
+      const io = new Server(httpServer, {
+        cors: {
+          origin: process.env.CLIENT_URL || "http://localhost:3000",
+          credentials: true,
+        },
+        // No adapter → uses default in‑memory adapter
+      });
+
+      // Same authentication and namespace setup (copy from above, or define a function to avoid duplication)
+      io.use(async (socket, next) => {
+        const token = socket.handshake.auth.token;
+        if (!token) {
+          return next(new Error("Authentication required"));
+        }
+        try {
+          const decoded = jwt.verify(token, process.env.JWT_ACCESS_SECRET);
+          socket.user = decoded;
+          next();
+        } catch (err) {
+          next(new Error("Invalid token"));
+        }
+      });
+
+      const collabNamespace = io.of("/collab");
+      collabNamespace.on("connection", (socket) => {
+        const { planId } = socket.handshake.query;
+        if (!planId) {
+          socket.disconnect();
+          return;
+        }
+        (async () => {
+          const allowed = await openfgaService.canViewTravelPlan(
+            socket.user.userId,
+            planId,
+          );
+          if (!allowed) {
+            socket.emit(
+              "error",
+              "You do not have permission to edit this plan",
+            );
+            socket.disconnect();
+            return;
+          }
+          socket.join(`plan:${planId}`);
+          console.log(`User ${socket.user.userId} joined plan ${planId}`);
+        })();
+        socket.on("disconnect", () => {
+          console.log(`User ${socket.user.userId} left plan ${planId}`);
+        });
+      });
+    }
+
     // Start server
-    const server = app.listen(PORT, () => {
+    const server = httpServer.listen(PORT, () => {
       console.log(chalk.green("\n✓ Server started successfully"));
       console.log(
         chalk.cyan(`  Environment: ${process.env.NODE_ENV || "development"}`),
