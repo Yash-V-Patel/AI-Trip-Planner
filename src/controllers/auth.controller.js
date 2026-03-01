@@ -213,6 +213,8 @@ async getCurrentUser(req, res) {
       next(error);
     }
   }
+
+  
 async refreshToken(req, res, next) {
   try {
     console.log('Refresh token request received');

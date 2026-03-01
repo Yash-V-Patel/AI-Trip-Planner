@@ -20,8 +20,8 @@ router.post('/forgot-password', validate(forgotPasswordSchema), authController.f
 router.post('/reset-password', validate(resetPasswordSchema), authController.resetPassword);
 router.get('/verify-email/:token', authController.verifyEmail);
 router.post('/resend-verification', authController.resendVerificationEmail);
-router.get('/me', authController.getCurrentUser)
 // Protected routes - Uncomment these lines
+router.get('/me', authMiddleware.authenticate , authController.getCurrentUser);
 router.post('/logout', authMiddleware.authenticate, authController.logout);
 router.post('/change-password', 
   authMiddleware.authenticate, 
