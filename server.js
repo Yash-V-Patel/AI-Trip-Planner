@@ -10,11 +10,27 @@ const os = require("os");
 const crypto = require("crypto");
 const { Server } = require("socket.io");
 const { createAdapter } = require("@socket.io/redis-adapter");
-const { createClient } = require("ioredis");
+const swaggerJsdoc = require('swagger-jsdoc');
 const jwt = require("jsonwebtoken"); // <-- ADDED
-
 // Use chalk v4 (CommonJS compatible)
 const chalk = require("chalk");
+const cookieParser = require('cookie-parser');
+const swaggerUi = require('swagger-ui-express');
+
+const options = {
+  definition: {
+    openapi: "3.0.0",
+    info: {
+      title: "Travel API",
+      version: "1.0.0",
+    },
+  },
+  apis: [
+    "./src/controllers/auth.controller.js",
+    "./src/routes/*.js",
+  ],
+};
+const specs = swaggerJsdoc(options);
 
 const authRoutes = require("./src/routes/auth.routes");
 const userRoutes = require("./src/routes/user.routes");
@@ -26,6 +42,7 @@ const travelPlanRoutes = require("./src/routes/travelplan.routes");
 const vendorExperienceRoutes = require("./src/routes/vendor-experience.routes");
 const travelerExperienceRoutes = require("./src/routes/traveler-experience.routes");
 const dashboardRoutes = require('./src/routes/dashboard.routes');
+const aiagent = require('./src/routes/agent.routes')
 // Import OpenFGA service (not the config initializer)
 const { createSuperAdmin } = require("./src/config/make-superadmin");
 const openfgaService = require("./src/services/openfga.service");
@@ -74,13 +91,13 @@ class Logger {
   constructor() {
     this.startTime = Date.now();
   }
-
+  
   // Get colored method
   getColoredMethod(method) {
     const color = methodColors[method] || chalk.white;
     return color(method.padEnd(6));
   }
-
+  
   // Get colored status
   getColoredStatus(status) {
     const statusCode = parseInt(status);
@@ -88,7 +105,7 @@ class Logger {
     const color = statusColors[statusGroup] || chalk.white;
     return color(statusCode);
   }
-
+  
   // Format date in [DD/MMM/YYYY:HH:MM:SS +0000] format
   formatDate(date = new Date()) {
     const months = [
@@ -105,65 +122,65 @@ class Logger {
       "Nov",
       "Dec",
     ];
-
+    
     const day = String(date.getDate()).padStart(2, "0");
     const month = months[date.getMonth()];
     const year = date.getFullYear();
     const hours = String(date.getHours()).padStart(2, "0");
     const minutes = String(date.getMinutes()).padStart(2, "0");
     const seconds = String(date.getSeconds()).padStart(2, "0");
-
+    
     // Get timezone offset in +0000 format
     const offset = -date.getTimezoneOffset();
     const offsetHours = Math.floor(Math.abs(offset) / 60);
     const offsetMinutes = Math.abs(offset) % 60;
     const offsetSign = offset >= 0 ? "+" : "-";
     const timezone = `${offsetSign}${String(offsetHours).padStart(2, "0")}${String(offsetMinutes).padStart(2, "0")}`;
-
+    
     return `[${day}/${month}/${year}:${hours}:${minutes}:${seconds} ${timezone}]`;
   }
-
+  
   // Calculate response time
   getResponseTime(start) {
     const diff = process.hrtime(start);
     const ms = (diff[0] * 1e3 + diff[1] / 1e6).toFixed(0);
     return `${ms}ms`;
   }
-
+  
   // Main log method
   log(req, res, next) {
     const start = process.hrtime();
     const requestStart = Date.now();
-
+    
     // Get user agent
     const userAgent = req.headers["user-agent"] || "unknown";
-
+    
     // Log on response finish
     res.on("finish", () => {
       const responseTime = this.getResponseTime(start);
       const timestamp = this.formatDate(new Date(requestStart));
-
+      
       // Prepare log components
       const method = req.method;
       const url = req.originalUrl || req.url;
       const status = res.statusCode;
-
+      
       // Format: METHOD [TIMESTAMP] URL UserAgent Status ResponseTime
       const logMessage = `${method} ${timestamp} ${url} ${userAgent} ${status} ${responseTime}`;
-
+      
       // Colored console output
       const coloredMethod = this.getColoredMethod(method);
       const coloredStatus = this.getColoredStatus(status);
       const coloredUrl = chalk.cyan(url);
       const coloredTime = chalk.magenta(responseTime);
-
+      
       console.log(
         `${coloredMethod} ${chalk.gray(timestamp)} ${coloredUrl} ${chalk.gray(userAgent)} ${coloredStatus} ${coloredTime}`,
       );
-
+      
       // Write to access log
       accessLogStream.write(`${logMessage}\n`);
-
+      
       // If there was an error, log it to error log
       if (status >= 400) {
         const errorMessage = res.locals?.error?.message || "Unknown error";
@@ -171,46 +188,46 @@ class Logger {
         errorLogStream.write(errorLog);
       }
     });
-
+    
     next();
   }
-
+  
   // Error logger
   error(err, req, res, next) {
     // Store error in res.locals for the onFinished handler
     if (!res.locals) res.locals = {};
     res.locals.error = err;
-
+    
     const timestamp = this.formatDate();
     const method = req.method;
     const url = req.originalUrl || req.url;
     const userAgent = req.headers["user-agent"] || "unknown";
-
+    
     // Error console output
     console.log(
       chalk.red(
         `${method} ${timestamp} ${url} ${userAgent} ERROR ${err.message}`,
       ),
     );
-
+    
     // Write to error log immediately
     errorLogStream.write(
       `${timestamp} [ERROR] ${method} ${url} ${userAgent} ${err.message}\n`,
     );
-
+    
     if (process.env.NODE_ENV === "development") {
       console.log(chalk.red(err.stack));
       errorLogStream.write(`${err.stack}\n`);
     }
-
+    
     next(err);
   }
-
+  
   // System info logger
   logSystemInfo() {
     const memory = process.memoryUsage();
     const loadAvg = os.loadavg();
-
+    
     console.log(
       chalk.cyan("[SYSTEM] Memory:", {
         rss: `${Math.round(memory.rss / 1024 / 1024)} MB`,
@@ -229,6 +246,13 @@ const logger = new Logger();
 
 // Basic middleware
 app.use(helmet());
+
+// Use cookie-parser (place it before your routes)
+app.use(cookieParser());
+
+// swagger setup
+app.use("/api-docs", swaggerUi.serve, swaggerUi.setup(specs));
+
 // Update this section:
 app.use(
   cors({
@@ -304,8 +328,9 @@ app.use("/api/travel-plans", travelPlanRoutes);
 app.use("/api/vendor/experiences", vendorExperienceRoutes);
 app.use("/api/experiences", travelerExperienceRoutes);
 app.use('/api/dashboard', dashboardRoutes);
+app.use("/api/agent", aiagent);
 // Test route for logging demonstration
-app.get("/api/test", (req, res) => {
+app.get("/", (req, res) => {
   res.json({ message: "Test successful" });
 });
 

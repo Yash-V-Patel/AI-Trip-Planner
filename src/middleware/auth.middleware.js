@@ -1,224 +1,163 @@
-const jwt = require('jsonwebtoken');
-const { PrismaClient } = require('@prisma/client');
-const openfgaService = require('../services/openfga.service');
-const redisService = require('../services/redis.service');
+"use strict";
+
+/**
+ * auth.middleware.js
+ *
+ * Changes from the previous version
+ * ──────────────────────────────────
+ * 1. Token transport: httpOnly cookie (`access_token`) is checked first;
+ *    Authorization: Bearer header accepted as a fallback for API clients.
+ *
+ * 2. No Redis access-token cache. JWTs are verified by signature only.
+ *    Redis is only used for refresh-token fingerprints and profile cache —
+ *    the middleware reads the profile cache but writes nothing to Redis itself.
+ *
+ * 3. No permission caching for the superadmin check (removed cachePermission /
+ *    getCachedPermission calls that were crashing the server). OpenFGA is
+ *    queried directly; the result is cheap because superadmin membership
+ *    changes rarely and OpenFGA has its own in-process evaluation.
+ *
+ * 4. requirePermission still delegates to OpenFGA but no longer tries to
+ *    cache the result in Redis.
+ */
+
+const jwt          = require("jsonwebtoken");
+const { PrismaClient } = require("@prisma/client");
+const openfgaService   = require("../services/openfga.service");
+const redisService     = require("../services/redis.service");
 
 const prisma = new PrismaClient();
 
-class AuthMiddleware {
-   constructor() {
-    // Bind methods to ensure 'this' context
-    this.authenticate = this.authenticate.bind(this);
-    this.requirePermission = this.requirePermission.bind(this);
-    this.rateLimit = this.rateLimit.bind(this);
-    this.requireSuperAdmin = this.requireSuperAdmin.bind(this);
-    this.extractToken = this.extractToken.bind(this);
-  }
+// ─── cookie / token constants ─────────────────────────────────────────────────
 
+/** Name of the httpOnly cookie that carries the access token. */
+const ACCESS_COOKIE = "access_token";
+
+// ─── helpers ─────────────────────────────────────────────────────────────────
+
+const send = (res, status, message) =>
+  res.status(status).json({ success: false, message });
+
+// ─── middleware class ─────────────────────────────────────────────────────────
+
+class AuthMiddleware {
+  // ── authenticate ────────────────────────────────────────────────────────────
+
+  /**
+   * Verify the access token (cookie or Authorization header) and attach
+   * `req.user` for downstream handlers.
+   *
+   * req.user shape:
+   *   { id, email, name, phone, profile, isSuperAdmin }
+   */
   async authenticate(req, res, next) {
     try {
-      const token = this.extractToken(req);
-      
+      const token = this._extractToken(req);
+
       if (!token) {
-        return res.status(401).json({
-          success: false,
-          message: 'Authentication token required'
-        });
+        return send(res, 401, "Authentication token required");
       }
 
-      // Check Redis cache first
-      let cachedToken;
+      // ── 1. Verify JWT signature ──────────────────────────────────────────
+      let decoded;
       try {
-        cachedToken = await redisService.validateAccessToken(token);
-      } catch (redisError) {
-        // Continue without Redis
-      }
-      
-      if (cachedToken) {
-        // Get user from cache
-        let user = await redisService.getUser(cachedToken.userId);
-        
-        if (!user) {
-          // If user not in cache, get from DB and cache it
-          const dbUser = await prisma.user.findUnique({
-            where: { id: cachedToken.userId },
-            include: { profile: true }
-          });
-
-          if (dbUser) {
-            user = {
-              id: dbUser.id,
-              email: dbUser.email,
-              name: dbUser.name,
-              phone: dbUser.phone,
-              profile: dbUser.profile
-            };
-            await redisService.cacheUser(user.id, user);
+        decoded = jwt.verify(token, process.env.JWT_ACCESS_SECRET);
+      } catch (err) {
+        if (err.name === "TokenExpiredError") {
+          // Clean up the stale cookie if it came from there
+          if (req.cookies?.[ACCESS_COOKIE]) {
+            res.clearCookie(ACCESS_COOKIE);
           }
+          return send(res, 401, "Token expired");
         }
-
-        if (!user) {
-          return res.status(401).json({
-            success: false,
-            message: 'User not found'
-          });
-        }
-
-        // Check superadmin status from cache
-        const cachedPermission = await redisService.getCachedPermission(
-          user.id,
-          'superadmin:global',
-          'can_manage_all'
-        );
-
-        let isSuperAdmin = false;
-        if (cachedPermission) {
-          isSuperAdmin = cachedPermission.allowed;
-        } else {
-          isSuperAdmin = await openfgaService.checkSuperAdmin(user.id);
-          await redisService.cachePermission(
-            user.id,
-            'superadmin:global',
-            'can_manage_all',
-            isSuperAdmin
-          );
-        }
-
-        req.user = {
-          ...user,
-          isSuperAdmin
-        };
-
-        return next();
+        return send(res, 401, "Invalid token");
       }
 
-      // If not in cache, verify JWT
-      const decoded = jwt.verify(token, process.env.JWT_ACCESS_SECRET);
-      
-      // Get user from database
-      const user = await prisma.user.findUnique({
-        where: { id: decoded.userId },
-        include: { profile: true }
-      });
+      const userId = decoded.userId;
 
-      if (!user) {
-        return res.status(401).json({
-          success: false,
-          message: 'User not found'
+      // ── 2. Load user from DB (profile from Redis cache if warm) ─────────
+      // We skip a full user-data Redis cache deliberately — the JWT already
+      // carries userId/email and we only need the profile for req.user.
+      // A profile cache hit avoids one DB join; a miss just does a normal query.
+
+      const cachedProfile = await redisService.getProfile(userId).catch(() => null);
+
+      let user;
+      if (cachedProfile) {
+        // We have the profile — still need core user fields for req.user
+        // Use a lean select to avoid fetching password etc.
+        user = await prisma.user.findUnique({
+          where:  { id: userId },
+          select: { id: true, email: true, name: true, phone: true },
         });
+
+        if (!user) return send(res, 401, "User not found");
+        user = { ...user, profile: cachedProfile };
+      } else {
+        // Full join — then warm the profile cache for next time
+        user = await prisma.user.findUnique({
+          where:   { id: userId },
+          include: { profile: true },
+          select:  {
+            id: true, email: true, name: true, phone: true,
+            profile: true,
+          },
+        });
+
+        if (!user) return send(res, 401, "User not found");
+
+        if (user.profile) {
+          redisService.cacheProfile(userId, user.profile).catch(() => {});
+        }
       }
 
-      // Check superadmin status
-      const isSuperAdmin = await openfgaService.checkSuperAdmin(user.id);
-
-      // Cache the token for future requests
-      await redisService.cacheUserTokens(user.id, { accessToken: token });
-      
-      // Cache user data
-      const userData = {
-        id: user.id,
-        email: user.email,
-        name: user.name,
-        phone: user.phone,
-        profile: user.profile
-      };
-      await redisService.cacheUser(user.id, userData);
-
-      // Cache permission
-      await redisService.cachePermission(
-        user.id,
-        'superadmin:global',
-        'can_manage_all',
-        isSuperAdmin
-      );
+      // ── 3. Superadmin check (direct OpenFGA call — no Redis cache) ───────
+      const isSuperAdmin = await openfgaService.checkSuperAdmin(userId).catch(() => false);
 
       req.user = {
-        ...userData,
-        isSuperAdmin
+        id:          user.id,
+        email:       user.email,
+        name:        user.name,
+        phone:       user.phone,
+        profile:     user.profile ?? null,
+        isSuperAdmin,
       };
 
-      next();
+      return next();
     } catch (error) {
-      if (error.name === 'TokenExpiredError') {
-        // Clean up expired token from Redis if it exists
-        try {
-          const token = this.extractToken(req);
-          if (token) {
-            await redisService.invalidateAccessToken(token);
-          }
-        } catch (cleanupError) {
-          // Ignore cleanup errors
-        }
-
-        return res.status(401).json({
-          success: false,
-          message: 'Token expired'
-        });
-      }
-      
-      if (error.name === 'JsonWebTokenError') {
-        return res.status(401).json({
-          success: false,
-          message: 'Invalid token'
-        });
-      }
-
       next(error);
     }
   }
 
-  // Permission-based authorization with Redis caching
+  // ── requirePermission ────────────────────────────────────────────────────────
+
+  /**
+   * Factory that returns a middleware enforcing a specific OpenFGA relation.
+   *
+   * Usage: router.get("/plan/:id", auth.authenticate, auth.requirePermission("travelplan", "viewer"))
+   *
+   * Superadmins bypass all permission checks.
+   *
+   * @param {string} objectType  FGA object type, e.g. "travelplan"
+   * @param {string} relation    FGA relation, e.g. "viewer" | "editor"
+   */
   requirePermission(objectType, relation) {
     return async (req, res, next) => {
       try {
+        // Superadmins can do anything
+        if (req.user?.isSuperAdmin) return next();
+
         const objectId = req.params.id;
         if (!objectId) {
-          return res.status(400).json({
-            success: false,
-            message: 'Object ID required'
-          });
+          return send(res, 400, "Object ID required");
         }
 
-        const object = `${objectType}:${objectId}`;
-        
-        // Check Redis cache first
-        const cachedPermission = await redisService.getCachedPermission(
-          req.user.id,
-          object,
-          relation
-        );
+        const hasPermission = await openfgaService
+          .checkPermission(req.user.id, relation, `${objectType}:${objectId}`)
+          .catch(() => false);
 
-        if (cachedPermission) {
-          if (cachedPermission.allowed || req.user.isSuperAdmin) {
-            return next();
-          } else {
-            return res.status(403).json({
-              success: false,
-              message: 'Insufficient permissions'
-            });
-          }
-        }
-
-        // If not in cache, check OpenFGA
-        const hasPermission = await openfgaService.checkPermission(
-          req.user.id,
-          relation,
-          object
-        );
-
-        // Cache the result
-        await redisService.cachePermission(
-          req.user.id,
-          object,
-          relation,
-          hasPermission
-        );
-
-        if (!hasPermission && !req.user.isSuperAdmin) {
-          return res.status(403).json({
-            success: false,
-            message: 'Insufficient permissions'
-          });
+        if (!hasPermission) {
+          return send(res, 403, "Insufficient permissions");
         }
 
         next();
@@ -228,73 +167,95 @@ class AuthMiddleware {
     };
   }
 
-  // Rate limiting middleware using Redis
+  // ── requireSuperAdmin ────────────────────────────────────────────────────────
+
+  /**
+   * Guard that only allows through users with isSuperAdmin = true.
+   * Must be used after `authenticate`.
+   */
+  requireSuperAdmin(req, res, next) {
+    if (!req.user) return send(res, 401, "Authentication required");
+    if (!req.user.isSuperAdmin) return send(res, 403, "Superadmin access required");
+    next();
+  }
+
+  // ── rateLimit ────────────────────────────────────────────────────────────────
+
+  /**
+   * Sliding-window rate limiter backed by Redis.
+   * Gracefully passes through if Redis is unavailable.
+   *
+   * @param {{ windowMs?: number, max?: number, keyPrefix?: string }} [options]
+   */
   rateLimit(options = {}) {
     const {
-      windowMs = 60 * 1000,
-      max = 60,
-      keyPrefix = 'rate_limit'
+      windowMs  = 60 * 1000,
+      max       = 60,
+      keyPrefix = "rate_limit",
     } = options;
 
     return async (req, res, next) => {
       const key = `${keyPrefix}:${req.ip}:${req.path}`;
-      
+
       try {
-        const result = await redisService.incrementRateLimit(
-          key,
-          windowMs / 1000,
-          max
-        );
+        const result = await redisService.incrementRateLimit(key, windowMs / 1000, max);
 
         res.set({
-          'X-RateLimit-Limit': max,
-          'X-RateLimit-Remaining': result.remaining,
-          'X-RateLimit-Reset': result.reset
+          "X-RateLimit-Limit":     max,
+          "X-RateLimit-Remaining": result.remaining,
+          "X-RateLimit-Reset":     result.reset,
         });
 
         if (result.current > max) {
-          return res.status(429).json({
-            success: false,
-            message: 'Too many requests, please try again later.'
-          });
+          return send(res, 429, "Too many requests, please try again later.");
         }
-
-        next();
-      } catch (error) {
-        next();
-      }
-    };
-  }
-
-  requireSuperAdmin(req, res, next) {
-    try {
-      if (!req.user) {
-        return res.status(401).json({
-          success: false,
-          message: 'Authentication required'
-        });
-      }
-
-      if (!req.user.isSuperAdmin) {
-        return res.status(403).json({
-          success: false,
-          message: 'Superadmin access required'
-        });
+      } catch {
+        // Redis unavailable — fail open (don't block the request)
       }
 
       next();
-    } catch (error) {
-      next(error);
-    }
+    };
   }
 
-  extractToken(req) {
-    const authHeader = req.headers.authorization;
-    if (authHeader && authHeader.startsWith('Bearer ')) {
-      return authHeader.substring(7);
+  // ── _extractToken (private) ─────────────────────────────────────────────────
+
+  /**
+   * Extract the raw JWT string from the request.
+   *
+   * Priority:
+   *   1. httpOnly cookie `access_token`   (set by auth controller on login)
+   *   2. Authorization: Bearer <token>    (fallback for API / mobile clients)
+   *   3. Signed cookie `token`            (legacy support)
+   *
+   * @param {import('express').Request} req
+   * @returns {string|null}
+   */
+  _extractToken(req) {
+    // 1. httpOnly cookie
+    if (req.cookies?.[ACCESS_COOKIE]) {
+      return req.cookies[ACCESS_COOKIE];
     }
+
+    // 2. Authorization header
+    const authHeader = req.headers.authorization;
+    if (authHeader?.startsWith("Bearer ")) {
+      return authHeader.slice(7);
+    }
+
+    // 3. Signed cookie (legacy)
+    if (req.signedCookies?.token) {
+      return req.signedCookies.token;
+    }
+
     return null;
   }
 }
 
-module.exports = new AuthMiddleware();
+// Export a singleton; bind methods so they can be destructured safely
+const middleware = new AuthMiddleware();
+
+// Pre-bind public methods so `const { authenticate } = authMiddleware` works
+middleware.authenticate      = middleware.authenticate.bind(middleware);
+middleware.requireSuperAdmin = middleware.requireSuperAdmin.bind(middleware);
+
+module.exports = middleware;

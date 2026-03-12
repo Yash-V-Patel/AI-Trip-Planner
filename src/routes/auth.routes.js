@@ -1,7 +1,7 @@
 const express = require('express');
 const router = express.Router();
 const authController = require('../controllers/auth.controller');
-const authMiddleware = require('../middleware/auth.middleware'); // Uncomment this line
+const authMiddleware = require('../middleware/auth.middleware');
 const validate = require('../middleware/validate.middleware');
 const {
   registerSchema,
@@ -9,7 +9,8 @@ const {
   refreshTokenSchema,
   changePasswordSchema,
   forgotPasswordSchema,
-  resetPasswordSchema
+  resetPasswordSchema,
+  resendVerificationSchema   // <-- import new schema
 } = require('../schemas/auth.schema');
 
 // Public routes
@@ -19,9 +20,10 @@ router.post('/refresh-token', validate(refreshTokenSchema), authController.refre
 router.post('/forgot-password', validate(forgotPasswordSchema), authController.forgotPassword);
 router.post('/reset-password', validate(resetPasswordSchema), authController.resetPassword);
 router.get('/verify-email/:token', authController.verifyEmail);
-router.post('/resend-verification', authController.resendVerificationEmail);
-// Protected routes - Uncomment these lines
-router.get('/me', authMiddleware.authenticate , authController.getCurrentUser);
+router.post('/resend-verification', validate(resendVerificationSchema), authController.resendVerificationEmail);
+
+// Protected routes
+router.get('/me', authMiddleware.authenticate, authController.getCurrentUser);
 router.post('/logout', authMiddleware.authenticate, authController.logout);
 router.post('/change-password', 
   authMiddleware.authenticate, 

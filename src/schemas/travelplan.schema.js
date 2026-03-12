@@ -1,6 +1,6 @@
 const Joi = require('joi');
 
-// Enums
+// Enums (keep as defined)
 const travelPlanStatusEnum = ['PLANNING', 'ONGOING', 'COMPLETED', 'CANCELLED'];
 const experienceCategoryEnum = ['SIGHTSEEING', 'DINING', 'ENTERTAINMENT', 'ADVENTURE', 'CULTURAL', 'RELAXATION', 'SHOPPING', 'OTHER'];
 const roomTypeEnum = ['SINGLE', 'DOUBLE', 'TWIN', 'TRIPLE', 'SUITE', 'DELUXE', 'FAMILY', 'PRESIDENTIAL'];
@@ -44,6 +44,8 @@ const createTravelPlanSchema = Joi.object({
     'number.max': 'Cannot exceed 100 travelers'
   }),
   interests: Joi.array().items(Joi.string().max(50)).max(50),
+  itinerary: Joi.any().optional(), // flexible – can be any JSON structure
+  recommendations: Joi.any().optional(),
   status: Joi.string().valid(...travelPlanStatusEnum).default('PLANNING')
 });
 
@@ -88,24 +90,38 @@ const exportQuerySchema = Joi.object({
   format: Joi.string().valid('json', 'pdf').default('json')
 });
 
+// ==================== ADMIN SCHEMAS (added) ====================
+
+const adminUpdatePlanStatusSchema = Joi.object({
+  status: Joi.string().valid(...travelPlanStatusEnum).required().messages({
+    'any.required': 'Status is required',
+    'any.only': `Status must be one of: ${travelPlanStatusEnum.join(', ')}`
+  })
+});
+
+const adminDeletePlanSchema = Joi.object({
+  reason: Joi.string().max(500).optional()
+});
+
 // ==================== ACCOMMODATION BOOKING SCHEMAS ====================
 
 const accommodationBookingSchema = Joi.object({
+  accommodationId: Joi.string().required(),
+  roomIds: Joi.array().items(Joi.string()).optional(), // IDs of rooms to connect
   checkInDate: Joi.date().iso().required(),
   checkOutDate: Joi.date().iso().greater(Joi.ref('checkInDate')).required(),
   totalGuests: Joi.number().integer().min(1).max(20).default(1),
   roomType: Joi.string().valid(...roomTypeEnum).required(),
-  selectedRoomNumbers: Joi.array().items(Joi.string()).min(1).required(),
   pricePerNight: Joi.number().positive().precision(2).required(),
   taxes: Joi.number().min(0).precision(2).default(0),
   serviceFee: Joi.number().min(0).precision(2).default(0),
   totalCost: Joi.number().positive().precision(2).required(),
   guestName: Joi.string().required().max(255),
   guestEmail: Joi.string().email().required().max(255),
-  guestPhone: Joi.string().pattern(/^[0-9+\-\s()]{10,20}$/),
-  specialRequests: Joi.string().max(1000).allow(''),
-  paymentMethod: Joi.string().valid(...paymentMethodEnum),
-  accommodationId: Joi.string().required()
+  guestPhone: Joi.string().pattern(/^[0-9+\-\s()]{10,20}$/).optional(),
+  specialRequests: Joi.string().max(1000).allow('').optional(),
+  paymentStatus: Joi.string().valid(...paymentStatusEnum).optional(),
+  paymentMethod: Joi.string().valid(...paymentMethodEnum).optional()
 });
 
 const updateAccommodationBookingSchema = Joi.object({
@@ -113,40 +129,45 @@ const updateAccommodationBookingSchema = Joi.object({
   checkOutDate: Joi.date().iso().greater(Joi.ref('checkInDate')),
   totalGuests: Joi.number().integer().min(1).max(20),
   specialRequests: Joi.string().max(1000).allow(''),
-  paymentMethod: Joi.string().valid(...paymentMethodEnum)
+  paymentStatus: Joi.string().valid(...paymentStatusEnum),
+  paymentMethod: Joi.string().valid(...paymentMethodEnum),
+  bookingStatus: Joi.string().valid(...bookingStatusEnum)
 }).min(1);
 
 // ==================== TRANSPORTATION BOOKING SCHEMAS ====================
 
 const transportationBookingSchema = Joi.object({
+  providerId: Joi.string().optional(),
+  vehicleId: Joi.string().optional(),
   serviceType: Joi.string().valid(...transportationServiceTypeEnum).required(),
   pickupLocation: Joi.string().required().max(500),
   dropoffLocation: Joi.string().required().max(500),
   pickupTime: Joi.date().iso().required(),
-  estimatedArrival: Joi.date().iso().greater(Joi.ref('pickupTime')),
+  estimatedArrival: Joi.date().iso().greater(Joi.ref('pickupTime')).optional(),
   numberOfPassengers: Joi.number().integer().min(1).max(100).default(1),
-  specialRequests: Joi.string().max(1000).allow(''),
-  estimatedFare: Joi.number().positive().precision(2),
-  paymentMethod: Joi.string().valid(...paymentMethodEnum),
-  providerId: Joi.string().required(),
-  vehicleId: Joi.string(),
-  vehicleType: Joi.string(),
-  vehicleNumber: Joi.string(),
-  driverName: Joi.string(),
-  driverContact: Joi.string().pattern(/^[0-9+\-\s()]{10,20}$/)
+  specialRequests: Joi.string().max(1000).allow('').optional(),
+  estimatedFare: Joi.number().positive().precision(2).optional(),
+  paymentMethod: Joi.string().valid(...paymentMethodEnum).optional(),
+  // snapshot fields (when provider/vehicle are not selected from master data)
+  snapshotVehicleType: Joi.string().max(100).optional(),
+  snapshotVehicleNumber: Joi.string().max(50).optional(),
+  snapshotDriverName: Joi.string().max(255).optional(),
+  snapshotDriverContact: Joi.string().pattern(/^[0-9+\-\s()]{10,20}$/).optional()
 });
 
 const updateTransportationBookingSchema = Joi.object({
+  pickupLocation: Joi.string().max(500),
+  dropoffLocation: Joi.string().max(500),
   pickupTime: Joi.date().iso(),
   estimatedArrival: Joi.date().iso(),
+  numberOfPassengers: Joi.number().integer().min(1).max(100),
   specialRequests: Joi.string().max(1000).allow(''),
-  estimatedFare: Joi.number().positive().precision(2),
-  actualFare: Joi.number().positive().precision(2),
-  actualPickupTime: Joi.date().iso(),
-  actualDropoffTime: Joi.date().iso(),
   status: Joi.string().valid(...transportationStatusEnum),
   paymentMethod: Joi.string().valid(...paymentMethodEnum),
   paymentStatus: Joi.string().valid(...paymentStatusEnum),
+  actualFare: Joi.number().positive().precision(2),
+  actualPickupTime: Joi.date().iso(),
+  actualDropoffTime: Joi.date().iso(),
   isPaid: Joi.boolean()
 }).min(1);
 
@@ -159,9 +180,9 @@ const packageBookingSchema = Joi.object({
   numberOfTravelers: Joi.number().integer().min(1).max(100).default(1),
   leadGuestName: Joi.string().required().max(255),
   leadGuestEmail: Joi.string().email().required().max(255),
-  leadGuestPhone: Joi.string().pattern(/^[0-9+\-\s()]{10,20}$/),
-  specialRequests: Joi.string().max(1000).allow(''),
-  paymentMethod: Joi.string().valid(...paymentMethodEnum)
+  leadGuestPhone: Joi.string().pattern(/^[0-9+\-\s()]{10,20}$/).optional(),
+  specialRequests: Joi.string().max(1000).allow('').optional(),
+  paymentMethod: Joi.string().valid(...paymentMethodEnum).optional()
 });
 
 const updatePackageBookingSchema = Joi.object({
@@ -183,9 +204,9 @@ const experienceBookingSchema = Joi.object({
   numberOfChildren: Joi.number().integer().min(0).max(50).default(0),
   leadGuestName: Joi.string().required().max(255),
   leadGuestEmail: Joi.string().email().required().max(255),
-  leadGuestPhone: Joi.string().pattern(/^[0-9+\-\s()]{10,20}$/),
-  specialRequests: Joi.string().max(1000).allow(''),
-  paymentMethod: Joi.string().valid(...paymentMethodEnum)
+  leadGuestPhone: Joi.string().pattern(/^[0-9+\-\s()]{10,20}$/).optional(),
+  specialRequests: Joi.string().max(1000).allow('').optional(),
+  paymentMethod: Joi.string().valid(...paymentMethodEnum).optional()
 });
 
 const updateExperienceBookingSchema = Joi.object({
@@ -203,14 +224,16 @@ const updateExperienceBookingSchema = Joi.object({
 const shoppingVisitSchema = Joi.object({
   storeId: Joi.string().required(),
   plannedDate: Joi.date().iso().required(),
-  duration: Joi.number().integer().min(15).max(480),
-  purpose: Joi.string().max(500),
+  duration: Joi.number().integer().min(15).max(480).optional(),
+  purpose: Joi.string().max(500).optional(),
   plannedItems: Joi.array().items(Joi.object({
     productId: Joi.string(),
     name: Joi.string().max(255),
     quantity: Joi.number().integer().min(1).max(100),
     estimatedPrice: Joi.number().positive().precision(2)
-  }))
+  })).optional(),
+  aiNotes: Joi.string().max(2000).allow('').optional(),
+  recommendations: Joi.any().optional()
 });
 
 const updateShoppingVisitSchema = Joi.object({
@@ -224,27 +247,31 @@ const updateShoppingVisitSchema = Joi.object({
     quantity: Joi.number().integer().min(1).max(100),
     estimatedPrice: Joi.number().positive().precision(2)
   })),
-  status: Joi.string().valid(...shoppingVisitStatusEnum)
+  status: Joi.string().valid(...shoppingVisitStatusEnum),
+  aiNotes: Joi.string().max(2000).allow(''),
+  recommendations: Joi.any()
 }).min(1);
 
 // ==================== CUSTOM TRAVEL EXPERIENCE SCHEMAS ====================
 
 const travelExperienceSchema = Joi.object({
   title: Joi.string().required().max(255),
-  description: Joi.string().max(1000).allow(''),
+  description: Joi.string().max(1000).allow('').optional(),
   date: Joi.date().iso().required(),
-  startTime: Joi.string().pattern(/^([01]\d|2[0-3]):([0-5]\d):([0-5]\d)$/),
-  endTime: Joi.string().pattern(/^([01]\d|2[0-3]):([0-5]\d):([0-5]\d)$/),
-  location: Joi.string().max(500),
+  startTime: Joi.string().pattern(/^([01]\d|2[0-3]):([0-5]\d):([0-5]\d)$/).optional(),
+  endTime: Joi.string().pattern(/^([01]\d|2[0-3]):([0-5]\d):([0-5]\d)$/).optional(),
+  location: Joi.string().max(500).optional(),
   cost: Joi.number().positive().precision(2).default(0),
   category: Joi.string().valid(...experienceCategoryEnum).default('SIGHTSEEING'),
-  aiNotes: Joi.string().max(2000).allow('')
+  aiNotes: Joi.string().max(2000).allow('').optional()
 });
 
 const updateTravelExperienceSchema = travelExperienceSchema.fork(
   ['title', 'date'],
   (field) => field.optional()
 );
+
+// ==================== EXPORT ====================
 
 module.exports = {
   // Core schemas
@@ -255,6 +282,10 @@ module.exports = {
   duplicatePlanSchema,
   updateBudgetSchema,
   exportQuerySchema,
+  
+  // Admin schemas (added)
+  adminUpdatePlanStatusSchema,
+  adminDeletePlanSchema,
   
   // Accommodation schemas
   accommodationBookingSchema,

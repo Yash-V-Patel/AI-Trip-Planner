@@ -7072,3 +7072,74 @@ GET [01/Mar/2026:12:25:39 +0530] /api/dashboard/notifications?unreadOnly=false&l
 GET [01/Mar/2026:12:25:39 +0530] /api/dashboard/upcoming?limit=10 Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36 200 43ms
 GET [01/Mar/2026:12:25:39 +0530] /api/dashboard/charts?chart=user-growth&period=month Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36 304 14ms
 GET [01/Mar/2026:12:25:39 +0530] /api/dashboard/charts?chart=revenue-chart&period=month Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36 304 17ms
+POST [02/Mar/2026:22:17:28 +0530] /api/auth/login Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36 401 103ms
+POST [02/Mar/2026:22:18:22 +0530] /api/auth/register Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36 201 218ms
+GET [02/Mar/2026:22:18:23 +0530] /api/dashboard/notifications?unreadOnly=true&limit=5 Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36 200 335ms
+GET [02/Mar/2026:22:18:23 +0530] /api/dashboard Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36 200 407ms
+GET [02/Mar/2026:22:18:23 +0530] /api/dashboard/notifications?unreadOnly=false&limit=5 Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36 200 5ms
+GET [02/Mar/2026:22:18:23 +0530] /api/dashboard/upcoming?limit=10 Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36 500 32ms
+POST [02/Mar/2026:22:28:22 +0530] /api/auth/refresh-token Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36 200 9ms
+GET [02/Mar/2026:22:32:27 +0530] /api/dashboard/notifications?unreadOnly=true&limit=5 Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36 304 216ms
+GET [02/Mar/2026:22:32:27 +0530] /api/dashboard Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36 304 336ms
+GET [02/Mar/2026:22:32:27 +0530] /api/dashboard/notifications?unreadOnly=false&limit=5 Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36 304 5ms
+GET [02/Mar/2026:22:32:27 +0530] /api/dashboard/upcoming?limit=10 Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36 500 20ms
+POST [02/Mar/2026:22:32:29 +0530] /api/auth/logout Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36 200 12ms
+POST [02/Mar/2026:22:32:56 +0530] /api/auth/register Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36 201 215ms
+GET [02/Mar/2026:22:32:56 +0530] /api/dashboard/upcoming?limit=10 Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36 500 26ms
+POST [02/Mar/2026:22:50:17 +0530] /api/auth/login Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36 401 240ms
+POST [02/Mar/2026:22:54:25 +0530] /api/auth/register PostmanRuntime/7.51.1 201 297ms
+POST [02/Mar/2026:22:57:11 +0530] /api/auth/register PostmanRuntime/7.51.1 409 151ms
+POST [02/Mar/2026:22:57:22 +0530] /api/auth/login PostmanRuntime/7.51.1 200 260ms
+POST [02/Mar/2026:23:08:50 +0530] /api/auth/login PostmanRuntime/7.51.1 200 326ms
+POST [02/Mar/2026:23:23:06 +0530] /api/auth/login PostmanRuntime/7.51.1 200 292ms
+POST [02/Mar/2026:23:36:24 +0530] /api/auth/login PostmanRuntime/7.51.1 200 309ms
+POST [02/Mar/2026:23:46:05 +0530] /api/auth/login PostmanRuntime/7.51.1 200 302ms
+POST [02/Mar/2026:23:53:20 +0530] /api/auth/login PostmanRuntime/7.51.1 200 481ms
+POST [02/Mar/2026:23:54:15 +0530] /api/auth/login PostmanRuntime/7.51.1 200 103ms
+POST [03/Mar/2026:00:01:00 +0530] /api/auth/login PostmanRuntime/7.51.1 200 246ms
+POST [03/Mar/2026:00:04:42 +0530] /api/auth/login PostmanRuntime/7.51.1 200 279ms
+POST [03/Mar/2026:00:07:14 +0530] /api/auth/login PostmanRuntime/7.51.1 200 328ms
+POST [07/Mar/2026:15:38:12 +0530] /api/auth/login PostmanRuntime/7.51.1 200 460ms
+GET [10/Mar/2026:10:06:45 +0530] / Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36 404 10ms
+GET [10/Mar/2026:10:06:45 +0530] /favicon.ico Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36 404 3ms
+GET [10/Mar/2026:10:07:18 +0530] / Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36 404 3ms
+GET [10/Mar/2026:10:08:22 +0530] / Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36 200 8ms
+GET [10/Mar/2026:10:09:01 +0530] /api/auth/me Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36 401 2ms
+POST [10/Mar/2026:10:09:25 +0530] /api/auth/register Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36 400 7ms
+POST [10/Mar/2026:10:10:10 +0530] /api/auth/register Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36 400 2ms
+POST [10/Mar/2026:10:10:33 +0530] /api/auth/register Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36 201 202ms
+POST [10/Mar/2026:10:10:49 +0530] /api/auth/login Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36 200 1003ms
+POST [10/Mar/2026:10:11:13 +0530] /api/auth/logout Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36 401 2ms
+POST [10/Mar/2026:10:11:16 +0530] /api/auth/logout Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36 401 1ms
+GET [10/Mar/2026:12:15:03 +0530] /api/auth/me Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36 401 5ms
+POST [10/Mar/2026:12:16:31 +0530] /api/auth/register Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36 400 6ms
+POST [10/Mar/2026:12:17:07 +0530] /api/auth/register Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36 400 3ms
+POST [10/Mar/2026:12:17:16 +0530] /api/auth/register Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36 409 166ms
+POST [10/Mar/2026:12:17:33 +0530] /api/auth/login Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36 200 185ms
+POST [10/Mar/2026:12:17:36 +0530] /api/auth/login Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36 200 154ms
+GET [10/Mar/2026:12:17:45 +0530] /api/auth/me Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36 401 3ms
+POST [10/Mar/2026:14:28:07 +0530] /api/auth/login Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36 200 373ms
+POST [10/Mar/2026:14:29:12 +0530] /api/auth/login Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36 200 98ms
+POST [10/Mar/2026:14:29:42 +0530] /api/auth/logout Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36 500 65ms
+POST [10/Mar/2026:14:29:46 +0530] /api/auth/logout Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36 500 2ms
+POST [10/Mar/2026:14:30:55 +0530] /api/auth/logout Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36 500 14ms
+POST [10/Mar/2026:14:44:47 +0530] /api/auth/login Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36 200 218ms
+GET [10/Mar/2026:14:45:16 +0530] /api/auth/me Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36 500 63ms
+GET [10/Mar/2026:14:45:19 +0530] /api/auth/me Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36 500 2ms
+POST [10/Mar/2026:14:46:02 +0530] /api/auth/login PostmanRuntime/7.51.1 200 240ms
+POST [10/Mar/2026:14:48:13 +0530] /api/auth/logout PostmanRuntime/7.51.1 500 74ms
+POST [10/Mar/2026:14:48:27 +0530] /api/auth/logout PostmanRuntime/7.51.1 500 4ms
+POST [10/Mar/2026:14:49:11 +0530] /api/auth/logout PostmanRuntime/7.51.1 500 13ms
+GET [10/Mar/2026:15:22:22 +0530] /api/auth/me Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36 500 9ms
+POST [10/Mar/2026:15:24:17 +0530] /api/auth/logout PostmanRuntime/7.51.1 500 8ms
+POST [10/Mar/2026:15:25:49 +0530] /api/auth/logout PostmanRuntime/7.51.1 500 10ms
+POST [10/Mar/2026:15:27:22 +0530] /api/auth/login PostmanRuntime/7.51.1 200 289ms
+POST [10/Mar/2026:15:27:41 +0530] /api/auth/logout PostmanRuntime/7.51.1 500 80ms
+POST [10/Mar/2026:15:40:15 +0530] /api/auth/logout PostmanRuntime/7.51.1 500 22ms
+POST [10/Mar/2026:15:40:42 +0530] /api/auth/login PostmanRuntime/7.51.1 200 268ms
+POST [10/Mar/2026:15:40:59 +0530] /api/auth/logout PostmanRuntime/7.51.1 200 50ms
+POST [10/Mar/2026:15:42:55 +0530] /api/auth/login Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36 200 109ms
+POST [10/Mar/2026:15:42:58 +0530] /api/auth/login Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36 200 96ms
+GET [10/Mar/2026:15:43:40 +0530] /api/auth/me Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36 200 18ms
+POST [10/Mar/2026:15:44:23 +0530] /api/auth/login Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36 200 104ms
+POST [10/Mar/2026:15:44:56 +0530] /api/auth/logout Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36 200 15ms

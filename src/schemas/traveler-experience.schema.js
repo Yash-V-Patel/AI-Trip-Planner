@@ -1,12 +1,33 @@
+// Updated schemas file: schemas/traveler-experience.schema.js
 const Joi = require('joi');
 
+// Enums (matching controller expectations)
 const experienceCategoryEnum = [
-  'SIGHTSEEING', 'DINING', 'ENTERTAINMENT', 'ADVENTURE', 
+  'SIGHTSEEING', 'DINING', 'ENTERTAINMENT', 'ADVENTURE',
   'CULTURAL', 'RELAXATION', 'SHOPPING', 'OTHER'
 ];
 
 const bookingStatusEnum = ['PENDING', 'CONFIRMED', 'CANCELLED', 'COMPLETED'];
+const paymentMethodEnum = ['CASH', 'CARD', 'DIGITAL_WALLET', 'ONLINE_PAYMENT', 'VOUCHER'];
 
+// ==================== PARAM SCHEMAS ====================
+const travelPlanIdParamSchema = Joi.object({
+  travelPlanId: Joi.string().required()
+});
+
+const customExperienceIdParamSchema = Joi.object({
+  experienceId: Joi.string().required()
+});
+
+const bookingIdParamSchema = Joi.object({
+  bookingId: Joi.string().required()
+});
+
+const vendorExperienceIdParamSchema = Joi.object({
+  experienceId: Joi.string().required()
+});
+
+// ==================== BODY SCHEMAS ====================
 const createCustomExperienceSchema = Joi.object({
   title: Joi.string().required().max(255),
   description: Joi.string().max(1000).allow(''),
@@ -15,7 +36,8 @@ const createCustomExperienceSchema = Joi.object({
   endTime: Joi.string().pattern(/^([01]\d|2[0-3]):([0-5]\d)$/),
   location: Joi.string().max(500),
   cost: Joi.number().positive().precision(2).default(0),
-  category: Joi.string().valid(...experienceCategoryEnum).default('SIGHTSEEING')
+  category: Joi.string().valid(...experienceCategoryEnum).default('SIGHTSEEING'),
+  aiNotes: Joi.string().max(2000).allow('') // included because controller handles it
 });
 
 const bookVendorExperienceSchema = Joi.object({
@@ -27,7 +49,7 @@ const bookVendorExperienceSchema = Joi.object({
   leadGuestEmail: Joi.string().email().required().max(255),
   leadGuestPhone: Joi.string().pattern(/^[0-9+\-\s()]{10,20}$/),
   specialRequests: Joi.string().max(1000).allow(''),
-  paymentMethod: Joi.string().valid('CASH', 'CARD', 'DIGITAL_WALLET', 'ONLINE_PAYMENT', 'VOUCHER')
+  paymentMethod: Joi.string().valid(...paymentMethodEnum)
 });
 
 const updateCustomExperienceSchema = Joi.object({
@@ -38,7 +60,8 @@ const updateCustomExperienceSchema = Joi.object({
   endTime: Joi.string().pattern(/^([01]\d|2[0-3]):([0-5]\d)$/),
   location: Joi.string().max(500),
   cost: Joi.number().positive().precision(2),
-  category: Joi.string().valid(...experienceCategoryEnum)
+  category: Joi.string().valid(...experienceCategoryEnum),
+  aiNotes: Joi.string().max(2000).allow('')
 }).min(1);
 
 const updateBookingSchema = Joi.object({
@@ -46,7 +69,9 @@ const updateBookingSchema = Joi.object({
   numberOfParticipants: Joi.number().integer().min(1).max(100),
   numberOfChildren: Joi.number().integer().min(0).max(50),
   specialRequests: Joi.string().max(1000).allow(''),
-  status: Joi.string().valid(...bookingStatusEnum)
+  status: Joi.string().valid(...bookingStatusEnum),
+  paymentStatus: Joi.string().valid('PENDING', 'PAID', 'REFUNDED', 'FAILED', 'PARTIALLY_PAID'),
+  paymentMethod: Joi.string().valid(...paymentMethodEnum)
 }).min(1);
 
 const addReviewSchema = Joi.object({
@@ -55,6 +80,13 @@ const addReviewSchema = Joi.object({
 });
 
 module.exports = {
+  // Param schemas
+  travelPlanIdParamSchema,
+  customExperienceIdParamSchema,
+  bookingIdParamSchema,
+  vendorExperienceIdParamSchema,
+
+  // Body schemas
   createCustomExperienceSchema,
   bookVendorExperienceSchema,
   updateCustomExperienceSchema,

@@ -6177,3 +6177,71 @@ Error: Route not found: GET /favicon.ico
     at C:\Users\patel\OneDrive\Desktop\My-Project\Major-project\myproject\AI-Trip-Planner\node_modules\router\index.js:297:9
 [01/Mar/2026:11:13:55 +0530] [ERROR] GET /favicon.ico 404 Route not found: GET /favicon.ico
 [01/Mar/2026:12:02:14 +0530] [ERROR] POST /api/auth/login 500 Unknown error
+[02/Mar/2026:22:17:28 +0530] [ERROR] POST /api/auth/login 401 Unknown error
+[02/Mar/2026:22:18:23 +0530] [ERROR] GET /api/dashboard/upcoming?limit=10 500 Unknown error
+[02/Mar/2026:22:32:27 +0530] [ERROR] GET /api/dashboard/upcoming?limit=10 500 Unknown error
+[02/Mar/2026:22:32:56 +0530] [ERROR] GET /api/dashboard/upcoming?limit=10 500 Unknown error
+[02/Mar/2026:22:50:17 +0530] [ERROR] POST /api/auth/login 401 Unknown error
+[02/Mar/2026:22:57:11 +0530] [ERROR] POST /api/auth/register 409 Unknown error
+[10/Mar/2026:10:06:45 +0530] [ERROR] GET / Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36 Route not found: GET /
+Error: Route not found: GET /
+    at C:\Users\patel\OneDrive\Desktop\My-Project\Major-project\myproject\AI-Trip-Planner\server.js:338:17
+    at Layer.handleRequest (C:\Users\patel\OneDrive\Desktop\My-Project\Major-project\myproject\AI-Trip-Planner\node_modules\router\lib\layer.js:152:17)
+    at trimPrefix (C:\Users\patel\OneDrive\Desktop\My-Project\Major-project\myproject\AI-Trip-Planner\node_modules\router\index.js:342:13)
+    at C:\Users\patel\OneDrive\Desktop\My-Project\Major-project\myproject\AI-Trip-Planner\node_modules\router\index.js:297:9
+    at processParams (C:\Users\patel\OneDrive\Desktop\My-Project\Major-project\myproject\AI-Trip-Planner\node_modules\router\index.js:582:12)
+    at next (C:\Users\patel\OneDrive\Desktop\My-Project\Major-project\myproject\AI-Trip-Planner\node_modules\router\index.js:291:5)
+    at C:\Users\patel\OneDrive\Desktop\My-Project\Major-project\myproject\AI-Trip-Planner\server.js:293:3
+    at Layer.handleRequest (C:\Users\patel\OneDrive\Desktop\My-Project\Major-project\myproject\AI-Trip-Planner\node_modules\router\lib\layer.js:152:17)
+    at trimPrefix (C:\Users\patel\OneDrive\Desktop\My-Project\Major-project\myproject\AI-Trip-Planner\node_modules\router\index.js:342:13)
+    at C:\Users\patel\OneDrive\Desktop\My-Project\Major-project\myproject\AI-Trip-Planner\node_modules\router\index.js:297:9
+[10/Mar/2026:10:06:45 +0530] [ERROR] GET / 404 Route not found: GET /
+[10/Mar/2026:10:06:45 +0530] [ERROR] GET /favicon.ico Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36 Route not found: GET /favicon.ico
+Error: Route not found: GET /favicon.ico
+    at C:\Users\patel\OneDrive\Desktop\My-Project\Major-project\myproject\AI-Trip-Planner\server.js:338:17
+    at Layer.handleRequest (C:\Users\patel\OneDrive\Desktop\My-Project\Major-project\myproject\AI-Trip-Planner\node_modules\router\lib\layer.js:152:17)
+    at trimPrefix (C:\Users\patel\OneDrive\Desktop\My-Project\Major-project\myproject\AI-Trip-Planner\node_modules\router\index.js:342:13)
+    at C:\Users\patel\OneDrive\Desktop\My-Project\Major-project\myproject\AI-Trip-Planner\node_modules\router\index.js:297:9
+    at processParams (C:\Users\patel\OneDrive\Desktop\My-Project\Major-project\myproject\AI-Trip-Planner\node_modules\router\index.js:582:12)
+    at next (C:\Users\patel\OneDrive\Desktop\My-Project\Major-project\myproject\AI-Trip-Planner\node_modules\router\index.js:291:5)
+    at C:\Users\patel\OneDrive\Desktop\My-Project\Major-project\myproject\AI-Trip-Planner\server.js:293:3
+    at Layer.handleRequest (C:\Users\patel\OneDrive\Desktop\My-Project\Major-project\myproject\AI-Trip-Planner\node_modules\router\lib\layer.js:152:17)
+    at trimPrefix (C:\Users\patel\OneDrive\Desktop\My-Project\Major-project\myproject\AI-Trip-Planner\node_modules\router\index.js:342:13)
+    at C:\Users\patel\OneDrive\Desktop\My-Project\Major-project\myproject\AI-Trip-Planner\node_modules\router\index.js:297:9
+[10/Mar/2026:10:06:45 +0530] [ERROR] GET /favicon.ico 404 Route not found: GET /favicon.ico
+[10/Mar/2026:10:07:18 +0530] [ERROR] GET / Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36 Route not found: GET /
+Error: Route not found: GET /
+    at C:\Users\patel\OneDrive\Desktop\My-Project\Major-project\myproject\AI-Trip-Planner\server.js:338:17
+    at Layer.handleRequest (C:\Users\patel\OneDrive\Desktop\My-Project\Major-project\myproject\AI-Trip-Planner\node_modules\router\lib\layer.js:152:17)
+    at trimPrefix (C:\Users\patel\OneDrive\Desktop\My-Project\Major-project\myproject\AI-Trip-Planner\node_modules\router\index.js:342:13)
+    at C:\Users\patel\OneDrive\Desktop\My-Project\Major-project\myproject\AI-Trip-Planner\node_modules\router\index.js:297:9
+    at processParams (C:\Users\patel\OneDrive\Desktop\My-Project\Major-project\myproject\AI-Trip-Planner\node_modules\router\index.js:582:12)
+    at next (C:\Users\patel\OneDrive\Desktop\My-Project\Major-project\myproject\AI-Trip-Planner\node_modules\router\index.js:291:5)
+    at C:\Users\patel\OneDrive\Desktop\My-Project\Major-project\myproject\AI-Trip-Planner\server.js:293:3
+    at Layer.handleRequest (C:\Users\patel\OneDrive\Desktop\My-Project\Major-project\myproject\AI-Trip-Planner\node_modules\router\lib\layer.js:152:17)
+    at trimPrefix (C:\Users\patel\OneDrive\Desktop\My-Project\Major-project\myproject\AI-Trip-Planner\node_modules\router\index.js:342:13)
+    at C:\Users\patel\OneDrive\Desktop\My-Project\Major-project\myproject\AI-Trip-Planner\node_modules\router\index.js:297:9
+[10/Mar/2026:10:07:18 +0530] [ERROR] GET / 404 Route not found: GET /
+[10/Mar/2026:10:09:01 +0530] [ERROR] GET /api/auth/me 401 Unknown error
+[10/Mar/2026:10:09:25 +0530] [ERROR] POST /api/auth/register 400 Unknown error
+[10/Mar/2026:10:10:10 +0530] [ERROR] POST /api/auth/register 400 Unknown error
+[10/Mar/2026:10:11:13 +0530] [ERROR] POST /api/auth/logout 401 Unknown error
+[10/Mar/2026:10:11:16 +0530] [ERROR] POST /api/auth/logout 401 Unknown error
+[10/Mar/2026:12:15:03 +0530] [ERROR] GET /api/auth/me 401 Unknown error
+[10/Mar/2026:12:16:31 +0530] [ERROR] POST /api/auth/register 400 Unknown error
+[10/Mar/2026:12:17:07 +0530] [ERROR] POST /api/auth/register 400 Unknown error
+[10/Mar/2026:12:17:16 +0530] [ERROR] POST /api/auth/register 409 Unknown error
+[10/Mar/2026:12:17:45 +0530] [ERROR] GET /api/auth/me 401 Unknown error
+[10/Mar/2026:14:29:42 +0530] [ERROR] POST /api/auth/logout 500 Unknown error
+[10/Mar/2026:14:29:46 +0530] [ERROR] POST /api/auth/logout 500 Unknown error
+[10/Mar/2026:14:30:55 +0530] [ERROR] POST /api/auth/logout 500 Unknown error
+[10/Mar/2026:14:45:16 +0530] [ERROR] GET /api/auth/me 500 Unknown error
+[10/Mar/2026:14:45:19 +0530] [ERROR] GET /api/auth/me 500 Unknown error
+[10/Mar/2026:14:48:13 +0530] [ERROR] POST /api/auth/logout 500 Unknown error
+[10/Mar/2026:14:48:27 +0530] [ERROR] POST /api/auth/logout 500 Unknown error
+[10/Mar/2026:14:49:11 +0530] [ERROR] POST /api/auth/logout 500 Unknown error
+[10/Mar/2026:15:22:22 +0530] [ERROR] GET /api/auth/me 500 Unknown error
+[10/Mar/2026:15:24:17 +0530] [ERROR] POST /api/auth/logout 500 Unknown error
+[10/Mar/2026:15:25:49 +0530] [ERROR] POST /api/auth/logout 500 Unknown error
+[10/Mar/2026:15:27:41 +0530] [ERROR] POST /api/auth/logout 500 Unknown error
+[10/Mar/2026:15:40:15 +0530] [ERROR] POST /api/auth/logout 500 Unknown error

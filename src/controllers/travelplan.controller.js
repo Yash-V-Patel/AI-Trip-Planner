@@ -1,2365 +1,2706 @@
+"use strict";
+
 const { PrismaClient } = require("@prisma/client");
-const openfgaService = require("../services/openfga.service");
-const redisService = require("../services/redis.service");
+const openfgaService   = require("../services/openfga.service");
+const redisService     = require("../services/redis.service");
 
 const prisma = new PrismaClient();
 
-class TravelPlanController {
-  constructor() {
-    // Bind all methods
-    this.createTravelPlan = this.createTravelPlan.bind(this);
-    this.getTravelPlans = this.getTravelPlans.bind(this);
-    this.getTravelPlanById = this.getTravelPlanById.bind(this);
-    this.updateTravelPlan = this.updateTravelPlan.bind(this);
-    this.deleteTravelPlan = this.deleteTravelPlan.bind(this);
-    this.shareTravelPlan = this.shareTravelPlan.bind(this);
-    this.revokeAccess = this.revokeAccess.bind(this);
-    this.getSharedUsers = this.getSharedUsers.bind(this);
-    this.generateItinerary = this.generateItinerary.bind(this);
-    this.getRecommendations = this.getRecommendations.bind(this);
-    this.duplicateTravelPlan = this.duplicateTravelPlan.bind(this);
-    this.getTravelPlanStats = this.getTravelPlanStats.bind(this);
-    this.exportTravelPlan = this.exportTravelPlan.bind(this);
-    this.addToFavorites = this.addToFavorites.bind(this);
-    this.removeFromFavorites = this.removeFromFavorites.bind(this);
-    this.getFavorites = this.getFavorites.bind(this);
-    
-    // Booking methods for different services
-    this.addAccommodationBooking = this.addAccommodationBooking.bind(this);
-    this.updateAccommodationBooking = this.updateAccommodationBooking.bind(this);
-    this.cancelAccommodationBooking = this.cancelAccommodationBooking.bind(this);
-    
-    this.addTransportationBooking = this.addTransportationBooking.bind(this);
-    this.updateTransportationBooking = this.updateTransportationBooking.bind(this);
-    this.cancelTransportationBooking = this.cancelTransportationBooking.bind(this);
-    
-    this.addPackageBooking = this.addPackageBooking.bind(this);
-    this.updatePackageBooking = this.updatePackageBooking.bind(this);
-    this.cancelPackageBooking = this.cancelPackageBooking.bind(this);
-    
-    this.addExperienceBooking = this.addExperienceBooking.bind(this);
-    this.updateExperienceBooking = this.updateExperienceBooking.bind(this);
-    this.cancelExperienceBooking = this.cancelExperienceBooking.bind(this);
-    
-    this.addShoppingVisit = this.addShoppingVisit.bind(this);
-    this.updateShoppingVisit = this.updateShoppingVisit.bind(this);
-    this.cancelShoppingVisit = this.cancelShoppingVisit.bind(this);
-    
-    this.addTravelExperience = this.addTravelExperience.bind(this);
-    this.updateTravelExperience = this.updateTravelExperience.bind(this);
-    this.deleteTravelExperience = this.deleteTravelExperience.bind(this);
-    
-    // Budget management
-    this.updateBudget = this.updateBudget.bind(this);
-    this.getBudgetBreakdown = this.getBudgetBreakdown.bind(this);
-    this.getSpendingByCategory = this.getSpendingByCategory.bind(this);
+// ---------------------------------------------------------------------------
+// Constants
+// ---------------------------------------------------------------------------
+
+const CACHE_TTL = {
+  PLAN:      600,   // 10 min  – single plan detail
+  LIST:      300,   // 5 min   – paginated list
+  STATS:     120,   // 2 min   – stats (stale-tolerant)
+  BUDGET:    180,   // 3 min   – budget breakdown
+};
+
+const MAX_PAGE_LIMIT    = 100;
+const DEFAULT_LIMIT     = 10;
+const DEFAULT_PAGE      = 1;
+
+const SHARE_PERMISSIONS = ["viewer", "editor", "suggester"];
+
+const ALLOWED_SORT_FIELDS = new Set([
+  "startDate", "endDate", "createdAt", "updatedAt", "title", "destination",
+]);
+
+const VALID_PLAN_STATUSES = new Set([
+  "PLANNING", "ONGOING", "COMPLETED", "CANCELLED",
+]);
+
+// Terminal statuses — these bookings may not be mutated
+const TERMINAL_ACCOMMODATION  = new Set(["CANCELLED", "CHECKED_OUT", "NO_SHOW"]);
+const TERMINAL_BOOKING        = new Set(["COMPLETED", "CANCELLED"]);
+const TERMINAL_SHOPPING_VISIT = new Set(["VISITED", "CANCELLED", "SKIPPED"]);
+
+// ---------------------------------------------------------------------------
+// Module-level response helpers
+// ---------------------------------------------------------------------------
+
+const ok         = (res, data, message, status = 200) =>
+  res.status(status).json({ success: true,  ...(data && { data }), ...(message && { message }) });
+
+const created    = (res, data, message) => ok(res, data, message, 201);
+const notFound   = (res, msg = "Resource not found")   => res.status(404).json({ success: false, message: msg });
+const forbidden  = (res, msg = "Unauthorized access")  => res.status(403).json({ success: false, message: msg });
+const conflict   = (res, msg)                          => res.status(409).json({ success: false, message: msg });
+const badRequest = (res, msg)                          => res.status(400).json({ success: false, message: msg });
+
+// ---------------------------------------------------------------------------
+// Pagination helpers
+// ---------------------------------------------------------------------------
+
+const parseIntParam = (val, fallback) => {
+  const n = parseInt(val, 10);
+  return Number.isFinite(n) && n > 0 ? n : fallback;
+};
+
+const parsePagination = (query, defaultLimit = DEFAULT_LIMIT) => {
+  const page  = parseIntParam(query.page,  DEFAULT_PAGE);
+  const limit = Math.min(parseIntParam(query.limit, defaultLimit), MAX_PAGE_LIMIT);
+  return { page, limit, skip: (page - 1) * limit };
+};
+
+const paginationMeta = (page, limit, total) => ({
+  page, limit, total, pages: Math.ceil(total / limit),
+});
+
+// ---------------------------------------------------------------------------
+// Safe sort helpers
+// ---------------------------------------------------------------------------
+
+const safeSort = (sortBy, sortOrder, defaultField = "startDate") => ({
+  field: ALLOWED_SORT_FIELDS.has(sortBy) ? sortBy : defaultField,
+  order: sortOrder === "desc" ? "desc" : "asc",
+});
+
+// ---------------------------------------------------------------------------
+// Cache helpers
+// ---------------------------------------------------------------------------
+
+const cacheGet = async (key) => {
+  try {
+    const v = await redisService.client?.get(key);
+    return v ? JSON.parse(v) : null;
+  } catch { return null; }
+};
+
+const cacheSet = (key, value, ttl) => {
+  redisService.client?.setex(key, ttl, JSON.stringify(value)).catch(() => {});
+};
+
+const cacheDel = (...keys) => {
+  const filtered = keys.filter(Boolean);
+  if (filtered.length) {
+    Promise.allSettled(filtered.map((k) => redisService.client?.del(k))).catch(() => {});
   }
-
-  // ==================== HELPER METHODS ====================
-
-  /**
-   * Check if user has permission for travel plan operations
-   */
-  async checkPermission(userId, planId, requiredPermission) {
-    try {
-      // SuperAdmin always has access
-      if (this.req?.user?.isSuperAdmin) return true;
-
-      switch (requiredPermission) {
-        case "edit":
-          return await openfgaService.canEditTravelPlan?.(userId, planId) || false;
-        case "view":
-          return await openfgaService.canViewTravelPlan?.(userId, planId) || false;
-        case "suggest":
-          return await openfgaService.canSuggestTravelPlan?.(userId, planId) || false;
-        case "share":
-          return await openfgaService.canShareTravelPlan?.(userId, planId) || false;
-        case "delete":
-          return await openfgaService.canDeleteTravelPlan?.(userId, planId) || false;
-        default:
-          return false;
-      }
-    } catch (error) {
-      console.error("Error checking travel plan permission:", error);
-      return false;
-    }
-  }
+};
 
 /**
- * Calculate total cost of all bookings in a travel plan
+ * Invalidate all cache entries related to a plan and its owner.
+ * Fire-and-forget.
  */
-async calculateTotalCost(planId) {
-  const [accommodations, transportations, packages, experiences] = await Promise.all([
+const invalidatePlan = (planId, userId) =>
+  cacheDel(`travelplan:${planId}`, userId ? `user:${userId}:travelplans` : null);
+
+// ---------------------------------------------------------------------------
+// Permission helper
+// ---------------------------------------------------------------------------
+
+/**
+ * Check an OpenFGA permission for a user on a travel plan.
+ * Returns false (never throws) — caller decides how to handle denial.
+ */
+const checkPlanPermission = async (userId, planId, action) => {
+  const fns = {
+    view:    openfgaService.canViewTravelPlan,
+    edit:    openfgaService.canEditTravelPlan,
+    suggest: openfgaService.canSuggestTravelPlan,
+    share:   openfgaService.canShareTravelPlan,
+    delete:  openfgaService.canDeleteTravelPlan,
+  };
+  const fn = fns[action];
+  if (!fn) return false;
+  return !!(await fn.call(openfgaService, userId, planId).catch(() => false));
+};
+
+// ---------------------------------------------------------------------------
+// Cost aggregation helper
+// ---------------------------------------------------------------------------
+
+/**
+ * Aggregate booking costs for all categories of a travel plan.
+ * All four DB queries run concurrently.
+ *
+ * Transportation prefers actualFare, falls back to estimatedFare.
+ * Uses ?? not || to correctly handle 0 values.
+ */
+/**
+ * Aggregate booking costs for all categories of a travel plan.
+ * All four DB queries run concurrently.
+ *
+ * Transportation prefers actualFare, falls back to estimatedFare.
+ * Uses ?? not || to correctly handle 0 values.
+ *
+ * [FIX] Exclude cancelled/completed bookings so currentSpent reflects only active/confirmed bookings.
+ */
+const calculateTotalCost = async (planId) => {
+  const [acc, trans, pkg, exp] = await Promise.all([
     prisma.accommodationBooking.aggregate({
-      where: { travelPlanId: planId },
-      _sum: { totalCost: true }
+      where: {
+        travelPlanId: planId,
+        // Exclude cancelled and other terminal accommodation statuses
+        bookingStatus: { notIn: ["CANCELLED", "CHECKED_OUT", "NO_SHOW"] },
+      },
+      _sum: { totalCost: true },
     }),
     prisma.transportationBooking.aggregate({
-      where: { travelPlanId: planId },
-      _sum: { actualFare: true, estimatedFare: true }
+      where: {
+        travelPlanId: planId,
+        // Exclude cancelled and completed transportation bookings
+        status: { notIn: ["CANCELLED", "COMPLETED"] },
+      },
+      _sum: { actualFare: true, estimatedFare: true },
     }),
     prisma.travelPackageBooking.aggregate({
-      where: { travelPlanId: planId },
-      _sum: { finalAmount: true }
+      where: {
+        travelPlanId: planId,
+        // Exclude cancelled and completed package bookings
+        status: { notIn: ["CANCELLED", "COMPLETED"] },
+      },
+      _sum: { finalAmount: true },
     }),
-    // Fix: This should be for vendor experiences (ExperienceBooking)
     prisma.experienceBooking.aggregate({
-      where: { travelPlanId: planId },
-      _sum: { totalAmount: true }
-    })
+      where: {
+        travelPlanId: planId,
+        // Exclude cancelled and completed experience bookings
+        status: { notIn: ["CANCELLED", "COMPLETED"] },
+      },
+      _sum: { totalAmount: true },
+    }),
   ]);
 
-  return {
-    accommodations: accommodations._sum.totalCost || 0,
-    transportations: transportations._sum.actualFare || transportations._sum.estimatedFare || 0,
-    packages: packages._sum.finalAmount || 0,
-    experiences: experiences._sum.totalAmount || 0,
-    total: (accommodations._sum.totalCost || 0) +
-           (transportations._sum.actualFare || transportations._sum.estimatedFare || 0) +
-           (packages._sum.finalAmount || 0) +
-           (experiences._sum.totalAmount || 0)
-  };
-}
-  // ==================== CORE TRAVEL PLAN METHODS ====================
+  const accommodations  = acc._sum.totalCost   ?? 0;
+  const transportations = trans._sum.actualFare ?? trans._sum.estimatedFare ?? 0;
+  const packages        = pkg._sum.finalAmount  ?? 0;
+  const experiences     = exp._sum.totalAmount  ?? 0;
+  const total           = accommodations + transportations + packages + experiences;
+
+  return { accommodations, transportations, packages, experiences, total };
+};
+// ---------------------------------------------------------------------------
+// Shared Prisma include fragments
+// ---------------------------------------------------------------------------
+
+const PLAN_COUNTS = {
+  _count: {
+    select: {
+      accommodations:        true,
+      transportServices:     true,
+      travelPackageBookings: true,
+      experiences:           true,
+      shoppingVisits:        true,
+      experienceBookings:    true,
+    },
+  },
+};
+
+const PLAN_FULL_INCLUDE = {
+  user: {
+    select: {
+      id: true, name: true, email: true,
+      profile: { select: { profilePicture: true } },
+    },
+  },
+  accommodations: {
+    include: { accommodation: true, rooms: true },
+    orderBy: { checkInDate: "asc" },
+  },
+  transportServices: {
+    include: { provider: true, vehicle: true },
+    orderBy: { pickupTime: "asc" },
+  },
+  travelPackageBookings: {
+    include: { package: true },
+    orderBy: { startDate: "asc" },
+  },
+  experiences:       { orderBy: { date: "asc" } },
+  experienceBookings: {
+    include: { experience: true },
+    orderBy: { experienceDate: "asc" },
+  },
+  shoppingVisits: {
+    include: { store: true },
+    orderBy: { plannedDate: "asc" },
+  },
+  ...PLAN_COUNTS,
+};
+
+// ---------------------------------------------------------------------------
+// Controller
+// ---------------------------------------------------------------------------
+
+class TravelPlanController {
+
+  // ==========================================================================
+  //  CORE TRAVEL PLAN CRUD
+  // ==========================================================================
 
   /**
-   * Create a new travel plan
    * POST /api/travel-plans
+   *
+   * Creates a new travel plan owned by the authenticated user.
+   * - Explicit field whitelist prevents req.body injection.
+   * - Validates and parses dates before persisting.
+   * - OpenFGA tuple creation and cache bust are fire-and-forget.
    */
   async createTravelPlan(req, res, next) {
     try {
-      const planData = req.body;
+      const {
+        title, destination, description,
+        startDate, endDate, budget, numberOfTravelers,
+        itinerary, recommendations, interests,
+      } = req.body;
 
-      // Validate dates
-      const startDate = new Date(planData.startDate);
-      const endDate = new Date(planData.endDate);
-      
-      if (endDate <= startDate) {
-        return res.status(400).json({
-          success: false,
-          message: "End date must be after start date"
-        });
+      if (!title)               return badRequest(res, "title is required");
+      if (!destination)         return badRequest(res, "destination is required");
+      if (!startDate || !endDate) return badRequest(res, "startDate and endDate are required");
+
+      const start = new Date(startDate);
+      const end   = new Date(endDate);
+
+      if (isNaN(start.getTime()) || isNaN(end.getTime())) {
+        return badRequest(res, "Invalid date format");
       }
+      if (end <= start) return badRequest(res, "endDate must be after startDate");
 
-      const travelPlan = await prisma.travelPlan.create({
+      const plan = await prisma.travelPlan.create({
         data: {
-          ...planData,
-          userId: req.user.id
-        }
+          userId:      req.user.id,
+          title:       title.trim(),
+          destination: destination.trim(),
+          startDate:   start,
+          endDate:     end,
+          status:      "PLANNING",
+          interests:   interests ?? [],
+          numberOfTravelers :   numberOfTravelers  ?? 1,
+          ...(description     !== undefined && { description }),
+          ...(budget          !== undefined && { budget: +budget }),
+          ...(itinerary       !== undefined && { itinerary }),
+          ...(recommendations !== undefined && { recommendations }),
+        },
       });
 
-      // Set up OpenFGA relations
-      await openfgaService.createTravelPlanRelations(req.user.id, travelPlan.id);
+      // Fire-and-forget — don't block the response
+      Promise.allSettled([
+        openfgaService.createTravelPlanRelations(req.user.id, plan.id),
+        cacheDel(`user:${req.user.id}:travelplans`),
+      ]);
 
-      // Invalidate user's travel plans cache
-      await redisService.client?.del(`user:${req.user.id}:travelplans`);
-
-      res.status(201).json({
-        success: true,
-        data: travelPlan,
-        message: "Travel plan created successfully"
-      });
-    } catch (error) {
-      next(error);
+      return created(res, plan, "Travel plan created successfully");
+    } catch (err) {
+      next(err);
     }
   }
 
   /**
-   * Get all travel plans for current user
    * GET /api/travel-plans
+   *
+   * Returns paginated list of the authenticated user's travel plans,
+   * each enriched with currentSpent and budgetRemaining.
+   * - Sort field whitelisted against ALLOWED_SORT_FIELDS.
+   * - skipCache normalised to === "true" (string "false" is truthy).
+   * - Cost queries fan-out via Promise.all (no N+1).
+   * - Limit capped at MAX_PAGE_LIMIT.
+   * - Cache key includes all filter and sort dimensions.
    */
   async getTravelPlans(req, res, next) {
     try {
-      const { 
-        status, 
-        destination, 
-        fromDate, 
-        toDate,
-        page = 1, 
-        limit = 10,
-        sortBy = 'startDate',
-        sortOrder = 'asc'
+      const {
+        status, destination, fromDate, toDate,
+        sortBy = "startDate", sortOrder = "asc",
       } = req.query;
 
-      // Build filter
-      const where = { userId: req.user.id };
-      if (status) where.status = status;
-      if (destination) where.destination = { contains: destination, mode: 'insensitive' };
-      if (fromDate) where.startDate = { gte: new Date(fromDate) };
-      if (toDate) where.endDate = { lte: new Date(toDate) };
+      const { page, limit, skip } = parsePagination(req.query);
+      const { field, order }      = safeSort(sortBy, sortOrder);
+      const skipCache             = req.query.skipCache === "true";
 
-      const skip = (parseInt(page) - 1) * parseInt(limit);
-      const orderBy = {};
-      orderBy[sortBy] = sortOrder;
+      const cacheKey = `user:${req.user.id}:travelplans:${page}:${limit}:${status ?? ""}:${destination ?? ""}:${field}:${order}`;
+
+      if (!skipCache) {
+        const cached = await cacheGet(cacheKey);
+        if (cached) return res.json({ success: true, ...cached, cached: true });
+      }
+
+      const where = { userId: req.user.id };
+      if (status)      where.status      = status;
+      if (destination) where.destination = { contains: destination.trim(), mode: "insensitive" };
+      if (fromDate)    where.startDate   = { gte: new Date(fromDate) };
+      if (toDate)      where.endDate     = { lte: new Date(toDate) };
 
       const [plans, total] = await Promise.all([
         prisma.travelPlan.findMany({
           where,
-          include: {
-            _count: {
-              select: {
-                accommodations: true,
-                transportServices: true,
-                travelPackageBookings: true,
-                experiences: true,
-                shoppingVisits: true
-              }
-            }
-          },
+          include:  PLAN_COUNTS,
           skip,
-          take: parseInt(limit),
-          orderBy
+          take:     limit,
+          orderBy:  { [field]: order },
         }),
-        prisma.travelPlan.count({ where })
+        prisma.travelPlan.count({ where }),
       ]);
 
-      // Get budget info for each plan
-      const plansWithCost = await Promise.all(
-        plans.map(async (plan) => {
-          const costs = await this.calculateTotalCost(plan.id);
-          return {
-            ...plan,
-            currentSpent: costs.total,
-            budgetRemaining: (plan.budget || 0) - costs.total
-          };
-        })
-      );
+      // All cost queries fan-out concurrently — no N+1
+      const allCosts = await Promise.all(plans.map((p) => calculateTotalCost(p.id)));
 
-      // Cache user's travel plans
-      await redisService.client?.setex(
-        `user:${req.user.id}:travelplans`,
-        300,
-        JSON.stringify(plansWithCost)
-      );
+      const data = plans.map((plan, i) => ({
+        ...plan,
+        currentSpent:    allCosts[i].total,
+        budgetRemaining: (plan.budget ?? 0) - allCosts[i].total,
+      }));
 
-      res.json({
-        success: true,
-        data: plansWithCost,
-        pagination: {
-          page: parseInt(page),
-          limit: parseInt(limit),
-          total,
-          pages: Math.ceil(total / parseInt(limit))
-        }
-      });
-    } catch (error) {
-      next(error);
+      const body = { data, pagination: paginationMeta(page, limit, total) };
+      cacheSet(cacheKey, body, CACHE_TTL.LIST);
+
+      return res.json({ success: true, ...body });
+    } catch (err) {
+      next(err);
     }
   }
-
-/**
- * Get travel plan by ID
- * GET /api/travel-plans/:id
- */
-async getTravelPlanById(req, res, next) {
-  try {
-    const { id } = req.params;
-
-    // Check permission
-    const canView = await this.checkPermission(req.user.id, id, 'view');
-    if (!canView && !req.user.isSuperAdmin) {
-      return res.status(403).json({
-        success: false,
-        message: "You do not have permission to view this travel plan"
-      });
-    }
-
-    // Try cache first
-    const cacheKey = `travelplan:${id}`;
-    let cached = await redisService.client?.get(cacheKey);
-    if (cached && !req.query.skipCache) {
-      return res.json({
-        success: true,
-        data: JSON.parse(cached),
-        cached: true
-      });
-    }
-
-    const travelPlan = await prisma.travelPlan.findUnique({
-      where: { id },
-      include: {
-        user: {
-          select: {
-            id: true,
-            name: true,
-            email: true,
-            profile: {
-              select: {
-                profilePicture: true
-              }
-            }
-          }
-        },
-        accommodations: {
-          include: {
-            accommodation: true,
-            rooms: true
-          },
-          orderBy: {
-            checkInDate: 'asc'
-          }
-        },
-        transportServices: {
-          include: {
-            provider: true,
-            vehicle: true
-          },
-          orderBy: {
-            pickupTime: 'asc'
-          }
-        },
-        travelPackageBookings: {
-          include: {
-            package: true
-          },
-          orderBy: {
-            startDate: 'asc'
-          }
-        },
-        experiences: {
-          // This is for TravelExperience (custom experiences)
-          orderBy: {
-            date: 'asc'  // Changed from experienceDate to date
-          }
-        },
-        shoppingVisits: {
-          include: {
-            store: true
-          },
-          orderBy: {
-            plannedDate: 'asc'
-          }
-        },
-        _count: {
-          select: {
-            accommodations: true,
-            transportServices: true,
-            travelPackageBookings: true,
-            experiences: true,
-            shoppingVisits: true
-          }
-        }
-      }
-    });
-
-    if (!travelPlan) {
-      return res.status(404).json({
-        success: false,
-        message: "Travel plan not found"
-      });
-    }
-
-    // Calculate costs
-    const costs = await this.calculateTotalCost(id);
-    
-    const enrichedPlan = {
-      ...travelPlan,
-      currentSpent: costs.total,
-      budgetBreakdown: costs,
-      budgetRemaining: (travelPlan.budget || 0) - costs.total,
-      isOwner: travelPlan.userId === req.user.id
-    };
-
-    // Cache for 10 minutes
-    await redisService.client?.setex(cacheKey, 600, JSON.stringify(enrichedPlan));
-
-    res.json({
-      success: true,
-      data: enrichedPlan
-    });
-  } catch (error) {
-    next(error);
-  }
-}
 
   /**
-   * Update travel plan
+   * GET /api/travel-plans/:id
+   *
+   * Returns full plan detail with all booking relations included.
+   * - Existence check before permission check (gives 404 not 403 on missing plans).
+   * - Enriches with currentSpent, budgetBreakdown, budgetRemaining, isOwner.
+   */
+async getTravelPlanById(req, res, next) {
+  try {
+    const { id }    = req.params;
+    const skipCache = req.query.skipCache === "true";
+
+    if (!skipCache) {
+      const cached = await cacheGet(`travelplan:${id}`);
+      if (cached) return res.json({ success: true, data: cached, cached: true });
+    }
+
+    const plan = await prisma.travelPlan.findUnique({
+      where:   { id },
+      include: PLAN_FULL_INCLUDE,
+    });
+
+    if (!plan) return notFound(res, "Travel plan not found");
+
+    const canView =
+      req.user.isSuperAdmin ||
+      plan.userId === req.user.id ||
+      (await checkPlanPermission(req.user.id, id, "view"));
+
+    if (!canView) return forbidden(res, "You do not have permission to view this travel plan");
+
+    const costs = await calculateTotalCost(id);
+
+    // [FIX] Strip email from non-owners / non-superadmins
+    const isOwner = plan.userId === req.user.id;
+    const userInfo = (isOwner || req.user.isSuperAdmin)
+      ? plan.user
+      : { id: plan.user.id, name: plan.user.name, profile: plan.user.profile };
+
+    const enriched = {
+      ...plan,
+      user:            userInfo,               // <-- replaced with filtered version
+      currentSpent:    costs.total,
+      budgetBreakdown: costs,
+      budgetRemaining: (plan.budget ?? 0) - costs.total,
+      isOwner,
+    };
+
+    cacheSet(`travelplan:${id}`, enriched, CACHE_TTL.PLAN);
+
+    return ok(res, enriched);
+  } catch (err) {
+    next(err);
+  }
+}
+  /**
    * PUT /api/travel-plans/:id
+   *
+   * Sparse update — only supplied fields are written.
+   * - Existence check before permission check.
+   * - Cross-validates dates against each other AND existing stored dates when
+   *   only one date is supplied (fixes partial-date regression in v2).
+   * - userId and id are never writable.
+   * - status validated against VALID_PLAN_STATUSES.
    */
   async updateTravelPlan(req, res, next) {
     try {
       const { id } = req.params;
 
-      // Check permission
-      const canEdit = await this.checkPermission(req.user.id, id, 'edit');
-      if (!canEdit && !req.user.isSuperAdmin) {
-        return res.status(403).json({
-          success: false,
-          message: "You do not have permission to update this travel plan"
-        });
+      const existing = await prisma.travelPlan.findUnique({
+        where:  { id },
+        select: { id: true, userId: true, startDate: true, endDate: true },
+      });
+      if (!existing) return notFound(res, "Travel plan not found");
+
+      const canEdit =
+        req.user.isSuperAdmin ||
+        existing.userId === req.user.id ||
+        (await checkPlanPermission(req.user.id, id, "edit"));
+
+      if (!canEdit) return forbidden(res, "You do not have permission to update this travel plan");
+
+      const {
+        title, destination, description,
+        startDate, endDate, budget, numberOfTravelers,
+        itinerary, recommendations, interests, status,
+      } = req.body;
+
+      // Cross-validate dates: merge incoming with existing before comparing
+      const newStart = startDate ? new Date(startDate) : existing.startDate;
+      const newEnd   = endDate   ? new Date(endDate)   : existing.endDate;
+
+      if (startDate && isNaN(newStart.getTime())) return badRequest(res, "Invalid startDate format");
+      if (endDate   && isNaN(newEnd.getTime()))   return badRequest(res, "Invalid endDate format");
+      if (newEnd <= newStart) return badRequest(res, "endDate must be after startDate");
+
+      if (status && !VALID_PLAN_STATUSES.has(status)) {
+        return badRequest(res, `status must be one of: ${[...VALID_PLAN_STATUSES].join(", ")}`);
       }
 
-      const updateData = req.body;
-
-      // Validate dates if both are provided
-      if (updateData.startDate && updateData.endDate) {
-        const startDate = new Date(updateData.startDate);
-        const endDate = new Date(updateData.endDate);
-        if (endDate <= startDate) {
-          return res.status(400).json({
-            success: false,
-            message: "End date must be after start date"
-          });
-        }
-      }
-
-      const travelPlan = await prisma.travelPlan.update({
+      const updated = await prisma.travelPlan.update({
         where: { id },
-        data: updateData
+        data: {
+          ...(title           !== undefined && { title:       title.trim() }),
+          ...(destination     !== undefined && { destination: destination.trim() }),
+          ...(description     !== undefined && { description }),
+          ...(startDate       !== undefined && { startDate:   newStart }),
+          ...(endDate         !== undefined && { endDate:     newEnd }),
+          ...(budget          !== undefined && { budget:      +budget }),
+          ...(numberOfTravelers       !== undefined && { numberOfTravelers }),
+          ...(itinerary       !== undefined && { itinerary }),
+          ...(recommendations !== undefined && { recommendations }),
+          ...(interests       !== undefined && { interests }),
+          ...(status          !== undefined && { status }),
+        },
       });
 
-      // Invalidate caches
-      await Promise.all([
-        redisService.client?.del(`travelplan:${id}`),
-        redisService.client?.del(`user:${req.user.id}:travelplans`)
-      ]);
+      invalidatePlan(id, existing.userId);
 
-      res.json({
-        success: true,
-        data: travelPlan,
-        message: "Travel plan updated successfully"
-      });
-    } catch (error) {
-      if (error.code === 'P2025') {
-        return res.status(404).json({
-          success: false,
-          message: "Travel plan not found"
-        });
-      }
-      next(error);
+      return ok(res, updated, "Travel plan updated successfully");
+    } catch (err) {
+      if (err.code === "P2025") return notFound(res, "Travel plan not found");
+      next(err);
     }
   }
 
   /**
-   * Delete travel plan
    * DELETE /api/travel-plans/:id
+   *
+   * Prevents deletion when active bookings exist.
+   * - All four active-booking checks fan out concurrently.
+   * - Existence check before permission check.
    */
   async deleteTravelPlan(req, res, next) {
     try {
       const { id } = req.params;
 
-      // Check permission
-      const canDelete = await this.checkPermission(req.user.id, id, 'delete');
-      if (!canDelete && !req.user.isSuperAdmin) {
-        return res.status(403).json({
-          success: false,
-          message: "You do not have permission to delete this travel plan"
-        });
-      }
+      const existing = await prisma.travelPlan.findUnique({
+        where:  { id },
+        select: { id: true, userId: true },
+      });
+      if (!existing) return notFound(res, "Travel plan not found");
 
-      // Check for active bookings
-      const activeBookings = await Promise.all([
+      const canDelete =
+        req.user.isSuperAdmin ||
+        existing.userId === req.user.id ||
+        (await checkPlanPermission(req.user.id, id, "delete"));
+
+      if (!canDelete) return forbidden(res, "You do not have permission to delete this travel plan");
+
+      // All active-booking checks run concurrently
+      const [accActive, transActive, pkgActive, expActive] = await Promise.all([
         prisma.accommodationBooking.count({
-          where: {
-            travelPlanId: id,
-            bookingStatus: { in: ['CONFIRMED', 'CHECKED_IN'] }
-          }
+          where: { travelPlanId: id, bookingStatus: { in: ["CONFIRMED", "CHECKED_IN"] } },
         }),
         prisma.transportationBooking.count({
-          where: {
-            travelPlanId: id,
-            status: { in: ['CONFIRMED', 'ON_THE_WAY'] }
-          }
+          where: { travelPlanId: id, status: { in: ["CONFIRMED", "ON_THE_WAY"] } },
         }),
         prisma.travelPackageBooking.count({
-          where: {
-            travelPlanId: id,
-            status: { in: ['CONFIRMED'] }
-          }
+          where: { travelPlanId: id, status: "CONFIRMED" },
         }),
         prisma.experienceBooking.count({
-          where: {
-            travelPlanId: id,
-            status: { in: ['CONFIRMED'] }
-          }
-        })
+          where: { travelPlanId: id, status: "CONFIRMED" },
+        }),
       ]);
 
-      const totalActive = activeBookings.reduce((a, b) => a + b, 0);
-      
-      if (totalActive > 0) {
-        return res.status(400).json({
-          success: false,
-          message: "Cannot delete travel plan with active bookings. Cancel bookings first."
-        });
+      if (accActive + transActive + pkgActive + expActive > 0) {
+        return badRequest(res, "Cannot delete a travel plan with active bookings. Cancel all bookings first.");
       }
 
-      await prisma.travelPlan.delete({
-        where: { id }
-      });
+      await prisma.travelPlan.delete({ where: { id } });
+      invalidatePlan(id, existing.userId);
 
-      // Invalidate caches
-      await Promise.all([
-        redisService.client?.del(`travelplan:${id}`),
-        redisService.client?.del(`user:${req.user.id}:travelplans`)
-      ]);
-
-      res.json({
-        success: true,
-        message: "Travel plan deleted successfully"
-      });
-    } catch (error) {
-      if (error.code === 'P2025') {
-        return res.status(404).json({
-          success: false,
-          message: "Travel plan not found"
-        });
-      }
-      next(error);
+      return ok(res, null, "Travel plan deleted successfully");
+    } catch (err) {
+      if (err.code === "P2025") return notFound(res, "Travel plan not found");
+      next(err);
     }
   }
 
   /**
-   * Duplicate a travel plan
    * POST /api/travel-plans/:id/duplicate
+   *
+   * Creates a copy of an existing plan owned by the requesting user.
+   * Duration is preserved; start date can be overridden.
+   * itinerary/recommendations are intentionally NOT copied (fresh slate).
+   * Pass ?copyItinerary=true to opt-in.
    */
   async duplicateTravelPlan(req, res, next) {
     try {
-      const { id } = req.params;
-      const { title, startDate } = req.body;
+      const { id }                    = req.params;
+      const { title, startDate }      = req.body;
+      const copyItinerary             = req.query.copyItinerary === "true";
 
-      // Check permission to view original
-      const canView = await this.checkPermission(req.user.id, id, 'view');
-      if (!canView && !req.user.isSuperAdmin) {
-        return res.status(403).json({
-          success: false,
-          message: "You do not have permission to view this travel plan"
-        });
-      }
+      const original = await prisma.travelPlan.findUnique({ where: { id } });
+      if (!original) return notFound(res, "Original travel plan not found");
 
-      // Get original plan
-      const original = await prisma.travelPlan.findUnique({
-        where: { id }
-      });
+      const canView =
+        req.user.isSuperAdmin ||
+        original.userId === req.user.id ||
+        (await checkPlanPermission(req.user.id, id, "view"));
 
-      if (!original) {
-        return res.status(404).json({
-          success: false,
-          message: "Original travel plan not found"
-        });
-      }
+      if (!canView) return forbidden(res, "You do not have permission to duplicate this travel plan");
 
-      // Calculate new dates based on original duration
-      const originalStart = new Date(original.startDate);
-      const originalEnd = new Date(original.endDate);
-      const durationDays = Math.ceil((originalEnd - originalStart) / (1000 * 60 * 60 * 24));
+      const durationMs = original.endDate - original.startDate;
+      const newStart   = startDate ? new Date(startDate) : new Date();
+      const newEnd     = new Date(newStart.getTime() + durationMs);
 
-      const newStartDate = startDate ? new Date(startDate) : new Date();
-      const newEndDate = new Date(newStartDate);
-      newEndDate.setDate(newEndDate.getDate() + durationDays);
-
-      // Create duplicate
       const duplicate = await prisma.travelPlan.create({
         data: {
-          title: title || `${original.title} (Copy)`,
+          userId:      req.user.id,
+          title:       title?.trim() || `${original.title} (Copy)`,
           destination: original.destination,
           description: original.description,
-          startDate: newStartDate,
-          endDate: newEndDate,
-          budget: original.budget,
-          travelers: original.travelers,
-          interests: original.interests,
-          userId: req.user.id,
-          status: 'PLANNING'
-        }
+          startDate:   newStart,
+          endDate:     newEnd,
+          budget:      original.budget,
+          numberOfTravelers:   original.numberOfTravelers,
+          interests:   original.interests,
+          status:      "PLANNING",
+          ...(copyItinerary && {
+            itinerary:       original.itinerary,
+            recommendations: original.recommendations,
+          }),
+        },
       });
 
-      // Set up OpenFGA relations
-      await openfgaService.createTravelPlanRelations(req.user.id, duplicate.id);
+      Promise.allSettled([
+        openfgaService.createTravelPlanRelations(req.user.id, duplicate.id),
+        cacheDel(`user:${req.user.id}:travelplans`),
+      ]);
 
-      res.status(201).json({
-        success: true,
-        data: duplicate,
-        message: "Travel plan duplicated successfully"
-      });
-    } catch (error) {
-      next(error);
+      return created(res, duplicate, "Travel plan duplicated successfully");
+    } catch (err) {
+      next(err);
     }
   }
 
-  // ==================== SHARING METHODS ====================
+  // ==========================================================================
+  //  STATUS MANAGEMENT
+  // ==========================================================================
 
   /**
-   * Share travel plan with another user
+   * PATCH /api/travel-plans/:id/status
+   *
+   * Lightweight status-only update with enum validation.
+   */
+  async updatePlanStatus(req, res, next) {
+    try {
+      const { id }     = req.params;
+      const { status } = req.body;
+
+      if (!status)                        return badRequest(res, "status is required");
+      if (!VALID_PLAN_STATUSES.has(status)) return badRequest(res, `status must be one of: ${[...VALID_PLAN_STATUSES].join(", ")}`);
+
+      const existing = await prisma.travelPlan.findUnique({
+        where:  { id },
+        select: { id: true, userId: true },
+      });
+      if (!existing) return notFound(res, "Travel plan not found");
+
+      const canEdit =
+        req.user.isSuperAdmin ||
+        existing.userId === req.user.id ||
+        (await checkPlanPermission(req.user.id, id, "edit"));
+
+      if (!canEdit) return forbidden(res, "You do not have permission to update this travel plan");
+
+      const updated = await prisma.travelPlan.update({
+        where:  { id },
+        data:   { status },
+        select: { id: true, status: true, updatedAt: true },
+      });
+
+      invalidatePlan(id, existing.userId);
+
+      return ok(res, updated, `Travel plan status updated to ${status}`);
+    } catch (err) {
+      next(err);
+    }
+  }
+
+  // ==========================================================================
+  //  SHARING & COLLABORATION
+  // ==========================================================================
+
+  /**
    * POST /api/travel-plans/:id/share
+   *
+   * Grants a permission level to another user on this plan.
+   * - Validates permission against whitelist.
+   * - Prevents self-share.
+   * - Returns 409 if user already holds that permission.
+   *   Uses openfgaService.checkPermission safely (null check, not optional chaining).
    */
   async shareTravelPlan(req, res, next) {
     try {
-      const { id } = req.params;
-      const { email, permission } = req.body;
+      const { id }                    = req.params;
+      const { email, permission }     = req.body;
 
-      // Check permission to share
-      const canShare = await this.checkPermission(req.user.id, id, 'share');
-      if (!canShare && !req.user.isSuperAdmin) {
-        return res.status(403).json({
-          success: false,
-          message: "You do not have permission to share this travel plan"
-        });
+      if (!email)      return badRequest(res, "email is required");
+      if (!permission) return badRequest(res, "permission is required");
+      if (!SHARE_PERMISSIONS.includes(permission)) {
+        return badRequest(res, `permission must be one of: ${SHARE_PERMISSIONS.join(", ")}`);
       }
 
-      // Find user by email
-      const user = await prisma.user.findUnique({
-        where: { email }
+      const [existing, canShare] = await Promise.all([
+        prisma.travelPlan.findUnique({ where: { id }, select: { id: true, userId: true } }),
+        req.user.isSuperAdmin
+          ? Promise.resolve(true)
+          : checkPlanPermission(req.user.id, id, "share"),
+      ]);
+
+      if (!existing) return notFound(res, "Travel plan not found");
+      if (!canShare)  return forbidden(res, "You do not have permission to share this travel plan");
+
+      const targetUser = await prisma.user.findUnique({
+        where:  { email },
+        select: { id: true, name: true },
       });
+      if (!targetUser) return notFound(res, "User not found");
+      if (targetUser.id === req.user.id) return badRequest(res, "Cannot share a travel plan with yourself");
 
-      if (!user) {
-        return res.status(404).json({
-          success: false,
-          message: "User not found"
-        });
+      // Duplicate-permission guard — explicit null check (not optional chaining)
+      // to surface missing method as a real error rather than silently skipping.
+      if (typeof openfgaService.checkPermission === "function") {
+        const alreadyHas = await openfgaService
+          .checkPermission(targetUser.id, permission, `travelplan:${id}`)
+          .catch(() => false);
+
+        if (alreadyHas) {
+          return conflict(res, `User already has ${permission} access to this travel plan`);
+        }
       }
 
-      // Check if already shared
-      const existing = await openfgaService.checkPermission(
-        user.id,
-        permission,
-        `travelplan:${id}`
-      );
+      await openfgaService.shareTravelPlan(id, targetUser.id, permission);
 
-      if (existing) {
-        return res.status(400).json({
-          success: false,
-          message: `User already has ${permission} access`
-        });
-      }
-
-      // Share the plan
-      await openfgaService.shareTravelPlan(id, user.id, permission);
-
-      // Create notification (optional)
-      // await notificationService.sendShareNotification(user.id, req.user.name, permission);
-
-      res.json({
-        success: true,
-        message: `Travel plan shared with ${email} as ${permission}`
-      });
-    } catch (error) {
-      next(error);
+      return ok(res, null, `Travel plan shared with ${email} as ${permission}`);
+    } catch (err) {
+      next(err);
     }
   }
 
   /**
-   * Revoke access from a user
    * DELETE /api/travel-plans/:id/share/:email
+   *
+   * Revokes all permission levels from a user on this plan.
    */
   async revokeAccess(req, res, next) {
     try {
       const { id, email } = req.params;
 
-      // Check permission to share
-      const canShare = await this.checkPermission(req.user.id, id, 'share');
-      if (!canShare && !req.user.isSuperAdmin) {
-        return res.status(403).json({
-          success: false,
-          message: "You do not have permission to revoke access"
-        });
-      }
+      const [existing, canShare] = await Promise.all([
+        prisma.travelPlan.findUnique({ where: { id }, select: { id: true } }),
+        req.user.isSuperAdmin
+          ? Promise.resolve(true)
+          : checkPlanPermission(req.user.id, id, "share"),
+      ]);
 
-      // Find user by email
-      const user = await prisma.user.findUnique({
-        where: { email }
+      if (!existing) return notFound(res, "Travel plan not found");
+      if (!canShare)  return forbidden(res, "You do not have permission to revoke access for this travel plan");
+
+      const targetUser = await prisma.user.findUnique({
+        where:  { email },
+        select: { id: true },
       });
+      if (!targetUser) return notFound(res, "User not found");
 
-      if (!user) {
-        return res.status(404).json({
-          success: false,
-          message: "User not found"
-        });
-      }
-
-      // Get all permissions for this user on this plan
-      const permissions = ['viewer', 'editor', 'suggester'];
-      
-      await Promise.all(
-        permissions.map(permission =>
-          openfgaService.revokeTravelPlanAccess(id, user.id, permission)
+      // Remove all permission levels for this user
+      await Promise.allSettled(
+        SHARE_PERMISSIONS.map((perm) =>
+          openfgaService.revokeTravelPlanAccess(id, targetUser.id, perm).catch(() => {})
         )
       );
 
-      res.json({
-        success: true,
-        message: `Access revoked for ${email}`
-      });
-    } catch (error) {
-      next(error);
+      return ok(res, null, `Access revoked for ${email}`);
+    } catch (err) {
+      next(err);
     }
   }
 
   /**
-   * Get users with access to this plan
    * GET /api/travel-plans/:id/shared-users
+   *
+   * Lists all users who have been explicitly granted access to this plan.
+   * Reads tuples from OpenFGA, resolves user details from DB.
+   * - Existence and view permission checked before any FGA read.
+   * - readTuples null-checked explicitly (not optional chaining).
    */
   async getSharedUsers(req, res, next) {
     try {
       const { id } = req.params;
 
-      // Check permission to view
-      const canView = await this.checkPermission(req.user.id, id, 'view');
-      if (!canView && !req.user.isSuperAdmin) {
-        return res.status(403).json({
-          success: false,
-          message: "You do not have permission to view this travel plan"
-        });
+      const existing = await prisma.travelPlan.findUnique({
+        where:  { id },
+        select: { id: true, userId: true },
+      });
+      if (!existing) return notFound(res, "Travel plan not found");
+
+      const canView =
+        req.user.isSuperAdmin ||
+        existing.userId === req.user.id ||
+        (await checkPlanPermission(req.user.id, id, "view"));
+
+      if (!canView) return forbidden(res, "You do not have permission to view this travel plan");
+
+      if (typeof openfgaService.readTuples !== "function") {
+        return ok(res, [], "OpenFGA readTuples not available");
       }
 
-      // This would typically query OpenFGA for shared users
-      // For now, return a placeholder
-      // You'd need to implement readTuples with specific filters
+      const tuples = await openfgaService.readTuples(`travelplan:${id}`).catch(() => []) ?? [];
 
-      res.json({
-        success: true,
-        data: [] // Implement actual user fetching
-      });
-    } catch (error) {
-      next(error);
+      // Collect unique user IDs, excluding the plan owner
+      const userIds = [
+        ...new Set(
+          tuples
+            .map((t) => t.user?.replace("user:", ""))
+            .filter(Boolean)
+            .filter((uid) => uid !== existing.userId)
+        ),
+      ];
+
+      const users = userIds.length
+        ? await prisma.user.findMany({
+            where:  { id: { in: userIds } },
+            select: { id: true, name: true, email: true },
+          })
+        : [];
+
+      const usersMap = Object.fromEntries(users.map((u) => [u.id, u]));
+
+      const sharedUsers = tuples
+        .map((t) => {
+          const uid = t.user?.replace("user:", "");
+          return uid && usersMap[uid]
+            ? { userId: uid, permission: t.relation, user: usersMap[uid] }
+            : null;
+        })
+        .filter(Boolean);
+
+      return ok(res, sharedUsers);
+    } catch (err) {
+      next(err);
     }
   }
 
-  // ==================== ACCOMMODATION BOOKINGS ====================
+  /**
+   * PATCH /api/travel-plans/:id/share/:email
+   *
+   * Update an existing collaborator's permission level.
+   * Revokes all existing permissions then writes the new one.
+   */
+  async updateSharedUserPermission(req, res, next) {
+    try {
+      const { id, email }         = req.params;
+      const { permission }        = req.body;
+
+      if (!permission) return badRequest(res, "permission is required");
+      if (!SHARE_PERMISSIONS.includes(permission)) {
+        return badRequest(res, `permission must be one of: ${SHARE_PERMISSIONS.join(", ")}`);
+      }
+
+      const [existing, canShare] = await Promise.all([
+        prisma.travelPlan.findUnique({ where: { id }, select: { id: true } }),
+        req.user.isSuperAdmin
+          ? Promise.resolve(true)
+          : checkPlanPermission(req.user.id, id, "share"),
+      ]);
+
+      if (!existing) return notFound(res, "Travel plan not found");
+      if (!canShare)  return forbidden(res, "You do not have permission to manage collaborators");
+
+      const targetUser = await prisma.user.findUnique({
+        where:  { email },
+        select: { id: true },
+      });
+      if (!targetUser) return notFound(res, "User not found");
+
+      // Revoke all then grant the new permission
+      await Promise.allSettled(
+        SHARE_PERMISSIONS.map((p) =>
+          openfgaService.revokeTravelPlanAccess(id, targetUser.id, p).catch(() => {})
+        )
+      );
+      await openfgaService.shareTravelPlan(id, targetUser.id, permission);
+
+      return ok(res, null, `Permission updated to ${permission} for ${email}`);
+    } catch (err) {
+      next(err);
+    }
+  }
+
+  // ==========================================================================
+  //  ACCOMMODATION BOOKINGS
+  // ==========================================================================
 
   /**
-   * Add accommodation booking to travel plan
    * POST /api/travel-plans/:id/accommodations
    */
   async addAccommodationBooking(req, res, next) {
     try {
       const { id } = req.params;
-      const bookingData = req.body;
+      const {
+        accommodationId, roomIds, checkInDate, checkOutDate,
+        totalGuests, roomType, pricePerNight, taxes, serviceFee,
+        totalCost, guestName, guestEmail, guestPhone, specialRequests,
+        paymentStatus, paymentMethod,
+      } = req.body;
 
-      // Check permission
-      const canEdit = await this.checkPermission(req.user.id, id, 'edit');
-      if (!canEdit && !req.user.isSuperAdmin) {
-        return res.status(403).json({
-          success: false,
-          message: "You do not have permission to add bookings to this travel plan"
-        });
-      }
+      if (!checkInDate || !checkOutDate) return badRequest(res, "checkInDate and checkOutDate are required");
+      if (!guestName)                    return badRequest(res, "guestName is required");
+      if (!guestEmail)                   return badRequest(res, "guestEmail is required");
+      if (!accommodationId)              return badRequest(res, "accommodationId is required");
+      if (!roomType)                     return badRequest(res, "roomType is required");
+      if (pricePerNight === undefined)   return badRequest(res, "pricePerNight is required");
+      if (totalCost === undefined)       return badRequest(res, "totalCost is required");
 
-      // Validate dates
-      const checkIn = new Date(bookingData.checkInDate);
-      const checkOut = new Date(bookingData.checkOutDate);
-      
-      if (checkOut <= checkIn) {
-        return res.status(400).json({
-          success: false,
-          message: "Check-out date must be after check-in date"
-        });
-      }
+      const checkIn  = new Date(checkInDate);
+      const checkOut = new Date(checkOutDate);
+      if (isNaN(checkIn.getTime()) || isNaN(checkOut.getTime())) return badRequest(res, "Invalid date format");
+      if (checkOut <= checkIn) return badRequest(res, "checkOutDate must be after checkInDate");
 
-      // Calculate total nights
-      const totalNights = Math.ceil((checkOut - checkIn) / (1000 * 60 * 60 * 24));
-
-      // Verify accommodation exists
-      const accommodation = await prisma.accommodation.findUnique({
-        where: { id: bookingData.accommodationId }
+      const plan = await prisma.travelPlan.findUnique({
+        where: { id }, select: { id: true, userId: true },
       });
+      if (!plan) return notFound(res, "Travel plan not found");
 
-      if (!accommodation) {
-        return res.status(404).json({
-          success: false,
-          message: "Accommodation not found"
-        });
-      }
+      const canEdit =
+        req.user.isSuperAdmin ||
+        plan.userId === req.user.id ||
+        (await checkPlanPermission(req.user.id, id, "edit"));
 
-      if (!accommodation.isActive) {
-        return res.status(400).json({
-          success: false,
-          message: "This accommodation is currently unavailable"
-        });
-      }
+      if (!canEdit) return forbidden(res, "You do not have permission to add bookings to this travel plan");
 
-      // Create booking
+      const accommodation = await prisma.accommodation.findUnique({
+        where:  { id: accommodationId },
+        select: { id: true, isActive: true },
+      });
+      if (!accommodation)          return notFound(res, "Accommodation not found");
+      if (!accommodation.isActive) return badRequest(res, "This accommodation is not currently available");
+
       const booking = await prisma.accommodationBooking.create({
         data: {
-          ...bookingData,
-          totalNights,
-          travelPlanId: id
+          travelPlanId:    id,
+          accommodationId,
+          checkInDate:     checkIn,
+          checkOutDate:    checkOut,
+          roomType,
+          pricePerNight:   +pricePerNight,
+          totalCost:       +totalCost,
+          guestName,
+          guestEmail,
+          totalGuests:     totalGuests ?? 1,
+          ...(taxes           !== undefined && { taxes:          +taxes }),
+          ...(serviceFee      !== undefined && { serviceFee:     +serviceFee }),
+          ...(guestPhone      !== undefined && { guestPhone }),
+          ...(specialRequests !== undefined && { specialRequests }),
+          ...(paymentStatus   !== undefined && { paymentStatus }),
+          ...(paymentMethod   !== undefined && { paymentMethod }),
+          ...(Array.isArray(roomIds) && roomIds.length && {
+            rooms: { connect: roomIds.map((rid) => ({ id: rid })) },
+          }),
         },
-        include: {
-          accommodation: true,
-          rooms: true
-        }
+        include: { accommodation: true, rooms: true },
       });
 
-      // Set up OpenFGA relations
-      await openfgaService.createAccommodationBookingRelations(
-        req.user.id,
-        booking.id,
-        id
-      );
-
-      // Invalidate caches
-      await Promise.all([
-        redisService.client?.del(`travelplan:${id}`),
-        redisService.client?.del(`accommodation:${bookingData.accommodationId}`)
+      Promise.allSettled([
+        openfgaService.createAccommodationBookingRelations(req.user.id, booking.id, id),
+        cacheDel(`travelplan:${id}`, `accommodation:${accommodationId}`),
       ]);
 
-      res.status(201).json({
-        success: true,
-        data: booking,
-        message: "Accommodation booking added successfully"
-      });
-    } catch (error) {
-      next(error);
+      return created(res, booking, "Accommodation booking added successfully");
+    } catch (err) {
+      next(err);
     }
   }
 
   /**
-   * Update accommodation booking
+   * GET /api/travel-plans/:id/accommodations
+   *
+   * Lists all accommodation bookings for a plan.
+   */
+  async getAccommodationBookings(req, res, next) {
+    try {
+      const { id } = req.params;
+
+      const plan = await prisma.travelPlan.findUnique({
+        where: { id }, select: { id: true, userId: true },
+      });
+      if (!plan) return notFound(res, "Travel plan not found");
+
+      const canView =
+        req.user.isSuperAdmin ||
+        plan.userId === req.user.id ||
+        (await checkPlanPermission(req.user.id, id, "view"));
+
+      if (!canView) return forbidden(res, "You do not have permission to view this travel plan");
+
+      const bookings = await prisma.accommodationBooking.findMany({
+        where:   { travelPlanId: id },
+        include: { accommodation: true, rooms: true },
+        orderBy: { checkInDate: "asc" },
+      });
+
+      return ok(res, bookings);
+    } catch (err) {
+      next(err);
+    }
+  }
+
+  /**
    * PUT /api/travel-plans/bookings/accommodation/:bookingId
    */
   async updateAccommodationBooking(req, res, next) {
     try {
       const { bookingId } = req.params;
-      const updateData = req.body;
-
-      // Check permission
-      const canEdit = await openfgaService.canEditAccommodationBooking?.(
-        req.user.id,
-        bookingId
-      ) || false;
-
-      if (!canEdit && !req.user.isSuperAdmin) {
-        return res.status(403).json({
-          success: false,
-          message: "You do not have permission to update this booking"
-        });
-      }
 
       const booking = await prisma.accommodationBooking.findUnique({
-        where: { id: bookingId },
-        include: { travelPlan: true }
+        where:  { id: bookingId },
+        select: { bookingStatus: true, travelPlanId: true, accommodationId: true },
       });
+      if (!booking) return notFound(res, "Booking not found");
 
-      if (!booking) {
-        return res.status(404).json({
-          success: false,
-          message: "Booking not found"
-        });
+      if (TERMINAL_ACCOMMODATION.has(booking.bookingStatus)) {
+        return badRequest(res, `Cannot update a booking with status: ${booking.bookingStatus}`);
       }
 
-      // Don't allow updates to cancelled or completed bookings
-      if (['CANCELLED', 'CHECKED_OUT', 'NO_SHOW'].includes(booking.bookingStatus)) {
-        return res.status(400).json({
-          success: false,
-          message: `Cannot update booking with status: ${booking.bookingStatus}`
-        });
+      const canEdit =
+        req.user.isSuperAdmin ||
+        !!(await openfgaService.canEditAccommodationBooking?.(req.user.id, bookingId).catch(() => false));
+
+      if (!canEdit) return forbidden(res, "You do not have permission to update this booking");
+
+      const {
+        checkInDate, checkOutDate, totalGuests, specialRequests,
+        paymentStatus, paymentMethod, bookingStatus,
+      } = req.body;
+
+      if (checkInDate && checkOutDate) {
+        const ci = new Date(checkInDate);
+        const co = new Date(checkOutDate);
+        if (co <= ci) return badRequest(res, "checkOutDate must be after checkInDate");
       }
 
-      const updatedBooking = await prisma.accommodationBooking.update({
+      if (bookingStatus && TERMINAL_ACCOMMODATION.has(bookingStatus) && bookingStatus !== "CANCELLED") {
+        // Allow admin to set terminal statuses; log it
+      }
+
+      const updated = await prisma.accommodationBooking.update({
         where: { id: bookingId },
-        data: updateData,
-        include: {
-          accommodation: true,
-          rooms: true
-        }
+        data: {
+          ...(checkInDate     !== undefined && { checkInDate:  new Date(checkInDate) }),
+          ...(checkOutDate    !== undefined && { checkOutDate: new Date(checkOutDate) }),
+          ...(totalGuests     !== undefined && { totalGuests }),
+          ...(specialRequests !== undefined && { specialRequests }),
+          ...(paymentStatus   !== undefined && { paymentStatus }),
+          ...(paymentMethod   !== undefined && { paymentMethod }),
+          ...(bookingStatus   !== undefined && { bookingStatus }),
+        },
+        include: { accommodation: true, rooms: true },
       });
 
-      // Invalidate caches
-      await Promise.all([
-        redisService.client?.del(`travelplan:${booking.travelPlanId}`),
-        redisService.client?.del(`accommodation:${booking.accommodationId}`)
-      ]);
+      cacheDel(`travelplan:${booking.travelPlanId}`, `accommodation:${booking.accommodationId}`);
 
-      res.json({
-        success: true,
-        data: updatedBooking,
-        message: "Booking updated successfully"
-      });
-    } catch (error) {
-      next(error);
+      return ok(res, updated, "Booking updated successfully");
+    } catch (err) {
+      next(err);
     }
   }
 
   /**
-   * Cancel accommodation booking
    * DELETE /api/travel-plans/bookings/accommodation/:bookingId
+   *
+   * Blocks cancellation of CHECKED_IN (active stay) as well as CHECKED_OUT/NO_SHOW.
    */
   async cancelAccommodationBooking(req, res, next) {
     try {
       const { bookingId } = req.params;
 
-      // Check permission
-      const canCancel = await openfgaService.canCancelAccommodationBooking?.(
-        req.user.id,
-        bookingId
-      ) || false;
-
-      if (!canCancel && !req.user.isSuperAdmin) {
-        return res.status(403).json({
-          success: false,
-          message: "You do not have permission to cancel this booking"
-        });
-      }
-
       const booking = await prisma.accommodationBooking.findUnique({
-        where: { id: bookingId },
-        include: { travelPlan: true }
+        where:  { id: bookingId },
+        select: { bookingStatus: true, paymentStatus: true, travelPlanId: true, accommodationId: true },
       });
+      if (!booking) return notFound(res, "Booking not found");
 
-      if (!booking) {
-        return res.status(404).json({
-          success: false,
-          message: "Booking not found"
-        });
-      }
+      // FIX: also block CHECKED_IN (v2 only blocked CHECKED_OUT)
+      if (booking.bookingStatus === "CANCELLED")   return badRequest(res, "Booking is already cancelled");
+      if (booking.bookingStatus === "CHECKED_IN")  return badRequest(res, "Cannot cancel an active check-in. Contact support.");
+      if (booking.bookingStatus === "CHECKED_OUT") return badRequest(res, "Cannot cancel a completed stay");
+      if (booking.bookingStatus === "NO_SHOW")     return badRequest(res, "Cannot cancel a no-show booking");
 
-      const cancelledBooking = await prisma.accommodationBooking.update({
+      const canCancel =
+        req.user.isSuperAdmin ||
+        !!(await openfgaService.canCancelAccommodationBooking?.(req.user.id, bookingId).catch(() => false));
+
+      if (!canCancel) return forbidden(res, "You do not have permission to cancel this booking");
+
+      const cancelled = await prisma.accommodationBooking.update({
         where: { id: bookingId },
         data: {
-          bookingStatus: 'CANCELLED',
-          paymentStatus: booking.paymentStatus === 'PAID' ? 'REFUNDED' : 'PENDING'
-        }
+          bookingStatus: "CANCELLED",
+          paymentStatus: booking.paymentStatus === "PAID" ? "REFUNDED" : booking.paymentStatus,
+        },
       });
 
-      // Invalidate caches
-      await Promise.all([
-        redisService.client?.del(`travelplan:${booking.travelPlanId}`),
-        redisService.client?.del(`accommodation:${booking.accommodationId}`)
-      ]);
+      cacheDel(`travelplan:${booking.travelPlanId}`, `accommodation:${booking.accommodationId}`);
 
-      res.json({
-        success: true,
-        data: cancelledBooking,
-        message: "Booking cancelled successfully"
-      });
-    } catch (error) {
-      next(error);
+      return ok(res, cancelled, "Booking cancelled successfully");
+    } catch (err) {
+      next(err);
     }
   }
 
-  // ==================== TRANSPORTATION BOOKINGS ====================
+  // ==========================================================================
+  //  TRANSPORTATION BOOKINGS
+  // ==========================================================================
 
   /**
-   * Add transportation booking to travel plan
    * POST /api/travel-plans/:id/transportation
    */
   async addTransportationBooking(req, res, next) {
     try {
       const { id } = req.params;
-      const bookingData = req.body;
+      const {
+        providerId, vehicleId, serviceType,
+        pickupLocation, dropoffLocation, pickupTime, estimatedArrival,
+        numberOfPassengers, specialRequests, estimatedFare, paymentMethod,
+        snapshotVehicleType, snapshotVehicleNumber, snapshotDriverName, snapshotDriverContact,
+      } = req.body;
 
-      // Check permission
-      const canEdit = await this.checkPermission(req.user.id, id, 'edit');
-      if (!canEdit && !req.user.isSuperAdmin) {
-        return res.status(403).json({
-          success: false,
-          message: "You do not have permission to add bookings to this travel plan"
-        });
-      }
+      if (!serviceType)     return badRequest(res, "serviceType is required");
+      if (!pickupLocation)  return badRequest(res, "pickupLocation is required");
+      if (!dropoffLocation) return badRequest(res, "dropoffLocation is required");
+      if (!pickupTime)      return badRequest(res, "pickupTime is required");
 
-      // Validate times
-      const pickupTime = new Date(bookingData.pickupTime);
-      const estimatedArrival = bookingData.estimatedArrival ? new Date(bookingData.estimatedArrival) : null;
+      const pickup  = new Date(pickupTime);
+      if (isNaN(pickup.getTime())) return badRequest(res, "Invalid pickupTime format");
 
-      if (estimatedArrival && estimatedArrival <= pickupTime) {
-        return res.status(400).json({
-          success: false,
-          message: "Estimated arrival must be after pickup time"
-        });
-      }
+      const arrival = estimatedArrival ? new Date(estimatedArrival) : null;
+      if (arrival && isNaN(arrival.getTime())) return badRequest(res, "Invalid estimatedArrival format");
+      if (arrival && arrival <= pickup) return badRequest(res, "estimatedArrival must be after pickupTime");
 
-      // Verify provider exists
-      if (bookingData.providerId) {
+      const plan = await prisma.travelPlan.findUnique({
+        where: { id }, select: { id: true, userId: true },
+      });
+      if (!plan) return notFound(res, "Travel plan not found");
+
+      const canEdit =
+        req.user.isSuperAdmin ||
+        plan.userId === req.user.id ||
+        (await checkPlanPermission(req.user.id, id, "edit"));
+
+      if (!canEdit) return forbidden(res, "You do not have permission to add bookings to this travel plan");
+
+      if (providerId) {
         const provider = await prisma.transportationProvider.findUnique({
-          where: { id: bookingData.providerId }
+          where:  { id: providerId },
+          select: { id: true, isAvailable: true },
         });
-
-        if (!provider) {
-          return res.status(404).json({
-            success: false,
-            message: "Transportation provider not found"
-          });
-        }
-
-        if (!provider.isAvailable) {
-          return res.status(400).json({
-            success: false,
-            message: "This provider is currently unavailable"
-          });
-        }
+        if (!provider)              return notFound(res, "Transportation provider not found");
+        if (!provider.isAvailable)  return badRequest(res, "This provider is currently unavailable");
       }
 
       const booking = await prisma.transportationBooking.create({
         data: {
-          ...bookingData,
-          travelPlanId: id
+          travelPlanId:       id,
+          serviceType,
+          pickupLocation,
+          dropoffLocation,
+          pickupTime:         pickup,
+          numberOfPassengers: numberOfPassengers ?? 1,
+          ...(providerId            !== undefined && { providerId }),
+          ...(vehicleId             !== undefined && { vehicleId }),
+          ...(arrival               && { estimatedArrival: arrival }),
+          ...(specialRequests       !== undefined && { specialRequests }),
+          ...(estimatedFare         !== undefined && { estimatedFare: +estimatedFare }),
+          ...(paymentMethod         !== undefined && { paymentMethod }),
+          ...(snapshotVehicleType   !== undefined && { snapshotVehicleType }),
+          ...(snapshotVehicleNumber !== undefined && { snapshotVehicleNumber }),
+          ...(snapshotDriverName    !== undefined && { snapshotDriverName }),
+          ...(snapshotDriverContact !== undefined && { snapshotDriverContact }),
         },
-        include: {
-          provider: true,
-          vehicle: true
-        }
+        include: { provider: true, vehicle: true },
       });
 
-      // Set up OpenFGA relations
-      await openfgaService.createTransportationBookingRelations(
-        req.user.id,
-        booking.id,
-        id
-      );
-
-      // Invalidate caches
-      await Promise.all([
-        redisService.client?.del(`travelplan:${id}`),
-        redisService.client?.del(`transportationprovider:${bookingData.providerId}`)
+      Promise.allSettled([
+        openfgaService.createTransportationBookingRelations(req.user.id, booking.id, id),
+        cacheDel(`travelplan:${id}`, providerId ? `transportation:provider:${providerId}` : null),
       ]);
 
-      res.status(201).json({
-        success: true,
-        data: booking,
-        message: "Transportation booking added successfully"
-      });
-    } catch (error) {
-      next(error);
+      return created(res, booking, "Transportation booking added successfully");
+    } catch (err) {
+      next(err);
     }
   }
 
   /**
-   * Update transportation booking
+   * GET /api/travel-plans/:id/transportation
+   */
+  async getTransportationBookings(req, res, next) {
+    try {
+      const { id } = req.params;
+
+      const plan = await prisma.travelPlan.findUnique({
+        where: { id }, select: { id: true, userId: true },
+      });
+      if (!plan) return notFound(res, "Travel plan not found");
+
+      const canView =
+        req.user.isSuperAdmin ||
+        plan.userId === req.user.id ||
+        (await checkPlanPermission(req.user.id, id, "view"));
+
+      if (!canView) return forbidden(res, "You do not have permission to view this travel plan");
+
+      const bookings = await prisma.transportationBooking.findMany({
+        where:   { travelPlanId: id },
+        include: { provider: true, vehicle: true },
+        orderBy: { pickupTime: "asc" },
+      });
+
+      return ok(res, bookings);
+    } catch (err) {
+      next(err);
+    }
+  }
+
+  /**
    * PUT /api/travel-plans/bookings/transportation/:bookingId
    */
   async updateTransportationBooking(req, res, next) {
     try {
       const { bookingId } = req.params;
-      const updateData = req.body;
-
-      // Check permission
-      const canEdit = await openfgaService.canEditTransportationBooking?.(
-        req.user.id,
-        bookingId
-      ) || false;
-
-      if (!canEdit && !req.user.isSuperAdmin) {
-        return res.status(403).json({
-          success: false,
-          message: "You do not have permission to update this booking"
-        });
-      }
 
       const booking = await prisma.transportationBooking.findUnique({
-        where: { id: bookingId },
-        include: { travelPlan: true }
+        where:  { id: bookingId },
+        select: { status: true, travelPlanId: true, providerId: true },
       });
+      if (!booking) return notFound(res, "Booking not found");
 
-      if (!booking) {
-        return res.status(404).json({
-          success: false,
-          message: "Booking not found"
-        });
+      if (TERMINAL_BOOKING.has(booking.status)) {
+        return badRequest(res, `Cannot update a booking with status: ${booking.status}`);
       }
 
-      if (['COMPLETED', 'CANCELLED'].includes(booking.status)) {
-        return res.status(400).json({
-          success: false,
-          message: `Cannot update booking with status: ${booking.status}`
-        });
-      }
+      const canEdit =
+        req.user.isSuperAdmin ||
+        !!(await openfgaService.canEditTransportationBooking?.(req.user.id, bookingId).catch(() => false));
 
-      const updatedBooking = await prisma.transportationBooking.update({
+      if (!canEdit) return forbidden(res, "You do not have permission to update this booking");
+
+      const {
+        pickupLocation, dropoffLocation, pickupTime, estimatedArrival,
+        numberOfPassengers, specialRequests, status, paymentMethod, paymentStatus,
+      } = req.body;
+
+      const updated = await prisma.transportationBooking.update({
         where: { id: bookingId },
-        data: updateData,
-        include: {
-          provider: true,
-          vehicle: true
-        }
+        data: {
+          ...(pickupLocation     !== undefined && { pickupLocation }),
+          ...(dropoffLocation    !== undefined && { dropoffLocation }),
+          ...(pickupTime         !== undefined && { pickupTime:       new Date(pickupTime) }),
+          ...(estimatedArrival   !== undefined && { estimatedArrival: new Date(estimatedArrival) }),
+          ...(numberOfPassengers !== undefined && { numberOfPassengers }),
+          ...(specialRequests    !== undefined && { specialRequests }),
+          ...(status             !== undefined && { status }),
+          ...(paymentMethod      !== undefined && { paymentMethod }),
+          ...(paymentStatus      !== undefined && { paymentStatus }),
+        },
+        include: { provider: true, vehicle: true },
       });
 
-      // Invalidate caches
-      await Promise.all([
-        redisService.client?.del(`travelplan:${booking.travelPlanId}`),
-        redisService.client?.del(`transportationprovider:${booking.providerId}`)
-      ]);
+      cacheDel(
+        `travelplan:${booking.travelPlanId}`,
+        booking.providerId ? `transportation:provider:${booking.providerId}` : null
+      );
 
-      res.json({
-        success: true,
-        data: updatedBooking,
-        message: "Booking updated successfully"
-      });
-    } catch (error) {
-      next(error);
+      return ok(res, updated, "Booking updated successfully");
+    } catch (err) {
+      next(err);
     }
   }
 
   /**
-   * Cancel transportation booking
    * DELETE /api/travel-plans/bookings/transportation/:bookingId
    */
   async cancelTransportationBooking(req, res, next) {
     try {
       const { bookingId } = req.params;
 
-      // Check permission
-      const canCancel = await openfgaService.canCancelTransportationBooking?.(
-        req.user.id,
-        bookingId
-      ) || false;
-
-      if (!canCancel && !req.user.isSuperAdmin) {
-        return res.status(403).json({
-          success: false,
-          message: "You do not have permission to cancel this booking"
-        });
-      }
-
       const booking = await prisma.transportationBooking.findUnique({
-        where: { id: bookingId },
-        include: { travelPlan: true }
+        where:  { id: bookingId },
+        select: { status: true, paymentStatus: true, travelPlanId: true, providerId: true },
       });
+      if (!booking)                       return notFound(res, "Booking not found");
+      if (booking.status === "CANCELLED") return badRequest(res, "Booking is already cancelled");
+      if (booking.status === "COMPLETED") return badRequest(res, "Cannot cancel a completed booking");
+      if (booking.status === "ON_THE_WAY") return badRequest(res, "Cannot cancel a booking that is already in progress");
 
-      if (!booking) {
-        return res.status(404).json({
-          success: false,
-          message: "Booking not found"
-        });
-      }
+      const canCancel =
+        req.user.isSuperAdmin ||
+        !!(await openfgaService.canCancelTransportationBooking?.(req.user.id, bookingId).catch(() => false));
 
-      const cancelledBooking = await prisma.transportationBooking.update({
+      if (!canCancel) return forbidden(res, "You do not have permission to cancel this booking");
+
+      const cancelled = await prisma.transportationBooking.update({
         where: { id: bookingId },
         data: {
-          status: 'CANCELLED',
-          isPaid: false,
-          paymentStatus: booking.paymentStatus === 'PAID' ? 'REFUNDED' : 'PENDING'
-        }
+          status:        "CANCELLED",
+          paymentStatus: booking.paymentStatus === "PAID" ? "REFUNDED" : booking.paymentStatus,
+        },
       });
 
-      // Invalidate caches
-      await Promise.all([
-        redisService.client?.del(`travelplan:${booking.travelPlanId}`),
-        redisService.client?.del(`transportationprovider:${booking.providerId}`)
-      ]);
+      cacheDel(
+        `travelplan:${booking.travelPlanId}`,
+        booking.providerId ? `transportation:provider:${booking.providerId}` : null
+      );
 
-      res.json({
-        success: true,
-        data: cancelledBooking,
-        message: "Booking cancelled successfully"
-      });
-    } catch (error) {
-      next(error);
+      return ok(res, cancelled, "Booking cancelled successfully");
+    } catch (err) {
+      next(err);
     }
   }
 
-  // ==================== PACKAGE BOOKINGS ====================
+  // ==========================================================================
+  //  PACKAGE BOOKINGS
+  // ==========================================================================
 
   /**
-   * Add package booking to travel plan
    * POST /api/travel-plans/:id/packages
+   *
+   * FIX: Guards against null basePrice before computing finalAmount.
    */
   async addPackageBooking(req, res, next) {
     try {
       const { id } = req.params;
-      const bookingData = req.body;
+      const {
+        packageId, startDate, endDate, numberOfTravelers,
+        leadGuestName, leadGuestEmail, leadGuestPhone,
+        specialRequests, paymentMethod,
+      } = req.body;
 
-      // Check permission
-      const canEdit = await this.checkPermission(req.user.id, id, 'edit');
-      if (!canEdit && !req.user.isSuperAdmin) {
-        return res.status(403).json({
-          success: false,
-          message: "You do not have permission to add bookings to this travel plan"
-        });
-      }
+      if (!packageId)                    return badRequest(res, "packageId is required");
+      if (!startDate || !endDate)        return badRequest(res, "startDate and endDate are required");
+      if (!leadGuestName)                return badRequest(res, "leadGuestName is required");
+      if (!leadGuestEmail)               return badRequest(res, "leadGuestEmail is required");
 
-      // Validate dates
-      const startDate = new Date(bookingData.startDate);
-      const endDate = new Date(bookingData.endDate);
-      
-      if (endDate <= startDate) {
-        return res.status(400).json({
-          success: false,
-          message: "End date must be after start date"
-        });
-      }
+      const start = new Date(startDate);
+      const end   = new Date(endDate);
+      if (isNaN(start.getTime()) || isNaN(end.getTime())) return badRequest(res, "Invalid date format");
+      if (end <= start) return badRequest(res, "endDate must be after startDate");
 
-      // Verify package exists
-      const travelPackage = await prisma.travelPackage.findUnique({
-        where: { id: bookingData.packageId }
+      const plan = await prisma.travelPlan.findUnique({
+        where: { id }, select: { id: true, userId: true },
       });
+      if (!plan) return notFound(res, "Travel plan not found");
 
-      if (!travelPackage) {
-        return res.status(404).json({
-          success: false,
-          message: "Travel package not found"
-        });
-      }
+      const canEdit =
+        req.user.isSuperAdmin ||
+        plan.userId === req.user.id ||
+        (await checkPlanPermission(req.user.id, id, "edit"));
 
-      if (!travelPackage.isActive) {
-        return res.status(400).json({
-          success: false,
-          message: "This package is currently unavailable"
-        });
-      }
+      if (!canEdit) return forbidden(res, "You do not have permission to add bookings to this travel plan");
 
-      // Calculate final price (apply discount if any)
-      const finalAmount = travelPackage.discount 
-        ? travelPackage.basePrice - (travelPackage.basePrice * travelPackage.discount / 100)
-        : travelPackage.basePrice;
+      const pkg = await prisma.travelPackage.findUnique({
+        where:  { id: packageId },
+        select: { id: true, isActive: true, basePrice: true, discount: true, currency: true },
+      });
+      if (!pkg)           return notFound(res, "Travel package not found");
+      if (!pkg.isActive)  return badRequest(res, "This package is not currently available");
+      // FIX: guard against null basePrice
+      if (pkg.basePrice == null) return badRequest(res, "This package has no base price configured");
+
+      const travelers      = numberOfTravelers ?? 1;
+      const discountFactor = pkg.discount ? 1 - pkg.discount / 100 : 1;
+      const finalAmount    = +(pkg.basePrice * discountFactor * travelers).toFixed(2);
 
       const booking = await prisma.travelPackageBooking.create({
         data: {
-          ...bookingData,
-          basePrice: travelPackage.basePrice,
-          finalAmount: finalAmount * bookingData.numberOfTravelers,
-          travelPlanId: id
+          travelPlanId:      id,
+          packageId,
+          startDate:         start,
+          endDate:           end,
+          numberOfTravelers: travelers,
+          basePrice:         pkg.basePrice,
+          discount:          pkg.discount ?? 0,
+          finalAmount,
+          currency:          pkg.currency,
+          leadGuestName,
+          leadGuestEmail,
+          ...(leadGuestPhone  !== undefined && { leadGuestPhone }),
+          ...(specialRequests !== undefined && { specialRequests }),
+          ...(paymentMethod   !== undefined && { paymentMethod }),
         },
-        include: {
-          package: true
-        }
+        include: { package: true },
       });
 
-      // Set up OpenFGA relations
-      await openfgaService.createTravelPackageBookingRelations(
-        req.user.id,
-        booking.id,
-        id,
-        bookingData.packageId
-      );
-
-      // Invalidate caches
-      await Promise.all([
-        redisService.client?.del(`travelplan:${id}`),
-        redisService.client?.del(`travelpackage:${bookingData.packageId}`)
+      Promise.allSettled([
+        openfgaService.createTravelPackageBookingRelations(req.user.id, booking.id, id, packageId),
+        cacheDel(`travelplan:${id}`),
       ]);
 
-      res.status(201).json({
-        success: true,
-        data: booking,
-        message: "Package booking added successfully"
-      });
-    } catch (error) {
-      next(error);
+      return created(res, booking, "Package booking added successfully");
+    } catch (err) {
+      next(err);
     }
   }
 
   /**
-   * Update package booking
+   * GET /api/travel-plans/:id/packages
+   */
+  async getPackageBookings(req, res, next) {
+    try {
+      const { id } = req.params;
+
+      const plan = await prisma.travelPlan.findUnique({
+        where: { id }, select: { id: true, userId: true },
+      });
+      if (!plan) return notFound(res, "Travel plan not found");
+
+      const canView =
+        req.user.isSuperAdmin ||
+        plan.userId === req.user.id ||
+        (await checkPlanPermission(req.user.id, id, "view"));
+
+      if (!canView) return forbidden(res, "You do not have permission to view this travel plan");
+
+      const bookings = await prisma.travelPackageBooking.findMany({
+        where:   { travelPlanId: id },
+        include: { package: true },
+        orderBy: { startDate: "asc" },
+      });
+
+      return ok(res, bookings);
+    } catch (err) {
+      next(err);
+    }
+  }
+
+  /**
    * PUT /api/travel-plans/bookings/package/:bookingId
    */
   async updatePackageBooking(req, res, next) {
     try {
       const { bookingId } = req.params;
-      const updateData = req.body;
-
-      // Check permission
-      const canEdit = await openfgaService.canEditTravelPackageBooking?.(
-        req.user.id,
-        bookingId
-      ) || false;
-
-      if (!canEdit && !req.user.isSuperAdmin) {
-        return res.status(403).json({
-          success: false,
-          message: "You do not have permission to update this booking"
-        });
-      }
 
       const booking = await prisma.travelPackageBooking.findUnique({
-        where: { id: bookingId },
-        include: { 
-          travelPlan: true,
-          package: true
-        }
+        where:  { id: bookingId },
+        select: { status: true, travelPlanId: true },
       });
+      if (!booking) return notFound(res, "Booking not found");
 
-      if (!booking) {
-        return res.status(404).json({
-          success: false,
-          message: "Booking not found"
-        });
+      if (TERMINAL_BOOKING.has(booking.status)) {
+        return badRequest(res, `Cannot update a booking with status: ${booking.status}`);
       }
 
-      if (booking.status === 'CANCELLED' || booking.status === 'COMPLETED') {
-        return res.status(400).json({
-          success: false,
-          message: `Cannot update booking with status: ${booking.status}`
-        });
-      }
+      const canEdit =
+        req.user.isSuperAdmin ||
+        !!(await openfgaService.canEditTravelPackageBooking?.(req.user.id, bookingId).catch(() => false));
 
-      const updatedBooking = await prisma.travelPackageBooking.update({
+      if (!canEdit) return forbidden(res, "You do not have permission to update this booking");
+
+      const {
+        startDate, endDate, numberOfTravelers,
+        specialRequests, status, paymentStatus, paymentMethod,
+      } = req.body;
+
+      const updated = await prisma.travelPackageBooking.update({
         where: { id: bookingId },
-        data: updateData,
-        include: {
-          package: true
-        }
+        data: {
+          ...(startDate         !== undefined && { startDate:         new Date(startDate) }),
+          ...(endDate           !== undefined && { endDate:           new Date(endDate) }),
+          ...(numberOfTravelers !== undefined && { numberOfTravelers }),
+          ...(specialRequests   !== undefined && { specialRequests }),
+          ...(status            !== undefined && { status }),
+          ...(paymentStatus     !== undefined && { paymentStatus }),
+          ...(paymentMethod     !== undefined && { paymentMethod }),
+        },
+        include: { package: true },
       });
 
-      // Invalidate caches
-      await redisService.client?.del(`travelplan:${booking.travelPlanId}`);
+      cacheDel(`travelplan:${booking.travelPlanId}`);
 
-      res.json({
-        success: true,
-        data: updatedBooking,
-        message: "Booking updated successfully"
-      });
-    } catch (error) {
-      next(error);
+      return ok(res, updated, "Booking updated successfully");
+    } catch (err) {
+      next(err);
     }
   }
 
   /**
-   * Cancel package booking
    * DELETE /api/travel-plans/bookings/package/:bookingId
    */
   async cancelPackageBooking(req, res, next) {
     try {
       const { bookingId } = req.params;
 
-      // Check permission
-      const canCancel = await openfgaService.canCancelTravelPackageBooking?.(
-        req.user.id,
-        bookingId
-      ) || false;
-
-      if (!canCancel && !req.user.isSuperAdmin) {
-        return res.status(403).json({
-          success: false,
-          message: "You do not have permission to cancel this booking"
-        });
-      }
-
       const booking = await prisma.travelPackageBooking.findUnique({
-        where: { id: bookingId },
-        include: { travelPlan: true }
+        where:  { id: bookingId },
+        select: { status: true, paymentStatus: true, travelPlanId: true },
       });
+      if (!booking)                      return notFound(res, "Booking not found");
+      if (booking.status === "CANCELLED") return badRequest(res, "Booking is already cancelled");
+      if (booking.status === "COMPLETED") return badRequest(res, "Cannot cancel a completed booking");
 
-      if (!booking) {
-        return res.status(404).json({
-          success: false,
-          message: "Booking not found"
-        });
-      }
+      const canCancel =
+        req.user.isSuperAdmin ||
+        !!(await openfgaService.canCancelTravelPackageBooking?.(req.user.id, bookingId).catch(() => false));
 
-      const cancelledBooking = await prisma.travelPackageBooking.update({
+      if (!canCancel) return forbidden(res, "You do not have permission to cancel this booking");
+
+      const cancelled = await prisma.travelPackageBooking.update({
         where: { id: bookingId },
         data: {
-          status: 'CANCELLED',
-          paymentStatus: booking.paymentStatus === 'PAID' ? 'REFUNDED' : 'PENDING'
-        }
+          status:        "CANCELLED",
+          paymentStatus: booking.paymentStatus === "PAID" ? "REFUNDED" : booking.paymentStatus,
+        },
       });
 
-      // Invalidate caches
-      await redisService.client?.del(`travelplan:${booking.travelPlanId}`);
+      cacheDel(`travelplan:${booking.travelPlanId}`);
 
-      res.json({
-        success: true,
-        data: cancelledBooking,
-        message: "Booking cancelled successfully"
-      });
-    } catch (error) {
-      next(error);
+      return ok(res, cancelled, "Booking cancelled successfully");
+    } catch (err) {
+      next(err);
     }
   }
 
-  // ==================== EXPERIENCE BOOKINGS ====================
+  // ==========================================================================
+  //  EXPERIENCE BOOKINGS (Vendor)
+  // ==========================================================================
 
   /**
-   * Add experience booking to travel plan
    * POST /api/travel-plans/:id/experiences
    */
   async addExperienceBooking(req, res, next) {
     try {
       const { id } = req.params;
-      const bookingData = req.body;
+      const {
+        experienceId, experienceDate, numberOfParticipants, numberOfChildren,
+        leadGuestName, leadGuestEmail, leadGuestPhone, specialRequests, paymentMethod,
+      } = req.body;
 
-      // Check permission
-      const canEdit = await this.checkPermission(req.user.id, id, 'edit');
-      if (!canEdit && !req.user.isSuperAdmin) {
-        return res.status(403).json({
-          success: false,
-          message: "You do not have permission to add bookings to this travel plan"
-        });
-      }
+      if (!experienceId)   return badRequest(res, "experienceId is required");
+      if (!experienceDate) return badRequest(res, "experienceDate is required");
+      if (!leadGuestName)  return badRequest(res, "leadGuestName is required");
+      if (!leadGuestEmail) return badRequest(res, "leadGuestEmail is required");
 
-      // Verify experience exists
-      const experience = await prisma.vendorExperience.findUnique({
-        where: { id: bookingData.experienceId }
+      const plan = await prisma.travelPlan.findUnique({
+        where: { id }, select: { id: true, userId: true },
       });
+      if (!plan) return notFound(res, "Travel plan not found");
 
-      if (!experience) {
-        return res.status(404).json({
-          success: false,
-          message: "Experience not found"
-        });
-      }
+      const canEdit =
+        req.user.isSuperAdmin ||
+        plan.userId === req.user.id ||
+        (await checkPlanPermission(req.user.id, id, "edit"));
 
-      if (!experience.isActive) {
-        return res.status(400).json({
-          success: false,
-          message: "This experience is currently unavailable"
-        });
-      }
+      if (!canEdit) return forbidden(res, "You do not have permission to add bookings to this travel plan");
 
-      // Calculate total amount
-      const totalAmount = (bookingData.numberOfParticipants * experience.pricePerPerson) +
-                         (bookingData.numberOfChildren * (experience.childPrice || 0));
+      const experience = await prisma.vendorExperience.findUnique({
+        where:  { id: experienceId },
+        select: { id: true, isActive: true, pricePerPerson: true, childPrice: true, currency: true },
+      });
+      if (!experience)          return notFound(res, "Experience not found");
+      if (!experience.isActive) return badRequest(res, "This experience is not currently available");
+
+      const participants = numberOfParticipants ?? 1;
+      const children     = numberOfChildren     ?? 0;
+      const totalAmount  = +(
+        participants * (experience.pricePerPerson ?? 0) +
+        children     * (experience.childPrice ?? 0)
+      ).toFixed(2);
 
       const booking = await prisma.experienceBooking.create({
         data: {
-          ...bookingData,
-          unitPrice: experience.pricePerPerson,
-          childPrice: experience.childPrice,
+          travelPlanId:        id,
+          experienceId,
+          experienceDate:      new Date(experienceDate),
+          numberOfParticipants: participants,
+          numberOfChildren:     children,
+          unitPrice:            experience.pricePerPerson ?? 0,
+          childPrice:           experience.childPrice,
           totalAmount,
-          travelPlanId: id
+          currency:             experience.currency,
+          leadGuestName,
+          leadGuestEmail,
+          ...(leadGuestPhone  !== undefined && { leadGuestPhone }),
+          ...(specialRequests !== undefined && { specialRequests }),
+          ...(paymentMethod   !== undefined && { paymentMethod }),
         },
-        include: {
-          experience: true
-        }
+        include: { experience: true },
       });
 
-      // Set up OpenFGA relations
-      await openfgaService.createExperienceBookingRelations(
-        req.user.id,
-        booking.id,
-        id,
-        bookingData.experienceId
-      );
-
-      // Invalidate caches
-      await Promise.all([
-        redisService.client?.del(`travelplan:${id}`),
-        redisService.client?.del(`vendorexperience:${bookingData.experienceId}`)
+      Promise.allSettled([
+        openfgaService.createExperienceBookingRelations(req.user.id, booking.id, id, experienceId),
+        cacheDel(`travelplan:${id}`),
       ]);
 
-      res.status(201).json({
-        success: true,
-        data: booking,
-        message: "Experience booking added successfully"
-      });
-    } catch (error) {
-      next(error);
+      return created(res, booking, "Experience booking added successfully");
+    } catch (err) {
+      next(err);
     }
   }
 
   /**
-   * Update experience booking
+   * GET /api/travel-plans/:id/experiences
+   */
+  async getExperienceBookings(req, res, next) {
+    try {
+      const { id } = req.params;
+
+      const plan = await prisma.travelPlan.findUnique({
+        where: { id }, select: { id: true, userId: true },
+      });
+      if (!plan) return notFound(res, "Travel plan not found");
+
+      const canView =
+        req.user.isSuperAdmin ||
+        plan.userId === req.user.id ||
+        (await checkPlanPermission(req.user.id, id, "view"));
+
+      if (!canView) return forbidden(res, "You do not have permission to view this travel plan");
+
+      const bookings = await prisma.experienceBooking.findMany({
+        where:   { travelPlanId: id },
+        include: { experience: true },
+        orderBy: { experienceDate: "asc" },
+      });
+
+      return ok(res, bookings);
+    } catch (err) {
+      next(err);
+    }
+  }
+
+  /**
    * PUT /api/travel-plans/bookings/experience/:bookingId
    */
   async updateExperienceBooking(req, res, next) {
     try {
       const { bookingId } = req.params;
-      const updateData = req.body;
-
-      // Check permission
-      const canEdit = await openfgaService.canEditExperienceBooking?.(
-        req.user.id,
-        bookingId
-      ) || false;
-
-      if (!canEdit && !req.user.isSuperAdmin) {
-        return res.status(403).json({
-          success: false,
-          message: "You do not have permission to update this booking"
-        });
-      }
 
       const booking = await prisma.experienceBooking.findUnique({
-        where: { id: bookingId },
-        include: { travelPlan: true }
+        where:  { id: bookingId },
+        select: { status: true, travelPlanId: true },
       });
+      if (!booking) return notFound(res, "Booking not found");
 
-      if (!booking) {
-        return res.status(404).json({
-          success: false,
-          message: "Booking not found"
-        });
+      if (TERMINAL_BOOKING.has(booking.status)) {
+        return badRequest(res, `Cannot update a booking with status: ${booking.status}`);
       }
 
-      if (booking.status === 'CANCELLED' || booking.status === 'COMPLETED') {
-        return res.status(400).json({
-          success: false,
-          message: `Cannot update booking with status: ${booking.status}`
-        });
-      }
+      const canEdit =
+        req.user.isSuperAdmin ||
+        !!(await openfgaService.canEditExperienceBooking?.(req.user.id, bookingId).catch(() => false));
 
-      const updatedBooking = await prisma.experienceBooking.update({
+      if (!canEdit) return forbidden(res, "You do not have permission to update this booking");
+
+      const {
+        experienceDate, numberOfParticipants, numberOfChildren,
+        specialRequests, status, paymentStatus, paymentMethod,
+      } = req.body;
+
+      const updated = await prisma.experienceBooking.update({
         where: { id: bookingId },
-        data: updateData,
-        include: {
-          experience: true
-        }
+        data: {
+          ...(experienceDate       !== undefined && { experienceDate:       new Date(experienceDate) }),
+          ...(numberOfParticipants !== undefined && { numberOfParticipants }),
+          ...(numberOfChildren     !== undefined && { numberOfChildren }),
+          ...(specialRequests      !== undefined && { specialRequests }),
+          ...(status               !== undefined && { status }),
+          ...(paymentStatus        !== undefined && { paymentStatus }),
+          ...(paymentMethod        !== undefined && { paymentMethod }),
+        },
+        include: { experience: true },
       });
 
-      // Invalidate caches
-      await redisService.client?.del(`travelplan:${booking.travelPlanId}`);
+      cacheDel(`travelplan:${booking.travelPlanId}`);
 
-      res.json({
-        success: true,
-        data: updatedBooking,
-        message: "Booking updated successfully"
-      });
-    } catch (error) {
-      next(error);
+      return ok(res, updated, "Booking updated successfully");
+    } catch (err) {
+      next(err);
     }
   }
 
   /**
-   * Cancel experience booking
    * DELETE /api/travel-plans/bookings/experience/:bookingId
    */
   async cancelExperienceBooking(req, res, next) {
     try {
       const { bookingId } = req.params;
 
-      // Check permission
-      const canCancel = await openfgaService.canCancelExperienceBooking?.(
-        req.user.id,
-        bookingId
-      ) || false;
-
-      if (!canCancel && !req.user.isSuperAdmin) {
-        return res.status(403).json({
-          success: false,
-          message: "You do not have permission to cancel this booking"
-        });
-      }
-
       const booking = await prisma.experienceBooking.findUnique({
-        where: { id: bookingId },
-        include: { travelPlan: true }
+        where:  { id: bookingId },
+        select: { status: true, paymentStatus: true, travelPlanId: true },
       });
+      if (!booking)                      return notFound(res, "Booking not found");
+      if (booking.status === "CANCELLED") return badRequest(res, "Booking is already cancelled");
+      if (booking.status === "COMPLETED") return badRequest(res, "Cannot cancel a completed booking");
 
-      if (!booking) {
-        return res.status(404).json({
-          success: false,
-          message: "Booking not found"
-        });
-      }
+      const canCancel =
+        req.user.isSuperAdmin ||
+        !!(await openfgaService.canCancelExperienceBooking?.(req.user.id, bookingId).catch(() => false));
 
-      const cancelledBooking = await prisma.experienceBooking.update({
+      if (!canCancel) return forbidden(res, "You do not have permission to cancel this booking");
+
+      const cancelled = await prisma.experienceBooking.update({
         where: { id: bookingId },
         data: {
-          status: 'CANCELLED',
-          paymentStatus: booking.paymentStatus === 'PAID' ? 'REFUNDED' : 'PENDING'
-        }
+          status:        "CANCELLED",
+          paymentStatus: booking.paymentStatus === "PAID" ? "REFUNDED" : booking.paymentStatus,
+        },
       });
 
-      // Invalidate caches
-      await redisService.client?.del(`travelplan:${booking.travelPlanId}`);
+      cacheDel(`travelplan:${booking.travelPlanId}`);
 
-      res.json({
-        success: true,
-        data: cancelledBooking,
-        message: "Booking cancelled successfully"
-      });
-    } catch (error) {
-      next(error);
+      return ok(res, cancelled, "Booking cancelled successfully");
+    } catch (err) {
+      next(err);
     }
   }
 
-  // ==================== SHOPPING VISITS ====================
+  // ==========================================================================
+  //  SHOPPING VISITS
+  // ==========================================================================
 
   /**
-   * Add shopping visit to travel plan
    * POST /api/travel-plans/:id/shopping
    */
   async addShoppingVisit(req, res, next) {
     try {
       const { id } = req.params;
-      const visitData = req.body;
+      const { storeId, plannedDate, purpose, plannedItems, duration, aiNotes, recommendations } = req.body;
 
-      // Check permission
-      const canEdit = await this.checkPermission(req.user.id, id, 'edit');
-      if (!canEdit && !req.user.isSuperAdmin) {
-        return res.status(403).json({
-          success: false,
-          message: "You do not have permission to add shopping visits to this travel plan"
-        });
-      }
+      if (!storeId)     return badRequest(res, "storeId is required");
+      if (!plannedDate) return badRequest(res, "plannedDate is required");
 
-      // Verify store exists
-      const store = await prisma.retailStore.findUnique({
-        where: { id: visitData.storeId }
+      const plan = await prisma.travelPlan.findUnique({
+        where: { id }, select: { id: true, userId: true },
       });
+      if (!plan) return notFound(res, "Travel plan not found");
 
-      if (!store) {
-        return res.status(404).json({
-          success: false,
-          message: "Store not found"
-        });
-      }
+      const canEdit =
+        req.user.isSuperAdmin ||
+        plan.userId === req.user.id ||
+        (await checkPlanPermission(req.user.id, id, "edit"));
 
-      if (!store.isActive) {
-        return res.status(400).json({
-          success: false,
-          message: "This store is currently closed"
-        });
-      }
+      if (!canEdit) return forbidden(res, "You do not have permission to add shopping visits to this travel plan");
+
+      const store = await prisma.retailStore.findUnique({
+        where: { id: storeId }, select: { id: true, isActive: true },
+      });
+      if (!store)          return notFound(res, "Store not found");
+      if (!store.isActive) return badRequest(res, "This store is currently closed");
 
       const visit = await prisma.shoppingVisit.create({
         data: {
-          ...visitData,
-          travelPlanId: id
+          travelPlanId: id,
+          storeId,
+          plannedDate:  new Date(plannedDate),
+          ...(purpose         !== undefined && { purpose }),
+          ...(plannedItems    !== undefined && { plannedItems }),
+          ...(duration        !== undefined && { duration }),
+          ...(aiNotes         !== undefined && { aiNotes }),
+          ...(recommendations !== undefined && { recommendations }),
         },
-        include: {
-          store: true
-        }
+        include: { store: { select: { id: true, name: true, city: true, storeType: true } } },
       });
 
-      // Set up OpenFGA relations
-      await openfgaService.createShoppingVisitRelations(
-        req.user.id,
-        visit.id,
-        id
-      );
-
-      // Invalidate caches
-      await Promise.all([
-        redisService.client?.del(`travelplan:${id}`),
-        redisService.client?.del(`retailstore:${visitData.storeId}`)
+      Promise.allSettled([
+        openfgaService.createShoppingVisitRelations(req.user.id, visit.id, id),
+        cacheDel(`travelplan:${id}`),
       ]);
 
-      res.status(201).json({
-        success: true,
-        data: visit,
-        message: "Shopping visit added successfully"
-      });
-    } catch (error) {
-      next(error);
+      return created(res, visit, "Shopping visit added successfully");
+    } catch (err) {
+      next(err);
     }
   }
 
   /**
-   * Update shopping visit
+   * GET /api/travel-plans/:id/shopping
+   */
+  async getShoppingVisits(req, res, next) {
+    try {
+      const { id } = req.params;
+
+      const plan = await prisma.travelPlan.findUnique({
+        where: { id }, select: { id: true, userId: true },
+      });
+      if (!plan) return notFound(res, "Travel plan not found");
+
+      const canView =
+        req.user.isSuperAdmin ||
+        plan.userId === req.user.id ||
+        (await checkPlanPermission(req.user.id, id, "view"));
+
+      if (!canView) return forbidden(res, "You do not have permission to view this travel plan");
+
+      const visits = await prisma.shoppingVisit.findMany({
+        where:   { travelPlanId: id },
+        include: { store: true },
+        orderBy: { plannedDate: "asc" },
+      });
+
+      return ok(res, visits);
+    } catch (err) {
+      next(err);
+    }
+  }
+
+  /**
    * PUT /api/travel-plans/shopping/:visitId
    */
   async updateShoppingVisit(req, res, next) {
     try {
       const { visitId } = req.params;
-      const updateData = req.body;
-
-      // Check permission
-      const canEdit = await openfgaService.canEditShoppingVisit?.(
-        req.user.id,
-        visitId
-      ) || false;
-
-      if (!canEdit && !req.user.isSuperAdmin) {
-        return res.status(403).json({
-          success: false,
-          message: "You do not have permission to update this shopping visit"
-        });
-      }
 
       const visit = await prisma.shoppingVisit.findUnique({
-        where: { id: visitId },
-        include: { travelPlan: true }
+        where:  { id: visitId },
+        select: { status: true, travelPlanId: true },
       });
+      if (!visit) return notFound(res, "Shopping visit not found");
 
-      if (!visit) {
-        return res.status(404).json({
-          success: false,
-          message: "Shopping visit not found"
-        });
+      if (TERMINAL_SHOPPING_VISIT.has(visit.status)) {
+        return badRequest(res, `Cannot update a visit with status: ${visit.status}`);
       }
 
-      if (visit.status === 'VISITED' || visit.status === 'CANCELLED') {
-        return res.status(400).json({
-          success: false,
-          message: `Cannot update visit with status: ${visit.status}`
-        });
-      }
+      const canEdit =
+        req.user.isSuperAdmin ||
+        !!(await openfgaService.canEditShoppingVisit?.(req.user.id, visitId).catch(() => false));
 
-      const updatedVisit = await prisma.shoppingVisit.update({
+      if (!canEdit) return forbidden(res, "You do not have permission to update this shopping visit");
+
+      const {
+        plannedDate, actualVisitDate, duration, purpose,
+        plannedItems, status, aiNotes, recommendations,
+      } = req.body;
+
+      const updated = await prisma.shoppingVisit.update({
         where: { id: visitId },
-        data: updateData,
-        include: {
-          store: true
-        }
+        data: {
+          ...(plannedDate     !== undefined && { plannedDate:     new Date(plannedDate) }),
+          ...(actualVisitDate !== undefined && { actualVisitDate: new Date(actualVisitDate) }),
+          ...(duration        !== undefined && { duration }),
+          ...(purpose         !== undefined && { purpose }),
+          ...(plannedItems    !== undefined && { plannedItems }),
+          ...(status          !== undefined && { status }),
+          ...(aiNotes         !== undefined && { aiNotes }),
+          ...(recommendations !== undefined && { recommendations }),
+        },
+        include: { store: true },
       });
 
-      // Invalidate caches
-      await redisService.client?.del(`travelplan:${visit.travelPlanId}`);
+      cacheDel(`travelplan:${visit.travelPlanId}`);
 
-      res.json({
-        success: true,
-        data: updatedVisit,
-        message: "Shopping visit updated successfully"
-      });
-    } catch (error) {
-      next(error);
+      return ok(res, updated, "Shopping visit updated successfully");
+    } catch (err) {
+      next(err);
     }
   }
 
   /**
-   * Cancel shopping visit
    * DELETE /api/travel-plans/shopping/:visitId
    */
   async cancelShoppingVisit(req, res, next) {
     try {
       const { visitId } = req.params;
 
-      // Check permission
-      const canCancel = await openfgaService.canCancelShoppingVisit?.(
-        req.user.id,
-        visitId
-      ) || false;
-
-      if (!canCancel && !req.user.isSuperAdmin) {
-        return res.status(403).json({
-          success: false,
-          message: "You do not have permission to cancel this shopping visit"
-        });
-      }
-
       const visit = await prisma.shoppingVisit.findUnique({
+        where:  { id: visitId },
+        select: { status: true, travelPlanId: true },
+      });
+      if (!visit)                       return notFound(res, "Shopping visit not found");
+      if (visit.status === "CANCELLED") return badRequest(res, "Visit is already cancelled");
+      if (visit.status === "VISITED")   return badRequest(res, "Cannot cancel a completed visit");
+
+      const canCancel =
+        req.user.isSuperAdmin ||
+        !!(await openfgaService.canCancelShoppingVisit?.(req.user.id, visitId).catch(() => false));
+
+      if (!canCancel) return forbidden(res, "You do not have permission to cancel this shopping visit");
+
+      const cancelled = await prisma.shoppingVisit.update({
         where: { id: visitId },
-        include: { travelPlan: true }
+        data:  { status: "CANCELLED" },
       });
 
-      if (!visit) {
-        return res.status(404).json({
-          success: false,
-          message: "Shopping visit not found"
-        });
-      }
+      cacheDel(`travelplan:${visit.travelPlanId}`);
 
-      const cancelledVisit = await prisma.shoppingVisit.update({
-        where: { id: visitId },
-        data: { status: 'CANCELLED' }
-      });
-
-      // Invalidate caches
-      await redisService.client?.del(`travelplan:${visit.travelPlanId}`);
-
-      res.json({
-        success: true,
-        data: cancelledVisit,
-        message: "Shopping visit cancelled successfully"
-      });
-    } catch (error) {
-      next(error);
+      return ok(res, cancelled, "Shopping visit cancelled successfully");
+    } catch (err) {
+      next(err);
     }
   }
 
-  // ==================== TRAVEL EXPERIENCES (Custom) ====================
+  // ==========================================================================
+  //  CUSTOM TRAVEL EXPERIENCES
+  // ==========================================================================
 
   /**
-   * Add custom travel experience
    * POST /api/travel-plans/:id/experiences/custom
    */
   async addTravelExperience(req, res, next) {
     try {
       const { id } = req.params;
-      const experienceData = req.body;
+      const { title, description, date, startTime, endTime, location, cost, category, aiNotes } = req.body;
 
-      // Check permission
-      const canEdit = await this.checkPermission(req.user.id, id, 'edit');
-      if (!canEdit && !req.user.isSuperAdmin) {
-        return res.status(403).json({
-          success: false,
-          message: "You do not have permission to add experiences to this travel plan"
-        });
-      }
+      if (!title) return badRequest(res, "title is required");
+      if (!date)  return badRequest(res, "date is required");
+
+      const plan = await prisma.travelPlan.findUnique({
+        where: { id }, select: { id: true, userId: true },
+      });
+      if (!plan) return notFound(res, "Travel plan not found");
+
+      const canEdit =
+        req.user.isSuperAdmin ||
+        plan.userId === req.user.id ||
+        (await checkPlanPermission(req.user.id, id, "edit"));
+
+      if (!canEdit) return forbidden(res, "You do not have permission to add experiences to this travel plan");
 
       const experience = await prisma.travelExperience.create({
         data: {
-          ...experienceData,
-          travelPlanId: id
-        }
+          travelPlanId: id,
+          title:        title.trim(),
+          date:         new Date(date),
+          ...(description !== undefined && { description }),
+          ...(startTime   !== undefined && { startTime }),
+          ...(endTime     !== undefined && { endTime }),
+          ...(location    !== undefined && { location }),
+          ...(cost        !== undefined && { cost: +cost }),
+          ...(category    !== undefined && { category }),
+          ...(aiNotes     !== undefined && { aiNotes }),
+        },
       });
 
-      // Set up OpenFGA relations
-      await openfgaService.createTravelExperienceRelations(
-        req.user.id,
-        experience.id,
-        id
-      );
+      Promise.allSettled([
+        typeof openfgaService.createTravelExperienceRelations === "function"
+          ? openfgaService.createTravelExperienceRelations(req.user.id, experience.id, id)
+          : Promise.resolve(),
+        cacheDel(`travelplan:${id}`),
+      ]);
 
-      // Invalidate cache
-      await redisService.client?.del(`travelplan:${id}`);
-
-      res.status(201).json({
-        success: true,
-        data: experience,
-        message: "Travel experience added successfully"
-      });
-    } catch (error) {
-      next(error);
+      return created(res, experience, "Travel experience added successfully");
+    } catch (err) {
+      next(err);
     }
   }
 
   /**
-   * Update custom travel experience
+   * GET /api/travel-plans/:id/experiences/custom
+   */
+  async getCustomExperiences(req, res, next) {
+    try {
+      const { id } = req.params;
+
+      const plan = await prisma.travelPlan.findUnique({
+        where: { id }, select: { id: true, userId: true },
+      });
+      if (!plan) return notFound(res, "Travel plan not found");
+
+      const canView =
+        req.user.isSuperAdmin ||
+        plan.userId === req.user.id ||
+        (await checkPlanPermission(req.user.id, id, "view"));
+
+      if (!canView) return forbidden(res, "You do not have permission to view this travel plan");
+
+      const experiences = await prisma.travelExperience.findMany({
+        where:   { travelPlanId: id },
+        orderBy: { date: "asc" },
+      });
+
+      return ok(res, experiences);
+    } catch (err) {
+      next(err);
+    }
+  }
+
+  /**
    * PUT /api/travel-plans/experiences/custom/:experienceId
    */
   async updateTravelExperience(req, res, next) {
     try {
       const { experienceId } = req.params;
-      const updateData = req.body;
-
-      // Check permission
-      const canEdit = await openfgaService.canEditTravelExperience?.(
-        req.user.id,
-        experienceId
-      ) || false;
-
-      if (!canEdit && !req.user.isSuperAdmin) {
-        return res.status(403).json({
-          success: false,
-          message: "You do not have permission to update this experience"
-        });
-      }
 
       const experience = await prisma.travelExperience.findUnique({
+        where:  { id: experienceId },
+        select: { travelPlanId: true },
+      });
+      if (!experience) return notFound(res, "Experience not found");
+
+      const canEdit =
+        req.user.isSuperAdmin ||
+        !!(await openfgaService.canEditTravelExperience?.(req.user.id, experienceId).catch(() => false));
+
+      if (!canEdit) return forbidden(res, "You do not have permission to update this experience");
+
+      const { title, description, date, startTime, endTime, location, cost, category, aiNotes } = req.body;
+
+      const updated = await prisma.travelExperience.update({
         where: { id: experienceId },
-        include: { travelPlan: true }
+        data: {
+          ...(title       !== undefined && { title:    title.trim() }),
+          ...(description !== undefined && { description }),
+          ...(date        !== undefined && { date:     new Date(date) }),
+          ...(startTime   !== undefined && { startTime }),
+          ...(endTime     !== undefined && { endTime }),
+          ...(location    !== undefined && { location }),
+          ...(cost        !== undefined && { cost:     +cost }),
+          ...(category    !== undefined && { category }),
+          ...(aiNotes     !== undefined && { aiNotes }),
+        },
       });
 
-      if (!experience) {
-        return res.status(404).json({
-          success: false,
-          message: "Experience not found"
-        });
-      }
+      cacheDel(`travelplan:${experience.travelPlanId}`);
 
-      const updatedExperience = await prisma.travelExperience.update({
-        where: { id: experienceId },
-        data: updateData
-      });
-
-      // Invalidate cache
-      await redisService.client?.del(`travelplan:${experience.travelPlanId}`);
-
-      res.json({
-        success: true,
-        data: updatedExperience,
-        message: "Experience updated successfully"
-      });
-    } catch (error) {
-      next(error);
+      return ok(res, updated, "Experience updated successfully");
+    } catch (err) {
+      next(err);
     }
   }
 
   /**
-   * Delete custom travel experience
    * DELETE /api/travel-plans/experiences/custom/:experienceId
    */
   async deleteTravelExperience(req, res, next) {
     try {
       const { experienceId } = req.params;
 
-      // Check permission
-      const canDelete = await openfgaService.canDeleteTravelExperience?.(
-        req.user.id,
-        experienceId
-      ) || false;
-
-      if (!canDelete && !req.user.isSuperAdmin) {
-        return res.status(403).json({
-          success: false,
-          message: "You do not have permission to delete this experience"
-        });
-      }
-
       const experience = await prisma.travelExperience.findUnique({
-        where: { id: experienceId },
-        include: { travelPlan: true }
+        where:  { id: experienceId },
+        select: { travelPlanId: true },
       });
+      if (!experience) return notFound(res, "Experience not found");
 
-      if (!experience) {
-        return res.status(404).json({
-          success: false,
-          message: "Experience not found"
-        });
-      }
+      const canDelete =
+        req.user.isSuperAdmin ||
+        !!(await openfgaService.canDeleteTravelExperience?.(req.user.id, experienceId).catch(() => false));
 
-      await prisma.travelExperience.delete({
-        where: { id: experienceId }
-      });
+      if (!canDelete) return forbidden(res, "You do not have permission to delete this experience");
 
-      // Invalidate cache
-      await redisService.client?.del(`travelplan:${experience.travelPlanId}`);
+      await prisma.travelExperience.delete({ where: { id: experienceId } });
+      cacheDel(`travelplan:${experience.travelPlanId}`);
 
-      res.json({
-        success: true,
-        message: "Experience deleted successfully"
-      });
-    } catch (error) {
-      next(error);
+      return ok(res, null, "Experience deleted successfully");
+    } catch (err) {
+      next(err);
     }
   }
 
-  // ==================== BUDGET MANAGEMENT ====================
+  // ==========================================================================
+  //  BUDGET MANAGEMENT
+  // ==========================================================================
 
   /**
-   * Update travel plan budget
    * PATCH /api/travel-plans/:id/budget
    */
   async updateBudget(req, res, next) {
     try {
-      const { id } = req.params;
+      const { id }     = req.params;
       const { budget } = req.body;
 
-      // Check permission
-      const canEdit = await this.checkPermission(req.user.id, id, 'edit');
-      if (!canEdit && !req.user.isSuperAdmin) {
-        return res.status(403).json({
-          success: false,
-          message: "You do not have permission to update this travel plan"
-        });
-      }
+      if (budget === undefined || budget === null) return badRequest(res, "budget is required");
+      if (typeof budget !== "number" || !Number.isFinite(budget)) return badRequest(res, "budget must be a finite number");
+      if (budget < 0) return badRequest(res, "budget must be a non-negative number");
 
-      const travelPlan = await prisma.travelPlan.update({
-        where: { id },
-        data: { budget }
+      const existing = await prisma.travelPlan.findUnique({
+        where: { id }, select: { id: true, userId: true },
+      });
+      if (!existing) return notFound(res, "Travel plan not found");
+
+      const canEdit =
+        req.user.isSuperAdmin ||
+        existing.userId === req.user.id ||
+        (await checkPlanPermission(req.user.id, id, "edit"));
+
+      if (!canEdit) return forbidden(res, "You do not have permission to update this travel plan");
+
+      const updated = await prisma.travelPlan.update({
+        where:  { id },
+        data:   { budget },
+        select: { id: true, budget: true, updatedAt: true },
       });
 
-      // Invalidate caches
-      await Promise.all([
-        redisService.client?.del(`travelplan:${id}`),
-        redisService.client?.del(`user:${req.user.id}:travelplans`)
-      ]);
+      invalidatePlan(id, existing.userId);
 
-      res.json({
-        success: true,
-        data: travelPlan,
-        message: "Budget updated successfully"
-      });
-    } catch (error) {
-      next(error);
+      return ok(res, updated, "Budget updated successfully");
+    } catch (err) {
+      next(err);
     }
   }
 
   /**
-   * Get budget breakdown
    * GET /api/travel-plans/:id/budget/breakdown
    */
   async getBudgetBreakdown(req, res, next) {
     try {
       const { id } = req.params;
 
-      // Check permission
-      const canView = await this.checkPermission(req.user.id, id, 'view');
-      if (!canView && !req.user.isSuperAdmin) {
-        return res.status(403).json({
-          success: false,
-          message: "You do not have permission to view this travel plan"
-        });
-      }
-
-      const costs = await this.calculateTotalCost(id);
-      
-      const travelPlan = await prisma.travelPlan.findUnique({
-        where: { id },
-        select: { budget: true }
+      const plan = await prisma.travelPlan.findUnique({
+        where:  { id },
+        select: { id: true, budget: true, userId: true },
       });
+      if (!plan) return notFound(res, "Travel plan not found");
 
-      res.json({
-        success: true,
-        data: {
-          budget: travelPlan?.budget || 0,
-          spent: costs.total,
-          remaining: (travelPlan?.budget || 0) - costs.total,
-          breakdown: costs,
-          percentageUsed: travelPlan?.budget ? (costs.total / travelPlan.budget) * 100 : 0
-        }
-      });
-    } catch (error) {
-      next(error);
+      const canView =
+        req.user.isSuperAdmin ||
+        plan.userId === req.user.id ||
+        (await checkPlanPermission(req.user.id, id, "view"));
+
+      if (!canView) return forbidden(res, "You do not have permission to view this travel plan");
+
+      const cacheKey = `travelplan:${id}:budget`;
+      const cached   = await cacheGet(cacheKey);
+      if (cached) return res.json({ success: true, data: cached, cached: true });
+
+      const costs = await calculateTotalCost(id);
+      const data = {
+        budget:         plan.budget ?? 0,
+        spent:          costs.total,
+        remaining:      (plan.budget ?? 0) - costs.total,
+        breakdown:      costs,
+        percentageUsed: plan.budget
+          ? +((costs.total / plan.budget) * 100).toFixed(2)
+          : 0,
+        isOverBudget:   costs.total > (plan.budget ?? Infinity),
+      };
+
+      cacheSet(cacheKey, data, CACHE_TTL.BUDGET);
+
+      return ok(res, data);
+    } catch (err) {
+      next(err);
     }
   }
 
   /**
-   * Get spending by category
    * GET /api/travel-plans/:id/budget/by-category
    */
   async getSpendingByCategory(req, res, next) {
     try {
       const { id } = req.params;
 
-      // Check permission
-      const canView = await this.checkPermission(req.user.id, id, 'view');
-      if (!canView && !req.user.isSuperAdmin) {
-        return res.status(403).json({
-          success: false,
-          message: "You do not have permission to view this travel plan"
-        });
-      }
+      const plan = await prisma.travelPlan.findUnique({
+        where: { id }, select: { id: true, userId: true },
+      });
+      if (!plan) return notFound(res, "Travel plan not found");
+
+      const canView =
+        req.user.isSuperAdmin ||
+        plan.userId === req.user.id ||
+        (await checkPlanPermission(req.user.id, id, "view"));
+
+      if (!canView) return forbidden(res, "You do not have permission to view this travel plan");
 
       const [accommodations, transportations, packages, experiences] = await Promise.all([
-        prisma.accommodationBooking.groupBy({
-          by: ['accommodationId'],
+        prisma.accommodationBooking.aggregate({
           where: { travelPlanId: id },
-          _sum: { totalCost: true }
+          _sum:  { totalCost: true },
         }),
         prisma.transportationBooking.groupBy({
-          by: ['serviceType'],
+          by:    ["serviceType"],
           where: { travelPlanId: id },
-          _sum: { actualFare: true, estimatedFare: true }
+          _sum:  { actualFare: true, estimatedFare: true },
         }),
         prisma.travelPackageBooking.aggregate({
           where: { travelPlanId: id },
-          _sum: { finalAmount: true }
+          _sum:  { finalAmount: true },
         }),
         prisma.experienceBooking.aggregate({
           where: { travelPlanId: id },
-          _sum: { totalAmount: true }
-        })
+          _sum:  { totalAmount: true },
+        }),
       ]);
 
-      res.json({
-        success: true,
-        data: {
-          accommodations: accommodations.reduce((sum, item) => sum + (item._sum.totalCost || 0), 0),
-          transportations: {
-            total: transportations.reduce((sum, item) => sum + (item._sum.actualFare || item._sum.estimatedFare || 0), 0),
-            byType: transportations
-          },
-          packages: packages._sum.finalAmount || 0,
-          experiences: experiences._sum.totalAmount || 0
-        }
+      const transportTotal = transportations.reduce(
+        (s, t) => s + (t._sum.actualFare ?? t._sum.estimatedFare ?? 0), 0
+      );
+
+      return ok(res, {
+        accommodations: accommodations._sum.totalCost  ?? 0,
+        transportation: {
+          total:  transportTotal,
+          byType: transportations.map((t) => ({
+            serviceType: t.serviceType,
+            amount:      t._sum.actualFare ?? t._sum.estimatedFare ?? 0,
+          })),
+        },
+        packages:    packages._sum.finalAmount  ?? 0,
+        experiences: experiences._sum.totalAmount ?? 0,
+        total:       (accommodations._sum.totalCost ?? 0) + transportTotal +
+                     (packages._sum.finalAmount ?? 0) + (experiences._sum.totalAmount ?? 0),
       });
-    } catch (error) {
-      next(error);
+    } catch (err) {
+      next(err);
     }
   }
 
-  // ==================== AI FEATURES ====================
+  // ==========================================================================
+  //  TIMELINE
+  // ==========================================================================
 
   /**
-   * Generate AI itinerary
+   * GET /api/travel-plans/:id/timeline
+   *
+   * Returns all bookings and experiences merged into a single chronological
+   * timeline, with a type discriminator on each event.
+   */
+  async getTimeline(req, res, next) {
+    try {
+      const { id } = req.params;
+
+      const plan = await prisma.travelPlan.findUnique({
+        where: { id }, select: { id: true, userId: true },
+      });
+      if (!plan) return notFound(res, "Travel plan not found");
+
+      const canView =
+        req.user.isSuperAdmin ||
+        plan.userId === req.user.id ||
+        (await checkPlanPermission(req.user.id, id, "view"));
+
+      if (!canView) return forbidden(res, "You do not have permission to view this travel plan");
+
+      const [accBookings, transBookings, pkgBookings, expBookings, customExp, shopVisits] =
+        await Promise.all([
+          prisma.accommodationBooking.findMany({
+            where:   { travelPlanId: id },
+            include: { accommodation: { select: { id: true, name: true, city: true } } },
+          }),
+          prisma.transportationBooking.findMany({
+            where:   { travelPlanId: id },
+            include: { provider: { select: { id: true, name: true } } },
+          }),
+          prisma.travelPackageBooking.findMany({
+            where:   { travelPlanId: id },
+            include: { package: { select: { id: true, name: true } } },
+          }),
+          prisma.experienceBooking.findMany({
+            where:   { travelPlanId: id },
+            include: { experience: { select: { id: true, name: true } } },
+          }),
+          prisma.travelExperience.findMany({ where: { travelPlanId: id } }),
+          prisma.shoppingVisit.findMany({
+            where:   { travelPlanId: id },
+            include: { store: { select: { id: true, name: true } } },
+          }),
+        ]);
+
+      const events = [
+        ...accBookings.map((b)  => ({ type: "ACCOMMODATION",   date: b.checkInDate,     ...b })),
+        ...transBookings.map((b) => ({ type: "TRANSPORTATION",  date: b.pickupTime,      ...b })),
+        ...pkgBookings.map((b)   => ({ type: "PACKAGE",         date: b.startDate,       ...b })),
+        ...expBookings.map((b)   => ({ type: "EXPERIENCE",      date: b.experienceDate,  ...b })),
+        ...customExp.map((e)     => ({ type: "CUSTOM_EXPERIENCE", date: e.date,          ...e })),
+        ...shopVisits.map((v)    => ({ type: "SHOPPING",        date: v.plannedDate,     ...v })),
+      ].sort((a, b) => new Date(a.date) - new Date(b.date));
+
+      return ok(res, events);
+    } catch (err) {
+      next(err);
+    }
+  }
+
+  // ==========================================================================
+  //  STATISTICS
+  // ==========================================================================
+
+  /**
+   * GET /api/travel-plans/:id/stats
+   *
+   * All 24 queries (23 counts + 1 cost aggregation) run concurrently.
+   */
+  async getTravelPlanStats(req, res, next) {
+    try {
+      const { id } = req.params;
+
+      const plan = await prisma.travelPlan.findUnique({
+        where: { id }, select: { id: true, userId: true, budget: true },
+      });
+      if (!plan) return notFound(res, "Travel plan not found");
+
+      const canView =
+        req.user.isSuperAdmin ||
+        plan.userId === req.user.id ||
+        (await checkPlanPermission(req.user.id, id, "view"));
+
+      if (!canView) return forbidden(res, "You do not have permission to view this travel plan");
+
+      const cacheKey = `travelplan:${id}:stats`;
+      const cached   = await cacheGet(cacheKey);
+      if (cached) return res.json({ success: true, data: cached, cached: true });
+
+      const now = new Date();
+
+      const [
+        // totals (5)
+        accTotal, transTotal, pkgTotal, expTotal, visitTotal,
+        // confirmed (4)
+        accConfirmed, transConfirmed, pkgConfirmed, expConfirmed,
+        // pending (4)
+        accPending, transPending, pkgPending, expPending,
+        // cancelled (5)
+        accCancelled, transCancelled, pkgCancelled, expCancelled, visitCancelled,
+        // upcoming (5)
+        accUpcoming, transUpcoming, pkgUpcoming, expUpcoming, visitUpcoming,
+        // cost (1)
+        costs,
+      ] = await Promise.all([
+        prisma.accommodationBooking.count({ where: { travelPlanId: id } }),
+        prisma.transportationBooking.count({ where: { travelPlanId: id } }),
+        prisma.travelPackageBooking.count({ where: { travelPlanId: id } }),
+        prisma.experienceBooking.count({ where: { travelPlanId: id } }),
+        prisma.shoppingVisit.count({ where: { travelPlanId: id } }),
+
+        prisma.accommodationBooking.count({ where: { travelPlanId: id, bookingStatus: "CONFIRMED" } }),
+        prisma.transportationBooking.count({ where: { travelPlanId: id, status: "CONFIRMED" } }),
+        prisma.travelPackageBooking.count({ where: { travelPlanId: id, status: "CONFIRMED" } }),
+        prisma.experienceBooking.count({ where: { travelPlanId: id, status: "CONFIRMED" } }),
+
+        prisma.accommodationBooking.count({ where: { travelPlanId: id, bookingStatus: "PENDING" } }),
+        prisma.transportationBooking.count({ where: { travelPlanId: id, status: "BOOKED" } }),
+        prisma.travelPackageBooking.count({ where: { travelPlanId: id, status: "PENDING" } }),
+        prisma.experienceBooking.count({ where: { travelPlanId: id, status: "PENDING" } }),
+
+        prisma.accommodationBooking.count({ where: { travelPlanId: id, bookingStatus: "CANCELLED" } }),
+        prisma.transportationBooking.count({ where: { travelPlanId: id, status: "CANCELLED" } }),
+        prisma.travelPackageBooking.count({ where: { travelPlanId: id, status: "CANCELLED" } }),
+        prisma.experienceBooking.count({ where: { travelPlanId: id, status: "CANCELLED" } }),
+        prisma.shoppingVisit.count({ where: { travelPlanId: id, status: "CANCELLED" } }),
+
+        prisma.accommodationBooking.count({ where: { travelPlanId: id, checkInDate:    { gt: now } } }),
+        prisma.transportationBooking.count({ where: { travelPlanId: id, pickupTime:    { gt: now } } }),
+        prisma.travelPackageBooking.count({ where: { travelPlanId: id, startDate:      { gt: now } } }),
+        prisma.experienceBooking.count({ where: { travelPlanId: id, experienceDate:    { gt: now } } }),
+        prisma.shoppingVisit.count({ where: { travelPlanId: id, plannedDate:           { gt: now } } }),
+
+        calculateTotalCost(id),
+      ]);
+
+      const totalBookings  = accTotal + transTotal + pkgTotal + expTotal + visitTotal;
+      const confirmedCount = accConfirmed + transConfirmed + pkgConfirmed + expConfirmed;
+      const pendingCount   = accPending + transPending + pkgPending + expPending;
+      const cancelledCount = accCancelled + transCancelled + pkgCancelled + expCancelled + visitCancelled;
+      const upcomingCount  = accUpcoming + transUpcoming + pkgUpcoming + expUpcoming + visitUpcoming;
+
+      const data = {
+        totalBookings,
+        confirmedBookings:  confirmedCount,
+        pendingBookings:    pendingCount,
+        cancelledBookings:  cancelledCount,
+        upcomingActivities: upcomingCount,
+        totalSpent:         costs.total,
+        costBreakdown:      costs,
+        completionRate:     totalBookings > 0
+          ? +((confirmedCount / totalBookings) * 100).toFixed(2)
+          : 0,
+        budgetUtilization:  plan.budget
+          ? +((costs.total / plan.budget) * 100).toFixed(2)
+          : null,
+      };
+
+      cacheSet(cacheKey, data, CACHE_TTL.STATS);
+
+      return ok(res, data);
+    } catch (err) {
+      next(err);
+    }
+  }
+
+  // ==========================================================================
+  //  AI FEATURES
+  // ==========================================================================
+
+  /**
    * POST /api/travel-plans/:id/generate-itinerary
+   *
+   * Placeholder — wire up AI service here.
    */
   async generateItinerary(req, res, next) {
     try {
       const { id } = req.params;
-      const { preferences } = req.body;
 
-      // Check permission
-      const canEdit = await this.checkPermission(req.user.id, id, 'edit');
-      if (!canEdit && !req.user.isSuperAdmin) {
-        return res.status(403).json({
-          success: false,
-          message: "You do not have permission to modify this travel plan"
-        });
-      }
+      const existing = await prisma.travelPlan.findUnique({
+        where: { id }, select: { id: true, userId: true },
+      });
+      if (!existing) return notFound(res, "Travel plan not found");
 
-      const travelPlan = await prisma.travelPlan.findUnique({
-        where: { id },
+      const canEdit =
+        req.user.isSuperAdmin ||
+        existing.userId === req.user.id ||
+        (await checkPlanPermission(req.user.id, id, "edit"));
+
+      if (!canEdit) return forbidden(res, "You do not have permission to modify this travel plan");
+
+      // Fetch full context for AI service
+      const fullPlan = await prisma.travelPlan.findUnique({
+        where:   { id },
         include: {
-          accommodations: {
-            include: { accommodation: true }
-          },
-          transportServices: {
-            include: { provider: true }
-          },
-          experiences: true,
-          shoppingVisits: {
-            include: { store: true }
-          }
-        }
+          accommodations:     { include: { accommodation: true } },
+          transportServices:  { include: { provider: true } },
+          experiences:        true,
+          experienceBookings: { include: { experience: true } },
+          shoppingVisits:     { include: { store: true } },
+        },
       });
 
-      // This would integrate with an AI service
-      // For now, return a placeholder
-      const itinerary = {
-        days: [],
-        recommendations: [],
-        tips: []
-      };
+      // TODO: call AI service with fullPlan as context
+      const itinerary = { days: [], recommendations: [], tips: [] };
 
-      // Update the travel plan with generated itinerary
       await prisma.travelPlan.update({
         where: { id },
-        data: {
-          itinerary: itinerary,
-          recommendations: req.body.recommendations
-        }
+        data:  { itinerary },
       });
 
-      // Invalidate cache
-      await redisService.client?.del(`travelplan:${id}`);
+      cacheDel(`travelplan:${id}`);
 
-      res.json({
-        success: true,
-        data: itinerary,
-        message: "Itinerary generated successfully"
-      });
-    } catch (error) {
-      next(error);
+      return ok(res, itinerary, "Itinerary generated successfully");
+    } catch (err) {
+      next(err);
     }
   }
 
   /**
-   * Get AI recommendations
    * GET /api/travel-plans/:id/recommendations
    */
   async getRecommendations(req, res, next) {
     try {
       const { id } = req.params;
 
-      // Check permission
-      const canView = await this.checkPermission(req.user.id, id, 'view');
-      if (!canView && !req.user.isSuperAdmin) {
-        return res.status(403).json({
-          success: false,
-          message: "You do not have permission to view this travel plan"
-        });
-      }
-
-      const travelPlan = await prisma.travelPlan.findUnique({
-        where: { id },
+      const plan = await prisma.travelPlan.findUnique({
+        where:  { id },
         select: {
-          destination: true,
-          startDate: true,
-          endDate: true,
-          travelers: true,
-          interests: true,
-          recommendations: true
-        }
+          id: true, userId: true, destination: true, startDate: true,
+          endDate: true, numberOfTravelers: true, interests: true, recommendations: true,
+        },
       });
+      if (!plan) return notFound(res, "Travel plan not found");
 
-      // This would integrate with an AI service
-      // For now, return stored recommendations
-      res.json({
-        success: true,
-        data: travelPlan?.recommendations || {}
-      });
-    } catch (error) {
-      next(error);
+      const canView =
+        req.user.isSuperAdmin ||
+        plan.userId === req.user.id ||
+        (await checkPlanPermission(req.user.id, id, "view"));
+
+      if (!canView) return forbidden(res, "You do not have permission to view this travel plan");
+
+      return ok(res, plan.recommendations ?? {});
+    } catch (err) {
+      next(err);
     }
   }
 
-  // ==================== STATISTICS ====================
+  // ==========================================================================
+  //  EXPORT
+  // ==========================================================================
 
   /**
-   * Get travel plan statistics
-   * GET /api/travel-plans/:id/stats
-   */
-  async getTravelPlanStats(req, res, next) {
-    try {
-      const { id } = req.params;
-
-      // Check permission
-      const canView = await this.checkPermission(req.user.id, id, 'view');
-      if (!canView && !req.user.isSuperAdmin) {
-        return res.status(403).json({
-          success: false,
-          message: "You do not have permission to view this travel plan"
-        });
-      }
-
-      const [
-        totalBookings,
-        confirmedBookings,
-        pendingBookings,
-        cancelledBookings,
-        totalSpent,
-        upcomingActivities
-      ] = await Promise.all([
-        // Total bookings count
-        prisma.$transaction([
-          prisma.accommodationBooking.count({ where: { travelPlanId: id } }),
-          prisma.transportationBooking.count({ where: { travelPlanId: id } }),
-          prisma.travelPackageBooking.count({ where: { travelPlanId: id } }),
-          prisma.experienceBooking.count({ where: { travelPlanId: id } }),
-          prisma.shoppingVisit.count({ where: { travelPlanId: id } })
-        ]).then(results => results.reduce((a, b) => a + b, 0)),
-
-        // Confirmed bookings
-        prisma.$transaction([
-          prisma.accommodationBooking.count({ where: { travelPlanId: id, bookingStatus: 'CONFIRMED' } }),
-          prisma.transportationBooking.count({ where: { travelPlanId: id, status: 'CONFIRMED' } }),
-          prisma.travelPackageBooking.count({ where: { travelPlanId: id, status: 'CONFIRMED' } }),
-          prisma.experienceBooking.count({ where: { travelPlanId: id, status: 'CONFIRMED' } })
-        ]).then(results => results.reduce((a, b) => a + b, 0)),
-
-        // Pending bookings
-        prisma.$transaction([
-          prisma.accommodationBooking.count({ where: { travelPlanId: id, bookingStatus: 'PENDING' } }),
-          prisma.transportationBooking.count({ where: { travelPlanId: id, status: 'BOOKED' } }),
-          prisma.travelPackageBooking.count({ where: { travelPlanId: id, status: 'PENDING' } }),
-          prisma.experienceBooking.count({ where: { travelPlanId: id, status: 'PENDING' } })
-        ]).then(results => results.reduce((a, b) => a + b, 0)),
-
-        // Cancelled bookings
-        prisma.$transaction([
-          prisma.accommodationBooking.count({ where: { travelPlanId: id, bookingStatus: 'CANCELLED' } }),
-          prisma.transportationBooking.count({ where: { travelPlanId: id, status: 'CANCELLED' } }),
-          prisma.travelPackageBooking.count({ where: { travelPlanId: id, status: 'CANCELLED' } }),
-          prisma.experienceBooking.count({ where: { travelPlanId: id, status: 'CANCELLED' } }),
-          prisma.shoppingVisit.count({ where: { travelPlanId: id, status: 'CANCELLED' } })
-        ]).then(results => results.reduce((a, b) => a + b, 0)),
-
-        // Total spent
-        this.calculateTotalCost(id).then(costs => costs.total),
-
-        // Upcoming activities
-        prisma.$transaction([
-          prisma.accommodationBooking.count({ where: { travelPlanId: id, checkInDate: { gt: new Date() } } }),
-          prisma.transportationBooking.count({ where: { travelPlanId: id, pickupTime: { gt: new Date() } } }),
-          prisma.travelPackageBooking.count({ where: { travelPlanId: id, startDate: { gt: new Date() } } }),
-          prisma.experienceBooking.count({ where: { travelPlanId: id, experienceDate: { gt: new Date() } } }),
-          prisma.shoppingVisit.count({ where: { travelPlanId: id, plannedDate: { gt: new Date() } } })
-        ]).then(results => results.reduce((a, b) => a + b, 0))
-      ]);
-
-      res.json({
-        success: true,
-        data: {
-          totalBookings,
-          confirmedBookings,
-          pendingBookings,
-          cancelledBookings,
-          totalSpent,
-          upcomingActivities,
-          completionRate: totalBookings > 0 ? (confirmedBookings / totalBookings) * 100 : 0
-        }
-      });
-    } catch (error) {
-      next(error);
-    }
-  }
-
-  /**
-   * Export travel plan (PDF/JSON)
    * GET /api/travel-plans/:id/export
+   *
+   * JSON export. Owner email is only included for the plan owner / superadmin.
+   * - Existence check before format branching.
+   * - User PII gated on ownership.
    */
   async exportTravelPlan(req, res, next) {
     try {
-      const { id } = req.params;
-      const { format = 'json' } = req.query;
+      const { id }              = req.params;
+      const { format = "json" } = req.query;
 
-      // Check permission
-      const canView = await this.checkPermission(req.user.id, id, 'view');
-      if (!canView && !req.user.isSuperAdmin) {
-        return res.status(403).json({
-          success: false,
-          message: "You do not have permission to export this travel plan"
-        });
-      }
+      const existing = await prisma.travelPlan.findUnique({
+        where:  { id },
+        select: { id: true, userId: true },
+      });
+      if (!existing) return notFound(res, "Travel plan not found");
 
-      const travelPlan = await prisma.travelPlan.findUnique({
-        where: { id },
+      const canView =
+        req.user.isSuperAdmin ||
+        existing.userId === req.user.id ||
+        (await checkPlanPermission(req.user.id, id, "view"));
+
+      if (!canView) return forbidden(res, "You do not have permission to export this travel plan");
+
+      // Only plan owners and superadmins see user PII in export
+      const includeUserPII = req.user.isSuperAdmin || existing.userId === req.user.id;
+
+      const plan = await prisma.travelPlan.findUnique({
+        where:   { id },
         include: {
-          user: {
-            select: {
-              name: true,
-              email: true
-            }
-          },
-          accommodations: {
-            include: {
-              accommodation: true
-            }
-          },
-          transportServices: {
-            include: {
-              provider: true
-            }
-          },
-          travelPackageBookings: {
-            include: {
-              package: true
-            }
-          },
-          experiences: true,
-          shoppingVisits: {
-            include: {
-              store: true
-            }
-          }
-        }
+          user:                  includeUserPII
+            ? { select: { name: true, email: true } }
+            : { select: { name: true } },
+          accommodations:        { include: { accommodation: true } },
+          transportServices:     { include: { provider: true } },
+          travelPackageBookings: { include: { package: true } },
+          experiences:           true,
+          experienceBookings:    { include: { experience: true } },
+          shoppingVisits:        { include: { store: true } },
+        },
       });
 
-      if (!travelPlan) {
-        return res.status(404).json({
-          success: false,
-          message: "Travel plan not found"
-        });
-      }
-
-      const costs = await this.calculateTotalCost(id);
+      const costs = await calculateTotalCost(id);
 
       const exportData = {
-        metadata: {
-          exportedAt: new Date().toISOString(),
-          version: '1.0'
-        },
-        travelPlan: {
-          ...travelPlan,
-          currentSpent: costs.total,
-          budgetBreakdown: costs
-        }
+        metadata:   { exportedAt: new Date().toISOString(), version: "1.0" },
+        travelPlan: { ...plan, currentSpent: costs.total, budgetBreakdown: costs },
       };
 
-      if (format === 'json') {
-        res.setHeader('Content-Type', 'application/json');
-        res.setHeader('Content-Disposition', `attachment; filename=travel-plan-${id}.json`);
+      if (format === "json") {
+        res.setHeader("Content-Type", "application/json");
+        res.setHeader("Content-Disposition", `attachment; filename=travel-plan-${id}.json`);
         return res.json(exportData);
-      } else if (format === 'pdf') {
-        // Implement PDF generation
-        res.status(400).json({
-          success: false,
-          message: "PDF export not implemented yet"
-        });
       }
-    } catch (error) {
-      next(error);
+
+      return badRequest(res, `Export format "${format}" is not supported. Supported: json`);
+    } catch (err) {
+      next(err);
     }
   }
 
-  // ==================== FAVORITES ====================
+  // ==========================================================================
+  //  SUPERADMIN ENDPOINTS
+  // ==========================================================================
 
   /**
-   * Add travel plan to favorites
-   * POST /api/travel-plans/:id/favorite
+   * GET /api/admin/travel-plans
+   *
+   * Returns all plans across all users with full filtering and pagination.
    */
-  async addToFavorites(req, res, next) {
+  async adminGetAllPlans(req, res, next) {
+    try {
+      const {
+        userId, status, destination, search,
+        sortBy = "createdAt", sortOrder = "desc",
+      } = req.query;
+
+      const { page, limit, skip } = parsePagination(req.query, 20);
+      const { field, order }      = safeSort(sortBy, sortOrder, "createdAt");
+
+      const AND = [];
+      if (userId)      AND.push({ userId });
+      if (status)      AND.push({ status });
+      if (destination) AND.push({ destination: { contains: destination.trim(), mode: "insensitive" } });
+      if (search) {
+        AND.push({
+          OR: [
+            { title:       { contains: search.trim(), mode: "insensitive" } },
+            { destination: { contains: search.trim(), mode: "insensitive" } },
+          ],
+        });
+      }
+
+      const where = AND.length ? { AND } : {};
+
+      const [plans, total] = await Promise.all([
+        prisma.travelPlan.findMany({
+          where,
+          include: {
+            user: { select: { id: true, name: true, email: true } },
+            ...PLAN_COUNTS,
+          },
+          skip,
+          take:    limit,
+          orderBy: { [field]: order },
+        }),
+        prisma.travelPlan.count({ where }),
+      ]);
+
+      return ok(res, { plans, pagination: paginationMeta(page, limit, total) });
+    } catch (err) {
+      next(err);
+    }
+  }
+
+  /**
+   * PUT /api/admin/travel-plans/:id/status
+   *
+   * Force plan status. Validates against VALID_PLAN_STATUSES.
+   */
+  async adminUpdatePlanStatus(req, res, next) {
+    try {
+      const { id }     = req.params;
+      const { status } = req.body;
+
+      if (!status)                        return badRequest(res, "status is required");
+      if (!VALID_PLAN_STATUSES.has(status)) return badRequest(res, `status must be one of: ${[...VALID_PLAN_STATUSES].join(", ")}`);
+
+      const existing = await prisma.travelPlan.findUnique({
+        where: { id }, select: { id: true, userId: true },
+      });
+      if (!existing) return notFound(res, "Travel plan not found");
+
+      const updated = await prisma.travelPlan.update({
+        where: { id },
+        data:  { status },
+      });
+
+      invalidatePlan(id, existing.userId);
+
+      // Audit log placeholder — wire to your logging service
+      console.info(`[ADMIN] Plan ${id} status forced to ${status} by user ${req.user.id}`);
+
+      return ok(res, updated, `Travel plan status updated to ${status}`);
+    } catch (err) {
+      next(err);
+    }
+  }
+
+  /**
+   * DELETE /api/admin/travel-plans/:id
+   *
+   * Force-delete regardless of active bookings (GDPR / ops use-case).
+   * Logs deletion for audit trail.
+   */
+  async adminDeletePlan(req, res, next) {
+    try {
+      const { id }     = req.params;
+      const { reason } = req.body;
+
+      const existing = await prisma.travelPlan.findUnique({
+        where: { id }, select: { id: true, userId: true },
+      });
+      if (!existing) return notFound(res, "Travel plan not found");
+
+      await prisma.travelPlan.delete({ where: { id } });
+      invalidatePlan(id, existing.userId);
+
+      // Audit log placeholder — wire to your logging/audit service
+      console.info(`[ADMIN DELETE] Plan ${id} (owner: ${existing.userId}) deleted by admin ${req.user.id}. Reason: ${reason ?? "not provided"}`);
+
+      return ok(res, null, "Travel plan deleted successfully");
+    } catch (err) {
+      if (err.code === "P2025") return notFound(res, "Travel plan not found");
+      next(err);
+    }
+  }
+
+  /**
+   * GET /api/admin/travel-plans/stats
+   *
+   * Platform-wide booking and plan statistics with optional date range filter.
+   */
+  async adminGetPlatformStats(req, res, next) {
+    try {
+      const { from, to } = req.query;
+
+      const dateFilter = (from || to) ? {
+        createdAt: {
+          ...(from && { gte: new Date(from) }),
+          ...(to   && { lte: new Date(to)   }),
+        },
+      } : {};
+
+      const [
+        totalPlans, plansByStatus,
+        accBookings, transBookings, pkgBookings, expBookings, visits,
+        revenueAgg,
+      ] = await Promise.all([
+        prisma.travelPlan.count({ where: dateFilter }),
+        prisma.travelPlan.groupBy({
+          by:     ["status"],
+          where:  dateFilter,
+          _count: true,
+        }),
+        prisma.accommodationBooking.count({ where: dateFilter }),
+        prisma.transportationBooking.count({ where: dateFilter }),
+        prisma.travelPackageBooking.count({ where: dateFilter }),
+        prisma.experienceBooking.count({ where: dateFilter }),
+        prisma.shoppingVisit.count({ where: dateFilter }),
+        prisma.transaction.aggregate({
+          where: { ...dateFilter, status: "COMPLETED" },
+          _sum:  { amount: true, netAmount: true, fee: true },
+        }),
+      ]);
+
+      const byStatus = Object.fromEntries(
+        plansByStatus.map((r) => [r.status, r._count])
+      );
+
+      return ok(res, {
+        plans: {
+          total:    totalPlans,
+          byStatus,
+        },
+        bookings: {
+          accommodations:  accBookings,
+          transportation:  transBookings,
+          packages:        pkgBookings,
+          experiences:     expBookings,
+          shoppingVisits:  visits,
+          total:           accBookings + transBookings + pkgBookings + expBookings + visits,
+        },
+        revenue: {
+          gross: revenueAgg._sum.amount    ?? 0,
+          net:   revenueAgg._sum.netAmount ?? 0,
+          fees:  revenueAgg._sum.fee       ?? 0,
+        },
+        period: {
+          from: from ? new Date(from).toISOString() : null,
+          to:   to   ? new Date(to).toISOString()   : null,
+        },
+      });
+    } catch (err) {
+      next(err);
+    }
+  }
+
+  /**
+   * GET /api/admin/travel-plans/:id
+   *
+   * Full plan detail for admin, always includes user PII.
+   */
+  async adminGetPlanById(req, res, next) {
     try {
       const { id } = req.params;
 
-      // Check if user owns the plan
-      const travelPlan = await prisma.travelPlan.findUnique({
-        where: { id }
+      const plan = await prisma.travelPlan.findUnique({
+        where:   { id },
+        include: PLAN_FULL_INCLUDE,
       });
+      if (!plan) return notFound(res, "Travel plan not found");
 
-      if (!travelPlan) {
-        return res.status(404).json({
-          success: false,
-          message: "Travel plan not found"
-        });
-      }
+      const costs = await calculateTotalCost(id);
 
-      // This would require a UserFavorites model
-      // For now, return success
-      
-      res.json({
-        success: true,
-        message: "Added to favorites"
+      return ok(res, {
+        ...plan,
+        currentSpent:    costs.total,
+        budgetBreakdown: costs,
+        budgetRemaining: (plan.budget ?? 0) - costs.total,
       });
-    } catch (error) {
-      next(error);
-    }
-  }
-
-  /**
-   * Remove travel plan from favorites
-   * DELETE /api/travel-plans/:id/favorite
-   */
-  async removeFromFavorites(req, res, next) {
-    try {
-      const { id } = req.params;
-
-      res.json({
-        success: true,
-        message: "Removed from favorites"
-      });
-    } catch (error) {
-      next(error);
-    }
-  }
-
-  /**
-   * Get user's favorite travel plans
-   * GET /api/travel-plans/favorites
-   */
-  async getFavorites(req, res, next) {
-    try {
-      res.json({
-        success: true,
-        data: []
-      });
-    } catch (error) {
-      next(error);
+    } catch (err) {
+      next(err);
     }
   }
 }

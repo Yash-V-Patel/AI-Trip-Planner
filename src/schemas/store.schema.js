@@ -1,5 +1,7 @@
+// Updated schemas file: schemas/store.schema.js
 const Joi = require('joi');
 
+// Enums (aligned with controller)
 const storeTypeEnum = [
   'SHOPPING_MALL',
   'DEPARTMENT_STORE',
@@ -13,8 +15,9 @@ const storeTypeEnum = [
 
 const priceRangeEnum = ['BUDGET', 'MODERATE', 'EXPENSIVE', 'LUXURY'];
 const shoppingVisitStatusEnum = ['PLANNED', 'VISITED', 'SKIPPED', 'CANCELLED'];
+const dayOfWeekEnum = ['MONDAY', 'TUESDAY', 'WEDNESDAY', 'THURSDAY', 'FRIDAY', 'SATURDAY', 'SUNDAY'];
 
-// Create store schema
+// ==================== Core Store Schemas ====================
 const createStoreSchema = Joi.object({
   name: Joi.string().required().max(255),
   description: Joi.string().max(2000).allow(''),
@@ -42,13 +45,15 @@ const createStoreSchema = Joi.object({
   isActive: Joi.boolean().default(true)
 });
 
-// Update store schema
 const updateStoreSchema = createStoreSchema.fork(
   ['name', 'address', 'city', 'country'],
   (field) => field.optional()
 );
 
-// Store hours schema
+const toggleStoreStatusSchema = Joi.object({
+  isActive: Joi.boolean().required()
+});
+
 const storeHoursSchema = Joi.object({
   openingHours: Joi.object({
     monday: Joi.object({ open: Joi.string(), close: Joi.string() }),
@@ -61,7 +66,7 @@ const storeHoursSchema = Joi.object({
   }).required()
 });
 
-// Add product schema
+// ==================== Product Schemas ====================
 const addProductSchema = Joi.object({
   name: Joi.string().required().max(255),
   description: Joi.string().max(1000).allow(''),
@@ -77,18 +82,16 @@ const addProductSchema = Joi.object({
   tags: Joi.array().items(Joi.string())
 });
 
-// Bulk products schema
 const bulkProductsSchema = Joi.object({
   products: Joi.array().items(addProductSchema).min(1).max(1000).required()
 });
 
-// Update product schema
 const updateProductSchema = addProductSchema.fork(
   ['name', 'price'],
   (field) => field.optional()
 );
 
-// Create shopping visit schema
+// ==================== Shopping Visit Schemas ====================
 const createShoppingVisitSchema = Joi.object({
   storeId: Joi.string().required(),
   plannedDate: Joi.date().iso().required(),
@@ -99,10 +102,11 @@ const createShoppingVisitSchema = Joi.object({
     name: Joi.string(),
     quantity: Joi.number().integer().min(1),
     estimatedPrice: Joi.number().positive()
-  }))
+  })),
+  aiNotes: Joi.string().max(2000).allow(''),
+  recommendations: Joi.any()
 });
 
-// Update shopping visit schema
 const updateShoppingVisitSchema = Joi.object({
   plannedDate: Joi.date().iso(),
   actualVisitDate: Joi.date().iso(),
@@ -114,16 +118,23 @@ const updateShoppingVisitSchema = Joi.object({
     quantity: Joi.number().integer().min(1),
     estimatedPrice: Joi.number().positive()
   })),
-  status: Joi.string().valid(...shoppingVisitStatusEnum)
+  status: Joi.string().valid(...shoppingVisitStatusEnum),
+  aiNotes: Joi.string().max(2000).allow(''),
+  recommendations: Joi.any()
 }).min(1);
 
-// Store review schema
+// ==================== Review Schemas ====================
 const storeReviewSchema = Joi.object({
   rating: Joi.number().integer().min(1).max(5).required(),
   comment: Joi.string().max(1000)
 });
 
-// Nearby stores query schema
+// ==================== Query Schemas ====================
+const paginationQuerySchema = Joi.object({
+  page: Joi.number().integer().min(1).default(1),
+  limit: Joi.number().integer().min(1).max(100).default(20)
+});
+
 const nearbyStoresQuerySchema = Joi.object({
   lat: Joi.number().min(-90).max(90).required(),
   lng: Joi.number().min(-180).max(180).required(),
@@ -131,15 +142,82 @@ const nearbyStoresQuerySchema = Joi.object({
   limit: Joi.number().integer().min(1).max(50).default(20)
 });
 
+const storeProductsQuerySchema = Joi.object({
+  category: Joi.string(),
+  minPrice: Joi.number().positive(),
+  maxPrice: Joi.number().positive(),
+  page: Joi.number().integer().min(1).default(1),
+  limit: Joi.number().integer().min(1).max(100).default(20)
+});
+
+const myStoresQuerySchema = Joi.object({
+  status: Joi.string().valid('active', 'inactive'),
+  page: Joi.number().integer().min(1).default(1),
+  limit: Joi.number().integer().min(1).max(100).default(20)
+});
+
+const shoppingVisitsQuerySchema = Joi.object({
+  status: Joi.string().valid(...shoppingVisitStatusEnum),
+  page: Joi.number().integer().min(1).default(1),
+  limit: Joi.number().integer().min(1).max(100).default(20)
+});
+
+// ==================== Admin Schemas ====================
+const adminStoresQuerySchema = Joi.object({
+  vendorId: Joi.string(),
+  isActive: Joi.boolean(),
+  isVerified: Joi.boolean(),
+  city: Joi.string(),
+  country: Joi.string(),
+  storeType: Joi.string().valid(...storeTypeEnum),
+  search: Joi.string(),
+  sortBy: Joi.string().valid('createdAt', 'name', 'rating', 'city'),
+  sortOrder: Joi.string().valid('asc', 'desc'),
+  page: Joi.number().integer().min(1).default(1),
+  limit: Joi.number().integer().min(1).max(100).default(20)
+});
+
+const adminVerifyStoreSchema = Joi.object({
+  isVerified: Joi.boolean().required()
+});
+
+const adminStoreVisitsQuerySchema = Joi.object({
+  status: Joi.string().valid(...shoppingVisitStatusEnum),
+  from: Joi.date().iso(),
+  to: Joi.date().iso(),
+  page: Joi.number().integer().min(1).default(1),
+  limit: Joi.number().integer().min(1).max(100).default(20)
+});
+
+const adminUpdateVisitStatusSchema = Joi.object({
+  status: Joi.string().valid(...shoppingVisitStatusEnum).required(),
+  notes: Joi.string().max(1000)
+});
+
 module.exports = {
+  // Core
   createStoreSchema,
   updateStoreSchema,
+  toggleStoreStatusSchema,
   storeHoursSchema,
+  // Product
   addProductSchema,
   bulkProductsSchema,
   updateProductSchema,
+  // Shopping visit
   createShoppingVisitSchema,
   updateShoppingVisitSchema,
+  // Review
   storeReviewSchema,
-  nearbyStoresQuerySchema
+  // Query
+  paginationQuerySchema,
+  nearbyStoresQuerySchema,
+  storeProductsQuerySchema,
+  myStoresQuerySchema,
+  shoppingVisitsQuerySchema,
+  // Admin
+  adminStoresQuerySchema,
+  adminVerifyStoreSchema,
+  adminStoreVisitsQuerySchema,
+  adminUpdateVisitStatusSchema
 };

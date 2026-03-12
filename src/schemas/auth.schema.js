@@ -39,15 +39,12 @@ const registerSchema = Joi.object({
       'any.required': 'Name is required'
     }),
   
-  phone: Joi.number()
-    .integer()
-    .min(1000000000)
-    .max(9999999999)
+  // Changed to string with pattern for a 10-digit number (accepts leading zeros)
+  phone: Joi.string()
+    .pattern(/^\d{10}$/)
     .required()
     .messages({
-      'number.base': 'Phone must be a number',
-      'number.min': 'Please provide a valid 10-digit phone number',
-      'number.max': 'Please provide a valid 10-digit phone number',
+      'string.pattern.base': 'Please provide a valid 10-digit phone number',
       'any.required': 'Phone number is required'
     })
 });
@@ -140,11 +137,23 @@ const resetPasswordSchema = Joi.object({
     })
 });
 
+// NEW schema for resendVerificationEmail
+const resendVerificationSchema = Joi.object({
+  email: Joi.string()
+    .email()
+    .required()
+    .messages({
+      'string.email': 'Please provide a valid email address',
+      'any.required': 'Email is required'
+    })
+});
+
 module.exports = {
   registerSchema,
   loginSchema,
   refreshTokenSchema,
   changePasswordSchema,
   forgotPasswordSchema,
-  resetPasswordSchema
+  resetPasswordSchema,
+  resendVerificationSchema,  
 };

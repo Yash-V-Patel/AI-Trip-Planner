@@ -1,3 +1,4 @@
+// Updated schemas file: schemas/vendor.schema.js
 const Joi = require('joi');
 
 const vendorTypeEnum = [
@@ -15,7 +16,8 @@ const payoutMethodEnum = ['BANK_TRANSFER', 'PAYPAL', 'STRIPE'];
 const payoutStatusEnum = ['PENDING', 'PROCESSING', 'COMPLETED', 'FAILED', 'CANCELLED'];
 const transactionStatusEnum = ['PENDING', 'PROCESSING', 'COMPLETED', 'FAILED', 'REFUNDED', 'CANCELLED'];
 
-// Register vendor schema
+// ==================== BODY SCHEMAS ====================
+
 const registerVendorSchema = Joi.object({
   businessName: Joi.string().required().max(255),
   businessRegNumber: Joi.string().max(100).allow(''),
@@ -32,7 +34,6 @@ const registerVendorSchema = Joi.object({
   additionalInfo: Joi.string().max(1000).allow('')
 });
 
-// Update vendor profile schema
 const updateVendorProfileSchema = Joi.object({
   businessName: Joi.string().max(255),
   businessAddress: Joi.string().max(500),
@@ -48,7 +49,6 @@ const updateVendorProfileSchema = Joi.object({
   linkedInUrl: Joi.string().uri().allow('')
 }).min(1);
 
-// Document upload schema
 const documentUploadSchema = Joi.object({
   documentType: Joi.string().required().max(100),
   documentUrl: Joi.string().uri().required(),
@@ -60,21 +60,18 @@ const documentUploadSchema = Joi.object({
   mimeType: Joi.string().max(100)
 });
 
-// Add team member schema
 const addTeamMemberSchema = Joi.object({
   email: Joi.string().email().required(),
   role: Joi.string().valid(...teamRoleEnum).required(),
   permissions: Joi.object()
 });
 
-// Update team member schema
 const updateTeamMemberSchema = Joi.object({
   role: Joi.string().valid(...teamRoleEnum),
   permissions: Joi.object(),
   isActive: Joi.boolean()
 }).min(1);
 
-// Payout request schema
 const payoutRequestSchema = Joi.object({
   amount: Joi.number().positive().precision(2).required(),
   payoutMethod: Joi.string().valid(...payoutMethodEnum).required(),
@@ -89,36 +86,90 @@ const payoutRequestSchema = Joi.object({
   }).required()
 });
 
-// Reply to review schema
 const replyToReviewSchema = Joi.object({
   response: Joi.string().required().max(1000)
 });
 
-// Admin: Verify vendor schema
 const verifyVendorSchema = Joi.object({
   approvedTypes: Joi.array().items(Joi.string().valid(...vendorTypeEnum)).min(1).required(),
   notes: Joi.string().max(500).allow('')
 });
 
-// Admin: Suspend vendor schema
 const suspendVendorSchema = Joi.object({
   reason: Joi.string().required().max(500),
   duration: Joi.number().integer().min(3600000) // Minimum 1 hour in ms
 });
 
-// Admin: Update commission schema
 const updateCommissionSchema = Joi.object({
   commissionRate: Joi.number().min(0).max(100).precision(2).required()
 });
 
-// Admin: Process payout schema
 const processPayoutSchema = Joi.object({
   status: Joi.string().valid('PROCESSING', 'COMPLETED', 'FAILED', 'CANCELLED').required(),
   processorResponse: Joi.object(),
   failureReason: Joi.string().when('status', { is: 'FAILED', then: Joi.required() })
 });
 
+// ==================== QUERY SCHEMAS ====================
+
+const analyticsQuerySchema = Joi.object({
+  from: Joi.date().iso(),
+  to: Joi.date().iso().greater(Joi.ref('from'))
+});
+
+const transactionsQuerySchema = Joi.object({
+  status: Joi.string().valid(...transactionStatusEnum),
+  page: Joi.number().integer().min(1).default(1),
+  limit: Joi.number().integer().min(1).max(100).default(20)
+});
+
+const payoutsQuerySchema = Joi.object({
+  status: Joi.string().valid(...payoutStatusEnum),
+  page: Joi.number().integer().min(1).default(1),
+  limit: Joi.number().integer().min(1).max(100).default(20)
+});
+
+const reviewsQuerySchema = Joi.object({
+  page: Joi.number().integer().min(1).default(1),
+  limit: Joi.number().integer().min(1).max(100).default(10)
+});
+
+const adminVendorsQuerySchema = Joi.object({
+  type: Joi.string().valid(...vendorTypeEnum),
+  status: Joi.string().valid('PENDING', 'DOCUMENTS_SUBMITTED', 'UNDER_REVIEW', 'VERIFIED', 'REJECTED'),
+  verified: Joi.boolean(),
+  isActive: Joi.boolean(),
+  search: Joi.string().max(100),
+  sortBy: Joi.string().valid('createdAt', 'businessName', 'verificationStatus', 'balance'),
+  sortOrder: Joi.string().valid('asc', 'desc'),
+  page: Joi.number().integer().min(1).default(1),
+  limit: Joi.number().integer().min(1).max(100).default(20)
+});
+
+// ==================== PARAM SCHEMAS ====================
+
+const documentIdParamSchema = Joi.object({
+  documentId: Joi.string().required()
+});
+
+const memberIdParamSchema = Joi.object({
+  memberId: Joi.string().required()
+});
+
+const reviewIdParamSchema = Joi.object({
+  reviewId: Joi.string().required()
+});
+
+const vendorIdParamSchema = Joi.object({
+  vendorId: Joi.string().required()
+});
+
+const payoutIdParamSchema = Joi.object({
+  payoutId: Joi.string().required()
+});
+
 module.exports = {
+  // Body schemas
   registerVendorSchema,
   updateVendorProfileSchema,
   documentUploadSchema,
@@ -129,5 +180,17 @@ module.exports = {
   verifyVendorSchema,
   suspendVendorSchema,
   updateCommissionSchema,
-  processPayoutSchema
+  processPayoutSchema,
+  // Query schemas
+  analyticsQuerySchema,
+  transactionsQuerySchema,
+  payoutsQuerySchema,
+  reviewsQuerySchema,
+  adminVendorsQuerySchema,
+  // Param schemas
+  documentIdParamSchema,
+  memberIdParamSchema,
+  reviewIdParamSchema,
+  vendorIdParamSchema,
+  payoutIdParamSchema
 };

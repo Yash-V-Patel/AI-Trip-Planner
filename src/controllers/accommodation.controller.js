@@ -1,575 +1,346 @@
+"use strict";
+
 const { PrismaClient } = require("@prisma/client");
 const openfgaService = require("../services/openfga.service");
 const redisService = require("../services/redis.service");
 
 const prisma = new PrismaClient();
 
+// ---------------------------------------------------------------------------
+// Constants
+// ---------------------------------------------------------------------------
+
+const ACCOMMODATION_CACHE_TTL_S = 3600; // 1 hour
+const DEFAULT_PAGE  = 1;
+const DEFAULT_LIMIT = 10;
+
+// BookingStatus enum values used for grouping
+const ACTIVE_BOOKING_STATUSES   = ["PENDING", "CONFIRMED", "CHECKED_IN"];
+const TERMINAL_BOOKING_STATUSES = ["CANCELLED", "CHECKED_OUT", "NO_SHOW"];
+
+const ALLOWED_SORT_FIELDS = new Set([
+  "createdAt", "name", "starRating", "overallRating", "city",
+]);
+
+// PriceCategory enum: BUDGET | MIDRANGE | LUXURY | BOUTIQUE
+// FIX: original returned "EXPENSIVE" which does not exist in the enum
+const PRICE_CATEGORY_THRESHOLDS = [
+  { max: 3000,  category: "BUDGET"   },
+  { max: 7000,  category: "MIDRANGE" },
+  { max: 15000, category: "LUXURY"   },
+];
+
+// ---------------------------------------------------------------------------
+// Module-level helpers (mirrors vendor controller pattern)
+// ---------------------------------------------------------------------------
+
+const notFound   = (res, msg = "Resource not found") => res.status(404).json({ success: false, message: msg });
+const forbidden  = (res, msg = "Unauthorized access") => res.status(403).json({ success: false, message: msg });
+const badRequest = (res, msg) => res.status(400).json({ success: false, message: msg });
+
+const parseIntParam = (val, fallback) => {
+  const n = parseInt(val, 10);
+  return Number.isFinite(n) && n > 0 ? n : fallback;
+};
+
+const parsePagination = (query, defaultLimit = DEFAULT_LIMIT) => {
+  const page  = parseIntParam(query.page,  DEFAULT_PAGE);
+  const limit = parseIntParam(query.limit, defaultLimit);
+  return { page, limit, skip: (page - 1) * limit };
+};
+
+const buildPaginationMeta = (page, limit, total) => ({
+  page, limit, total, pages: Math.ceil(total / limit),
+});
+
+/** Map a numeric max-price to the correct PriceCategory enum value. */
+const getPriceCategoryFromMax = (maxPrice) => {
+  for (const { max, category } of PRICE_CATEGORY_THRESHOLDS) {
+    if (maxPrice < max) return category;
+  }
+  return "BOUTIQUE";
+};
+
+/**
+ * Invalidate both the single-accommodation cache entry and the list cache pattern.
+ * Fire-and-forget — never blocks a response.
+ */
+const invalidateAccommodationCache = (accommodationId) =>
+  Promise.allSettled([
+    redisService.client?.del(`accommodation:${accommodationId}`),
+    // FIX: Redis `del` does not support globs; use deletePattern for wildcard invalidation
+    redisService.deletePattern?.("accommodations:list:*"),
+  ]);
+
+// ---------------------------------------------------------------------------
+// Permission helpers (extracted from class — no `this` needed, easier to test)
+// ---------------------------------------------------------------------------
+
+/**
+ * Returns the vendor record (id only) for a user IF the vendor is verified and active.
+ * Returns null otherwise.
+ */
+const getActiveVendor = (userId) =>
+  prisma.vendor.findFirst({
+    where:  { userId, verificationStatus: "VERIFIED", isActive: true },
+    select: { id: true },
+  });
+
+/**
+ * Decide whether `user` may manage `accommodationId`.
+ *
+ * - SuperAdmin   → always yes
+ * - No id given  → creation guard: must be an approved vendor
+ * - id given     → ownership check, then OpenFGA team-member fallback
+ *
+ * BUG FIX (canManageAccommodation): original `canManageRoom` compared
+ * `accommodation.vendorId` (Vendor.id) to `user.id` (User.id) — different
+ * ID spaces. Fixed: both helpers now fetch the vendor record first.
+ */
+const canManageAccommodation = async (user, accommodationId = null, action = "view") => {
+  if (user?.isSuperAdmin) return true;
+
+  if (!accommodationId) {
+    // For creation: user must be an active, verified vendor
+    const vendor = await getActiveVendor(user?.id);
+    return !!vendor;
+  }
+
+  const [vendor, accommodation] = await Promise.all([
+    prisma.vendor.findUnique({ where: { userId: user?.id }, select: { id: true } }),
+    prisma.accommodation.findUnique({ where: { id: accommodationId }, select: { vendorId: true } }),
+  ]);
+
+  if (!accommodation) return false;
+
+  // Vendor owns this accommodation
+  if (vendor && accommodation.vendorId === vendor.id) {
+    if (action === "delete") {
+      const activeCount = await prisma.accommodationBooking.count({
+        where: { accommodationId, bookingStatus: { in: ACTIVE_BOOKING_STATUSES } },
+      });
+      return activeCount === 0;
+    }
+    return true;
+  }
+
+  // OpenFGA fallback (team-member access, etc.)
+  const fgaFns = {
+    delete: openfgaService.canDeleteAccommodation,
+    update: openfgaService.canEditAccommodation,
+    edit:   openfgaService.canEditAccommodation,
+    view:   openfgaService.canViewAccommodation,
+  };
+  return !!(await fgaFns[action]?.(user?.id, accommodationId).catch(() => false));
+};
+
+/** Same ownership-bug fix applied to room management. */
+const canManageRoom = async (user, accommodationId, roomId = null, action = "view") => {
+  if (user?.isSuperAdmin) return true;
+
+  const [vendor, accommodation] = await Promise.all([
+    prisma.vendor.findUnique({ where: { userId: user?.id }, select: { id: true } }),
+    prisma.accommodation.findUnique({ where: { id: accommodationId }, select: { vendorId: true } }),
+  ]);
+
+  // FIX: compare vendor.id ↔ accommodation.vendorId, NOT user.id ↔ accommodation.vendorId
+  if (vendor && accommodation?.vendorId === vendor.id) return true;
+
+  if (!roomId) {
+    return !!(await openfgaService.canManageAccommodationRooms?.(user?.id, accommodationId).catch(() => false));
+  }
+
+  const fgaFns = {
+    delete: openfgaService.canDeleteRoom,
+    edit:   openfgaService.canEditRoom,
+    view:   openfgaService.canViewRoom,
+  };
+  return !!(await fgaFns[action]?.(user?.id, roomId).catch(() => false));
+};
+
+/** Same ownership-bug fix applied to service management. */
+const canManageService = async (user, accommodationId, serviceId = null, action = "view") => {
+  if (user?.isSuperAdmin) return true;
+
+  const [vendor, accommodation] = await Promise.all([
+    prisma.vendor.findUnique({ where: { userId: user?.id }, select: { id: true } }),
+    prisma.accommodation.findUnique({ where: { id: accommodationId }, select: { vendorId: true } }),
+  ]);
+
+  if (vendor && accommodation?.vendorId === vendor.id) return true;
+
+  if (!serviceId) {
+    return !!(await openfgaService.canManageAccommodationServices?.(user?.id, accommodationId).catch(() => false));
+  }
+
+  const fgaFns = {
+    delete: openfgaService.canDeleteService,
+    edit:   openfgaService.canEditService,
+    view:   openfgaService.canViewService,
+  };
+  return !!(await fgaFns[action]?.(user?.id, serviceId).catch(() => false));
+};
+
+// ---------------------------------------------------------------------------
+// Controller
+// ---------------------------------------------------------------------------
+
 class AccommodationController {
-  constructor() {
-    // Bind all methods to ensure 'this' works correctly
-    this.createAccommodation = this.createAccommodation.bind(this);
-    this.getAllAccommodations = this.getAllAccommodations.bind(this);
-    this.getAccommodationById = this.getAccommodationById.bind(this);
-    this.updateAccommodation = this.updateAccommodation.bind(this);
-    this.deleteAccommodation = this.deleteAccommodation.bind(this);
-    this.addRoom = this.addRoom.bind(this);
-    this.updateRoom = this.updateRoom.bind(this);
-    this.deleteRoom = this.deleteRoom.bind(this);
-    this.addService = this.addService.bind(this);
-    this.updateService = this.updateService.bind(this);
-    this.deleteService = this.deleteService.bind(this);
-    this.createBooking = this.createBooking.bind(this);
-    this.getBookingById = this.getBookingById.bind(this);
-    this.updateBooking = this.updateBooking.bind(this);
-    this.cancelBooking = this.cancelBooking.bind(this);
-    this.getAvailableRooms = this.getAvailableRooms.bind(this);
-    this.canManageAccommodation = this.canManageAccommodation.bind(this);
-    this.canManageRoom = this.canManageRoom.bind(this);
-    this.canManageService = this.canManageService.bind(this);
-    this.checkTravelPlanPermission = this.checkTravelPlanPermission.bind(this);
-    this.getPriceCategoryFromMax = this.getPriceCategoryFromMax.bind(this);
-    this.checkIsVendor = this.checkIsVendor.bind(this);
-  }
-
-  // ==================== HELPER METHODS ====================
-
-  /**
-   * Check if user has permission for travel plan operations
-   */
-  async checkTravelPlanPermission(userId, travelPlanId, requiredPermission) {
-    // SuperAdmin always has access
-    if (this.req?.user?.isSuperAdmin) return true;
-
-    try {
-      switch (requiredPermission) {
-        case "edit":
-          return (
-            (await openfgaService.canEditTravelPlan?.(userId, travelPlanId)) ||
-            false
-          );
-        case "view":
-          return (
-            (await openfgaService.canViewTravelPlan?.(userId, travelPlanId)) ||
-            false
-          );
-        case "suggest":
-          return (
-            (await openfgaService.canSuggestTravelPlan?.(
-              userId,
-              travelPlanId,
-            )) || false
-          );
-        default:
-          return false;
-      }
-    } catch (error) {
-      console.error("Error checking travel plan permission:", error);
-      return false;
-    }
-  }
-
-  /**
-   * Check if user is an approved vendor
-   */
-  async checkIsVendor(userId) {
-    try {
-      if (!userId) return false;
-
-      const vendor = await prisma.vendor.findUnique({
-        where: {
-          userId,
-          verificationStatus: "VERIFIED",
-          isActive: true,
-        },
-      });
-
-      return !!vendor;
-    } catch (error) {
-      console.error("Error checking vendor status:", error);
-      return false;
-    }
-  }
-
-  /**
-   * Check if user can manage accommodation (create/update/delete)
-   * SuperAdmin always has access
-   * Vendor has access to their own accommodations
-   */
-  async canManageAccommodation(user, accommodationId = null, action = "view") {
-    try {
-      // SuperAdmin always has access
-      if (user?.isSuperAdmin) return true;
-
-      if (!accommodationId) {
-        // Creating new accommodation - check if user is an approved vendor
-        const isVendor = await this.checkIsVendor(user?.id);
-        return isVendor;
-      }
-
-      // For existing accommodations, first get the vendor record for this user
-      const vendor = await prisma.vendor.findUnique({
-        where: { userId: user?.id },
-      });
-
-      if (!vendor) return false;
-
-      // Get the accommodation to check ownership
-      const accommodation = await prisma.accommodation.findUnique({
-        where: { id: accommodationId },
-        select: { vendorId: true },
-      });
-
-      if (!accommodation) return false;
-
-      // If user is the vendor who owns this accommodation
-      if (accommodation.vendorId === vendor.id) {
-        if (action === "delete") {
-          // Check if accommodation has any active bookings
-          const activeBookings = await prisma.accommodationBooking.count({
-            where: {
-              accommodationId,
-              bookingStatus: { in: ["PENDING", "CONFIRMED", "CHECKED_IN"] },
-            },
-          });
-          return activeBookings === 0;
-        }
-        return true; // Vendors can view, edit, update their own
-      }
-
-      // Check OpenFGA permissions for other cases
-      switch (action) {
-        case "delete":
-          return (
-            (await openfgaService.canDeleteAccommodation?.(
-              user?.id,
-              accommodationId,
-            )) || false
-          );
-        case "update":
-          return (
-            (await openfgaService.canUpdateAccommodation?.(
-              user?.id,
-              accommodationId,
-            )) || false
-          );
-        case "edit":
-          return (
-            (await openfgaService.canEditAccommodation?.(
-              user?.id,
-              accommodationId,
-            )) || false
-          );
-        case "view":
-          return (
-            (await openfgaService.canViewAccommodation?.(
-              user?.id,
-              accommodationId,
-            )) || false
-          );
-        default:
-          return false;
-      }
-    } catch (error) {
-      console.error("Error in canManageAccommodation:", error);
-      return false;
-    }
-  }
-
-  /**
-   * Check if user can manage rooms
-   * SuperAdmin always has access
-   * Vendor can manage rooms in their own accommodations
-   */
-  async canManageRoom(user, accommodationId, roomId = null, action = "view") {
-    try {
-      // SuperAdmin always has access
-      if (user?.isSuperAdmin) return true;
-
-      // First check if user is the vendor who owns this accommodation
-      const accommodation = await prisma.accommodation.findUnique({
-        where: { id: accommodationId },
-        select: { vendorId: true },
-      });
-
-      if (accommodation?.vendorId === user?.id) {
-        return true; // Vendors can manage rooms in their own accommodations
-      }
-
-      if (roomId) {
-        // Check specific room permissions
-        switch (action) {
-          case "delete":
-            return (
-              (await openfgaService.canDeleteRoom?.(user?.id, roomId)) || false
-            );
-          case "edit":
-            return (
-              (await openfgaService.canEditRoom?.(user?.id, roomId)) || false
-            );
-          case "view":
-            return (
-              (await openfgaService.canViewRoom?.(user?.id, roomId)) || false
-            );
-          default:
-            return false;
-        }
-      } else {
-        // Check if user can manage rooms in this accommodation
-        return (
-          (await openfgaService.canManageAccommodationRooms?.(
-            user?.id,
-            accommodationId,
-          )) || false
-        );
-      }
-    } catch (error) {
-      console.error("Error in canManageRoom:", error);
-      return false;
-    }
-  }
-
-  /**
-   * Check if user can manage services
-   * SuperAdmin always has access
-   * Vendor can manage services in their own accommodations
-   */
-  async canManageService(
-    user,
-    accommodationId,
-    serviceId = null,
-    action = "view",
-  ) {
-    try {
-      // SuperAdmin always has access
-      if (user?.isSuperAdmin) return true;
-
-      // First check if user is the vendor who owns this accommodation
-      const accommodation = await prisma.accommodation.findUnique({
-        where: { id: accommodationId },
-        select: { vendorId: true },
-      });
-
-      if (accommodation?.vendorId === user?.id) {
-        return true; // Vendors can manage services in their own accommodations
-      }
-
-      if (serviceId) {
-        // Check specific service permissions
-        switch (action) {
-          case "delete":
-            return (
-              (await openfgaService.canDeleteService?.(user?.id, serviceId)) ||
-              false
-            );
-          case "edit":
-            return (
-              (await openfgaService.canEditService?.(user?.id, serviceId)) ||
-              false
-            );
-          case "view":
-            return (
-              (await openfgaService.canViewService?.(user?.id, serviceId)) ||
-              false
-            );
-          default:
-            return false;
-        }
-      } else {
-        // Check if user can manage services in this accommodation
-        return (
-          (await openfgaService.canManageAccommodationServices?.(
-            user?.id,
-            accommodationId,
-          )) || false
-        );
-      }
-    } catch (error) {
-      console.error("Error in canManageService:", error);
-      return false;
-    }
-  }
 
   // ==================== ACCOMMODATION MANAGEMENT ====================
 
   /**
-   * Create a new accommodation
    * POST /api/accommodations
+   * Create — approved vendors only
    */
   async createAccommodation(req, res, next) {
     try {
-      // Check permission
-      const canManage = await this.canManageAccommodation(req.user);
-      if (!canManage) {
-        return res.status(403).json({
-          success: false,
-          message: "Only approved vendors can create accommodations",
-        });
-      }
+      const canCreate = await canManageAccommodation(req.user);
+      if (!canCreate) return forbidden(res, "Only approved vendors can create accommodations");
 
-      // Get the vendor record
       const vendor = await prisma.vendor.findUnique({
-        where: { userId: req.user.id },
+        where:  { userId: req.user.id },
+        select: { id: true },
       });
 
-      if (!vendor) {
-        return res.status(403).json({
-          success: false,
-          message: "Vendor record not found",
-        });
-      }
+      if (!vendor) return forbidden(res, "Vendor record not found");
 
-      const accommodationData = req.body;
+      const {
+        name, description, address, city, country, latitude, longitude,
+        phone, email, website, starRating, accommodationType, priceCategory,
+        amenities, images, checkInTime, checkOutTime, policies, cancellationPolicy,
+      } = req.body;
 
-      // Convert phone to string if present
-      if (accommodationData.phone) {
-        accommodationData.phone = String(accommodationData.phone);
-      }
-
-      // Add vendorId from the vendor record
-      accommodationData.vendorId = vendor.id;
-
+      // Sparse create — only include explicitly provided fields
       const accommodation = await prisma.accommodation.create({
-        data: accommodationData,
-        include: {
-          rooms: true,
-          services: true,
+        data: {
+          vendorId: vendor.id,
+          name, description, address, city, country,
+          ...(latitude          !== undefined && { latitude }),
+          ...(longitude         !== undefined && { longitude }),
+          ...(phone             !== undefined && { phone: String(phone) }),
+          ...(email             !== undefined && { email }),
+          ...(website           !== undefined && { website }),
+          ...(starRating        !== undefined && { starRating }),
+          ...(accommodationType !== undefined && { accommodationType }),
+          ...(priceCategory     !== undefined && { priceCategory }),
+          amenities:          amenities  ?? [],
+          images:             images     ?? [],
+          ...(checkInTime       !== undefined && { checkInTime }),
+          ...(checkOutTime      !== undefined && { checkOutTime }),
+          ...(policies          !== undefined && { policies }),
+          ...(cancellationPolicy !== undefined && { cancellationPolicy }),
         },
+        include: { rooms: true, services: true },
       });
 
-      // Set up OpenFGA relations
-      if (openfgaService.createAccommodationRelations) {
-        await openfgaService.createAccommodationRelations(
-          req.user.id,
-          accommodation.id,
-        );
-      }
+      // OpenFGA + list-cache invalidation (fire-and-forget)
+      Promise.allSettled([
+        openfgaService.createAccommodationRelations(req.user.id, accommodation.id),
+        redisService.deletePattern?.("accommodations:list:*"),
+      ]);
 
-      // Invalidate accommodations list cache
-      await redisService.client?.del("accommodations:list:*");
-
-      res.status(201).json({
+      return res.status(201).json({
         success: true,
         data: accommodation,
         message: "Accommodation created successfully",
       });
     } catch (error) {
       if (error.code === "P2002" && error.meta?.target?.includes("name")) {
-        return res.status(409).json({
-          success: false,
-          message: "Accommodation with this name already exists",
-        });
+        return res.status(409).json({ success: false, message: "Accommodation with this name already exists" });
       }
       next(error);
     }
   }
-/**
- * Get all accommodations with filtering
- * GET /api/accommodations
- * Access: Public
- */
-async getAllAccommodations(req, res, next) {
-  try {
-    const {
-      location,     // New: search by location (city or area)
-      city,
-      country,
-      type,
-      minRating,
-      maxPrice,
-      search,
-      sortBy = 'createdAt',
-      sortOrder = 'desc',
-      page = 1,
-      limit = 10,
-    } = req.query;
-
-    // Build filter
-    const where = {
-      isActive: true // Only show active accommodations
-    };
-
-    // NEW: Enhanced location search
-    if (location) {
-      // Search across multiple fields
-      where.OR = [
-        { city: { contains: location, mode: 'insensitive' } },
-        { address: { contains: location, mode: 'insensitive' } },
-        { name: { contains: location, mode: 'insensitive' } }
-      ];
-    } else {
-      // Original filters
-      if (city) {
-        where.city = {
-          contains: city,
-          mode: 'insensitive'
-        };
-      }
-      
-      if (country) {
-        where.country = {
-          contains: country,
-          mode: 'insensitive'
-        };
-      }
-    }
-    
-    if (type) {
-      where.accommodationType = type;
-    }
-    
-    if (minRating) {
-      where.starRating = {
-        gte: parseInt(minRating)
-      };
-    }
-    
-    // Search by name or description
-    if (search) {
-      where.OR = [
-        { name: { contains: search, mode: 'insensitive' } },
-        { description: { contains: search, mode: 'insensitive' } }
-      ];
-    }
-
-    // Price filter (by price category)
-    if (maxPrice) {
-      const priceCategory = this.getPriceCategoryFromMax(parseInt(maxPrice));
-      where.priceCategory = priceCategory;
-    }
-
-    const skip = (parseInt(page) - 1) * parseInt(limit);
-
-    // Build sorting
-    const orderBy = {};
-    orderBy[sortBy] = sortOrder;
-
-    console.log('Accommodation query where:', JSON.stringify(where, null, 2));
-
-    const [accommodations, total] = await Promise.all([
-      prisma.accommodation.findMany({
-        where,
-        include: {
-          rooms: {
-            where: { isAvailable: true },
-            take: 3,
-            select: {
-              id: true,
-              roomNumber: true,
-              roomType: true,
-              basePrice: true,
-              maxOccupancy: true,
-              isAvailable: true
-            }
-          },
-          _count: {
-            select: {
-              rooms: true,
-              bookings: true,
-            },
-          },
-        },
-        skip,
-        take: parseInt(limit),
-        orderBy,
-      }),
-      prisma.accommodation.count({ where }),
-    ]);
-
-    // Format the response
-    const formattedAccommodations = accommodations.map(acc => ({
-      ...acc,
-      availableRooms: acc.rooms.length,
-      cheapestRoom: acc.rooms.length > 0 
-        ? Math.min(...acc.rooms.map(r => r.basePrice)) 
-        : null,
-      roomTypes: [...new Set(acc.rooms.map(r => r.roomType))],
-    }));
-
-    const response = {
-      success: true,
-      data: formattedAccommodations,
-      pagination: {
-        page: parseInt(page),
-        limit: parseInt(limit),
-        total,
-        pages: Math.ceil(total / parseInt(limit)),
-      },
-      filters: {
-        location: location || null,
-        city: city || null,
-        country: country || null,
-        type: type || null,
-        minRating: minRating || null,
-        maxPrice: maxPrice || null,
-      }
-    };
-
-    res.json(response);
-  } catch (error) {
-    console.error('Error in getAllAccommodations:', error);
-    next(error);
-  }
-}
 
   /**
-   * Get accommodation by ID
-   * GET /api/accommodations/:id
-   * Access: Public
+   * GET /api/accommodations
+   * Public listing with filtering, search, pagination, and sort whitelisting
+   *
+   * FIX: `location` and `search` both previously set `where.OR`, so search
+   *      silently overwrote location. Rebuilt using an AND[] array.
    */
-  async getAccommodationById(req, res, next) {
+  async getAllAccommodations(req, res, next) {
     try {
-      const { id } = req.params;
+      const {
+        location, city, country, type, minRating, maxPrice, search,
+        sortBy = "createdAt", sortOrder = "desc",
+      } = req.query;
+      const { page, limit, skip } = parsePagination(req.query);
 
-      // Try cache first
-      const cacheKey = `accommodation:${id}`;
-      let accommodation = await redisService.client?.get(cacheKey);
+      const safeSortBy    = ALLOWED_SORT_FIELDS.has(sortBy) ? sortBy : "createdAt";
+      const safeSortOrder = sortOrder === "asc" ? "asc" : "desc";
 
-      if (accommodation && !req.query.skipCache) {
-        return res.json({
-          success: true,
-          data: JSON.parse(accommodation),
-          cached: true,
+      // Build all conditions as AND clauses to prevent any OR overwrite
+      const AND = [{ isActive: true }];
+
+      if (location) {
+        AND.push({
+          OR: [
+            { city:    { contains: location, mode: "insensitive" } },
+            { address: { contains: location, mode: "insensitive" } },
+            { name:    { contains: location, mode: "insensitive" } },
+          ],
+        });
+      } else {
+        if (city)    AND.push({ city:    { contains: city,    mode: "insensitive" } });
+        if (country) AND.push({ country: { contains: country, mode: "insensitive" } });
+      }
+
+      if (type)      AND.push({ accommodationType: type });
+      if (minRating) AND.push({ starRating: { gte: parseIntParam(minRating, 1) } });
+      if (maxPrice)  AND.push({ priceCategory: getPriceCategoryFromMax(parseIntParam(maxPrice, 0)) });
+
+      // Keyword search is its own AND clause — never overwrites location filter
+      if (search) {
+        AND.push({
+          OR: [
+            { name:        { contains: search, mode: "insensitive" } },
+            { description: { contains: search, mode: "insensitive" } },
+          ],
         });
       }
 
-      accommodation = await prisma.accommodation.findUnique({
-        where: { id },
-        include: {
-          rooms: {
-            where: { isAvailable: true },
-            orderBy: { basePrice: "asc" },
+      const [accommodations, total] = await Promise.all([
+        prisma.accommodation.findMany({
+          where: { AND },
+          include: {
+            rooms: {
+              where: { isAvailable: true },
+              take: 3,
+              select: {
+                id: true, roomNumber: true, roomType: true,
+                basePrice: true, maxOccupancy: true, isAvailable: true,
+              },
+            },
+            _count: { select: { rooms: true, bookings: true } },
           },
-          services: {
-            where: { isAvailable: true },
-          },
-        },
-      });
+          skip,
+          take: limit,
+          orderBy: { [safeSortBy]: safeSortOrder },
+        }),
+        prisma.accommodation.count({ where: { AND } }),
+      ]);
 
-      if (!accommodation) {
-        return res.status(404).json({
-          success: false,
-          message: "Accommodation not found",
-        });
-      }
+      const data = accommodations.map((acc) => ({
+        ...acc,
+        availableRooms: acc.rooms.length,
+        cheapestRoom:   acc.rooms.length > 0 ? Math.min(...acc.rooms.map((r) => r.basePrice)) : null,
+        roomTypes:      [...new Set(acc.rooms.map((r) => r.roomType))],
+      }));
 
-      // Check if accommodation is active
-      if (!accommodation.isActive) {
-        return res.status(403).json({
-          success: false,
-          message: "This accommodation is currently unavailable",
-        });
-      }
-
-      // Cache for 1 hour
-      await redisService.client?.setex(
-        cacheKey,
-        3600,
-        JSON.stringify(accommodation),
-      );
-
-      res.json({
+      return res.json({
         success: true,
-        data: accommodation,
+        data,
+        pagination: buildPaginationMeta(page, limit, total),
+        filters: {
+          location: location ?? null,
+          city:     city     ?? null,
+          country:  country  ?? null,
+          type:     type     ?? null,
+          minRating: minRating ?? null,
+          maxPrice:  maxPrice  ?? null,
+        },
       });
     } catch (error) {
       next(error);
@@ -577,128 +348,241 @@ async getAllAccommodations(req, res, next) {
   }
 
   /**
-   * Update accommodation
+   * GET /api/accommodations/:id
+   * Public — returns accommodation with active rooms, services, and vendor summary
+   * FIX: inactive accommodation now returns 404 instead of 403 (don't leak existence)
+   */
+  async getAccommodationById(req, res, next) {
+    try {
+      const { id } = req.params;
+      const skipCache = req.query.skipCache === "true";
+
+      if (!skipCache) {
+        const cached = await redisService.client?.get(`accommodation:${id}`).catch(() => null);
+        if (cached) return res.json({ success: true, data: JSON.parse(cached), cached: true });
+      }
+
+      const accommodation = await prisma.accommodation.findUnique({
+        where: { id },
+        include: {
+          rooms:    { where: { isAvailable: true }, orderBy: { basePrice: "asc" } },
+          services: { where: { isAvailable: true } },
+          vendor: {
+            select: { id: true, businessName: true, overallRating: true, businessEmail: true },
+          },
+        },
+      });
+
+      if (!accommodation || !accommodation.isActive) return notFound(res, "Accommodation not found");
+
+      // Fire-and-forget cache write
+      redisService.client
+        ?.setex(`accommodation:${id}`, ACCOMMODATION_CACHE_TTL_S, JSON.stringify(accommodation))
+        .catch(() => {});
+
+      return res.json({ success: true, data: accommodation, cached: false });
+    } catch (error) {
+      next(error);
+    }
+  }
+
+  /**
    * PUT /api/accommodations/:id
-   * Access: Vendor (own) / SuperAdmin
+   * Vendor (own) / SuperAdmin — sparse update, vendorId is never writable
    */
   async updateAccommodation(req, res, next) {
     try {
       const { id } = req.params;
 
-      // Check permission
-      const canManage = await this.canManageAccommodation(
-        req.user,
-        id,
-        "update",
-      );
-      if (!canManage) {
-        return res.status(403).json({
-          success: false,
-          message: "You can only update your own accommodations",
-        });
-      }
+      const allowed = await canManageAccommodation(req.user, id, "update");
+      if (!allowed) return forbidden(res, "You can only update your own accommodations");
 
-      const updateData = req.body;
-
-      // Convert phone to string if present
-      if (updateData.phone) {
-        updateData.phone = String(updateData.phone);
-      }
-
-      // Don't allow changing vendorId
-      delete updateData.vendorId;
+      const {
+        name, description, address, city, country, latitude, longitude,
+        phone, email, website, starRating, accommodationType, priceCategory,
+        amenities, images, checkInTime, checkOutTime, policies, cancellationPolicy,
+        isActive,
+      } = req.body;
 
       const accommodation = await prisma.accommodation.update({
         where: { id },
-        data: updateData,
-        include: {
-          rooms: true,
-          services: true,
+        data: {
+          ...(name              !== undefined && { name }),
+          ...(description       !== undefined && { description }),
+          ...(address           !== undefined && { address }),
+          ...(city              !== undefined && { city }),
+          ...(country           !== undefined && { country }),
+          ...(latitude          !== undefined && { latitude }),
+          ...(longitude         !== undefined && { longitude }),
+          ...(phone             !== undefined && { phone: String(phone) }),
+          ...(email             !== undefined && { email }),
+          ...(website           !== undefined && { website }),
+          ...(starRating        !== undefined && { starRating }),
+          ...(accommodationType !== undefined && { accommodationType }),
+          ...(priceCategory     !== undefined && { priceCategory }),
+          ...(amenities         !== undefined && { amenities }),
+          ...(images            !== undefined && { images }),
+          ...(checkInTime       !== undefined && { checkInTime }),
+          ...(checkOutTime      !== undefined && { checkOutTime }),
+          ...(policies          !== undefined && { policies }),
+          ...(cancellationPolicy !== undefined && { cancellationPolicy }),
+          // isActive is only writable here by superadmin; vendors use PATCH /status
+          ...(req.user.isSuperAdmin && isActive !== undefined && { isActive }),
         },
+        include: { rooms: true, services: true },
       });
 
-      // Invalidate caches
-      await Promise.all([
-        redisService.client?.del(`accommodation:${id}`),
-        redisService.client?.del("accommodations:list:*"),
-      ]);
+      invalidateAccommodationCache(id);
 
-      res.json({
-        success: true,
-        data: accommodation,
-        message: "Accommodation updated successfully",
-      });
+      return res.json({ success: true, data: accommodation, message: "Accommodation updated successfully" });
     } catch (error) {
-      if (error.code === "P2025") {
-        return res.status(404).json({
-          success: false,
-          message: "Accommodation not found",
-        });
-      }
+      if (error.code === "P2025") return notFound(res, "Accommodation not found");
       next(error);
     }
   }
 
   /**
-   * Delete accommodation
    * DELETE /api/accommodations/:id
-   * Access: Vendor (own, with no active bookings) / SuperAdmin
+   * Vendor (own, no active bookings) / SuperAdmin
    */
   async deleteAccommodation(req, res, next) {
     try {
       const { id } = req.params;
 
-      // Check permission
-      const canManage = await this.canManageAccommodation(
-        req.user,
-        id,
-        "delete",
-      );
-      if (!canManage) {
-        return res.status(403).json({
-          success: false,
-          message:
-            "You can only delete your own accommodations with no active bookings",
-        });
-      }
-
-      // Double-check if accommodation has active bookings
-      const activeBookings = await prisma.accommodationBooking.count({
-        where: {
-          accommodationId: id,
-          bookingStatus: { in: ["PENDING", "CONFIRMED", "CHECKED_IN"] },
-        },
+      // Existence check before permission check for clean 404
+      const existing = await prisma.accommodation.findUnique({
+        where: { id }, select: { id: true },
       });
+      if (!existing) return notFound(res, "Accommodation not found");
 
-      if (activeBookings > 0) {
-        return res.status(400).json({
-          success: false,
-          message:
-            "Cannot delete accommodation with active bookings. Deactivate it instead.",
-        });
+      const allowed = await canManageAccommodation(req.user, id, "delete");
+      if (!allowed) {
+        return badRequest(res, "Cannot delete accommodation with active bookings. Deactivate it instead.");
       }
 
-      await prisma.accommodation.delete({
+      await prisma.accommodation.delete({ where: { id } });
+      invalidateAccommodationCache(id);
+
+      return res.json({ success: true, message: "Accommodation deleted successfully" });
+    } catch (error) {
+      if (error.code === "P2025") return notFound(res, "Accommodation not found");
+      next(error);
+    }
+  }
+
+  /**
+   * PATCH /api/accommodations/:id/status  [NEW]
+   * Vendor (own) — toggle active/inactive without a full update payload
+   */
+  async toggleAccommodationStatus(req, res, next) {
+    try {
+      const { id } = req.params;
+      const { isActive } = req.body;
+
+      if (typeof isActive !== "boolean") return badRequest(res, "isActive must be a boolean");
+
+      const allowed = await canManageAccommodation(req.user, id, "update");
+      if (!allowed) return forbidden(res, "You can only manage your own accommodations");
+
+      const accommodation = await prisma.accommodation.update({
         where: { id },
+        data:  { isActive },
+        select: { id: true, name: true, isActive: true },
       });
 
-      // Invalidate caches
-      await Promise.all([
-        redisService.client?.del(`accommodation:${id}`),
-        redisService.client?.del("accommodations:list:*"),
-      ]);
+      invalidateAccommodationCache(id);
 
-      res.json({
+      return res.json({
         success: true,
-        message: "Accommodation deleted successfully",
+        data: accommodation,
+        message: `Accommodation ${isActive ? "activated" : "deactivated"} successfully`,
       });
     } catch (error) {
-      if (error.code === "P2025") {
-        return res.status(404).json({
-          success: false,
-          message: "Accommodation not found",
-        });
-      }
+      if (error.code === "P2025") return notFound(res, "Accommodation not found");
+      next(error);
+    }
+  }
+
+  /**
+   * GET /api/vendor/accommodations  [NEW]
+   * Vendor — their own listings, includes inactive ones
+   */
+  async getVendorAccommodations(req, res, next) {
+    try {
+      const { id: userId } = req.user;
+      const { status } = req.query;
+      const { page, limit, skip } = parsePagination(req.query, 20);
+
+      const vendor = await prisma.vendor.findUnique({
+        where: { userId }, select: { id: true },
+      });
+      if (!vendor) return notFound(res, "Vendor profile not found");
+
+      const where = {
+        vendorId: vendor.id,
+        ...(status === "active"   && { isActive: true }),
+        ...(status === "inactive" && { isActive: false }),
+      };
+
+      const [accommodations, total] = await Promise.all([
+        prisma.accommodation.findMany({
+          where,
+          include: { _count: { select: { rooms: true, bookings: true } } },
+          skip,
+          take: limit,
+          orderBy: { createdAt: "desc" },
+        }),
+        prisma.accommodation.count({ where }),
+      ]);
+
+      return res.json({
+        success: true,
+        data: accommodations,
+        pagination: buildPaginationMeta(page, limit, total),
+      });
+    } catch (error) {
+      next(error);
+    }
+  }
+
+  /**
+   * GET /api/vendor/accommodations/:accommodationId/bookings  [NEW]
+   * Vendor — view bookings for one of their accommodations
+   */
+  async getAccommodationBookings(req, res, next) {
+    try {
+      const { accommodationId } = req.params;
+      const { status } = req.query;
+      const { page, limit, skip } = parsePagination(req.query, 20);
+
+      const allowed = await canManageAccommodation(req.user, accommodationId, "view");
+      if (!allowed) return forbidden(res, "You can only view bookings for your own accommodations");
+
+      const where = {
+        accommodationId,
+        ...(status && { bookingStatus: status }),
+      };
+
+      const [bookings, total] = await Promise.all([
+        prisma.accommodationBooking.findMany({
+          where,
+          include: {
+            rooms:      { select: { id: true, roomNumber: true, roomType: true } },
+            travelPlan: { select: { id: true, title: true, userId: true } },
+          },
+          orderBy: { createdAt: "desc" },
+          skip,
+          take: limit,
+        }),
+        prisma.accommodationBooking.count({ where }),
+      ]);
+
+      return res.json({
+        success: true,
+        data: bookings,
+        pagination: buildPaginationMeta(page, limit, total),
+      });
+    } catch (error) {
       next(error);
     }
   }
@@ -706,200 +590,172 @@ async getAllAccommodations(req, res, next) {
   // ==================== ROOM MANAGEMENT ====================
 
   /**
-   * Add room to accommodation
    * POST /api/accommodations/:accommodationId/rooms
-   * Access: Vendor (own) / SuperAdmin
    */
   async addRoom(req, res, next) {
     try {
       const { accommodationId } = req.params;
 
-      // Check permission
-      const canManage = await this.canManageRoom(
-        req.user,
-        accommodationId,
-        null,
-        "edit",
-      );
-      if (!canManage) {
-        return res.status(403).json({
-          success: false,
-          message: "You can only add rooms to your own accommodations",
-        });
-      }
+      const allowed = await canManageRoom(req.user, accommodationId, null, "edit");
+      if (!allowed) return forbidden(res, "You can only add rooms to your own accommodations");
 
-      const roomData = req.body;
+      const {
+        roomNumber, roomType, description, beds, maxOccupancy,
+        hasView, hasBalcony, floor, roomAmenities, basePrice, isAvailable,
+      } = req.body;
 
       const room = await prisma.accommodationRoom.create({
         data: {
-          ...roomData,
           accommodationId,
+          roomNumber, roomType,
+          ...(description  !== undefined && { description }),
+          ...(beds         !== undefined && { beds }),
+          ...(maxOccupancy !== undefined && { maxOccupancy }),
+          ...(hasView      !== undefined && { hasView }),
+          ...(hasBalcony   !== undefined && { hasBalcony }),
+          ...(floor        !== undefined && { floor }),
+          roomAmenities: roomAmenities ?? [],
+          basePrice,
+          isAvailable:   isAvailable ?? true,
         },
       });
 
-      // Set up OpenFGA relations
-      if (openfgaService.createRoomRelations) {
-        await openfgaService.createRoomRelations(
-          req.user.id,
-          room.id,
-          accommodationId,
-        );
-      }
+      Promise.allSettled([
+        openfgaService.createRoomRelations(req.user.id, room.id, accommodationId),
+        redisService.client?.del(`accommodation:${accommodationId}`),
+      ]);
 
-      // Invalidate accommodation cache
-      await redisService.client?.del(`accommodation:${accommodationId}`);
-
-      res.status(201).json({
-        success: true,
-        data: room,
-        message: "Room added successfully",
-      });
+      return res.status(201).json({ success: true, data: room, message: "Room added successfully" });
     } catch (error) {
       next(error);
     }
   }
 
   /**
-   * Update room
    * PUT /api/rooms/:roomId
-   * Access: Vendor (own) / SuperAdmin
    */
   async updateRoom(req, res, next) {
     try {
       const { roomId } = req.params;
 
       const room = await prisma.accommodationRoom.findUnique({
+        where:  { id: roomId },
+        select: { accommodation: { select: { id: true } } },
+      });
+      if (!room) return notFound(res, "Room not found");
+
+      const allowed = await canManageRoom(req.user, room.accommodation.id, roomId, "edit");
+      if (!allowed) return forbidden(res, "You can only update rooms in your own accommodations");
+
+      const {
+        roomNumber, roomType, description, beds, maxOccupancy,
+        hasView, hasBalcony, floor, roomAmenities, basePrice, isAvailable,
+      } = req.body;
+
+      const updated = await prisma.accommodationRoom.update({
         where: { id: roomId },
-        include: {
-          accommodation: {
-            select: { id: true, vendorId: true },
-          },
+        data: {
+          ...(roomNumber    !== undefined && { roomNumber }),
+          ...(roomType      !== undefined && { roomType }),
+          ...(description   !== undefined && { description }),
+          ...(beds          !== undefined && { beds }),
+          ...(maxOccupancy  !== undefined && { maxOccupancy }),
+          ...(hasView       !== undefined && { hasView }),
+          ...(hasBalcony    !== undefined && { hasBalcony }),
+          ...(floor         !== undefined && { floor }),
+          ...(roomAmenities !== undefined && { roomAmenities }),
+          ...(basePrice     !== undefined && { basePrice }),
+          ...(isAvailable   !== undefined && { isAvailable }),
         },
       });
 
-      if (!room) {
-        return res.status(404).json({
-          success: false,
-          message: "Room not found",
-        });
-      }
+      redisService.client?.del(`accommodation:${room.accommodation.id}`).catch(() => {});
 
-      // Check permission (using accommodationId)
-      const canManage = await this.canManageRoom(
-        req.user,
-        room.accommodation.id,
-        roomId,
-        "edit",
-      );
-
-      if (!canManage) {
-        return res.status(403).json({
-          success: false,
-          message: "You can only update rooms in your own accommodations",
-        });
-      }
-
-      const updatedRoom = await prisma.accommodationRoom.update({
-        where: { id: roomId },
-        data: req.body,
-      });
-
-      // Invalidate accommodation cache
-      await redisService.client?.del(`accommodation:${room.accommodation.id}`);
-
-      res.json({
-        success: true,
-        data: updatedRoom,
-        message: "Room updated successfully",
-      });
+      return res.json({ success: true, data: updated, message: "Room updated successfully" });
     } catch (error) {
-      if (error.code === "P2025") {
-        return res.status(404).json({
-          success: false,
-          message: "Room not found",
-        });
-      }
+      if (error.code === "P2025") return notFound(res, "Room not found");
       next(error);
     }
   }
 
   /**
-   * Delete room
    * DELETE /api/rooms/:roomId
-   * Access: Vendor (own, with no future bookings) / SuperAdmin
    */
   async deleteRoom(req, res, next) {
     try {
       const { roomId } = req.params;
 
       const room = await prisma.accommodationRoom.findUnique({
-        where: { id: roomId },
-        include: {
-          accommodation: {
-            select: { id: true, vendorId: true },
-          },
-        },
+        where:  { id: roomId },
+        select: { accommodation: { select: { id: true } } },
       });
+      if (!room) return notFound(res, "Room not found");
 
-      if (!room) {
-        return res.status(404).json({
-          success: false,
-          message: "Room not found",
-        });
-      }
+      const allowed = await canManageRoom(req.user, room.accommodation.id, roomId, "delete");
+      if (!allowed) return forbidden(res, "You can only delete rooms in your own accommodations");
 
-      // Check permission
-      const canManage = await this.canManageRoom(
-        req.user,
-        room.accommodation.id,
-        roomId,
-        "delete",
-      );
-
-      if (!canManage) {
-        return res.status(403).json({
-          success: false,
-          message: "You can only delete rooms in your own accommodations",
-        });
-      }
-
-      // Check if room has future bookings
       const futureBookings = await prisma.accommodationBooking.count({
         where: {
-          rooms: {
-            some: { id: roomId },
-          },
-          checkInDate: { gt: new Date() },
+          rooms:         { some: { id: roomId } },
+          checkInDate:   { gt: new Date() },
           bookingStatus: { in: ["PENDING", "CONFIRMED"] },
         },
       });
 
       if (futureBookings > 0) {
-        return res.status(400).json({
-          success: false,
-          message:
-            "Cannot delete room with future bookings. Mark it as unavailable instead.",
-        });
+        return badRequest(res, "Cannot delete room with future bookings. Mark it as unavailable instead.");
       }
 
-      await prisma.accommodationRoom.delete({
-        where: { id: roomId },
+      await prisma.accommodationRoom.delete({ where: { id: roomId } });
+      redisService.client?.del(`accommodation:${room.accommodation.id}`).catch(() => {});
+
+      return res.json({ success: true, message: "Room deleted successfully" });
+    } catch (error) {
+      if (error.code === "P2025") return notFound(res, "Room not found");
+      next(error);
+    }
+  }
+
+  /**
+   * PATCH /api/accommodations/:accommodationId/rooms/availability  [NEW]
+   * Bulk-toggle availability for multiple rooms in a single round-trip
+   */
+  async bulkUpdateRoomAvailability(req, res, next) {
+    try {
+      const { accommodationId } = req.params;
+      const { roomIds, isAvailable } = req.body;
+
+      if (!Array.isArray(roomIds) || roomIds.length === 0) {
+        return badRequest(res, "roomIds must be a non-empty array");
+      }
+      if (typeof isAvailable !== "boolean") {
+        return badRequest(res, "isAvailable must be a boolean");
+      }
+
+      const allowed = await canManageRoom(req.user, accommodationId, null, "edit");
+      if (!allowed) return forbidden(res, "You can only manage rooms in your own accommodations");
+
+      // Ownership check — all roomIds must belong to this accommodation
+      const ownedCount = await prisma.accommodationRoom.count({
+        where: { id: { in: roomIds }, accommodationId },
+      });
+      if (ownedCount !== roomIds.length) {
+        return badRequest(res, "One or more room IDs do not belong to this accommodation");
+      }
+
+      const { count } = await prisma.accommodationRoom.updateMany({
+        where: { id: { in: roomIds }, accommodationId },
+        data:  { isAvailable },
       });
 
-      // Invalidate accommodation cache
-      await redisService.client?.del(`accommodation:${room.accommodation.id}`);
+      redisService.client?.del(`accommodation:${accommodationId}`).catch(() => {});
 
-      res.json({
+      return res.json({
         success: true,
-        message: "Room deleted successfully",
+        updatedCount: count,
+        message: `${count} room(s) ${isAvailable ? "marked available" : "marked unavailable"}`,
       });
     } catch (error) {
-      if (error.code === "P2025") {
-        return res.status(404).json({
-          success: false,
-          message: "Room not found",
-        });
-      }
       next(error);
     }
   }
@@ -907,308 +763,221 @@ async getAllAccommodations(req, res, next) {
   // ==================== SERVICE MANAGEMENT ====================
 
   /**
-   * Add service to accommodation
    * POST /api/accommodations/:accommodationId/services
-   * Access: Vendor (own) / SuperAdmin
    */
   async addService(req, res, next) {
     try {
       const { accommodationId } = req.params;
 
-      // Check permission
-      const canManage = await this.canManageService(
-        req.user,
-        accommodationId,
-        null,
-        "edit",
-      );
-      if (!canManage) {
-        return res.status(403).json({
-          success: false,
-          message: "You can only add services to your own accommodations",
-        });
-      }
+      const allowed = await canManageService(req.user, accommodationId, null, "edit");
+      if (!allowed) return forbidden(res, "You can only add services to your own accommodations");
+
+      const {
+        name, description, category, price, isIncluded, isAvailable,
+        availableStartTime, availableEndTime, daysAvailable, locationInAccommodation,
+      } = req.body;
 
       const service = await prisma.accommodationService.create({
         data: {
-          ...req.body,
           accommodationId,
+          name, category,
+          ...(description             !== undefined && { description }),
+          ...(price                   !== undefined && { price }),
+          isIncluded:                 isIncluded  ?? false,
+          isAvailable:                isAvailable ?? true,
+          ...(availableStartTime      !== undefined && { availableStartTime }),
+          ...(availableEndTime        !== undefined && { availableEndTime }),
+          daysAvailable:              daysAvailable ?? [],
+          ...(locationInAccommodation !== undefined && { locationInAccommodation }),
         },
       });
 
-      // Set up OpenFGA relations
-      if (openfgaService.createServiceRelations) {
-        await openfgaService.createServiceRelations(
-          req.user.id,
-          service.id,
-          accommodationId,
-        );
-      }
+      Promise.allSettled([
+        openfgaService.createServiceRelations(req.user.id, service.id, accommodationId),
+        redisService.client?.del(`accommodation:${accommodationId}`),
+      ]);
 
-      // Invalidate accommodation cache
-      await redisService.client?.del(`accommodation:${accommodationId}`);
-
-      res.status(201).json({
-        success: true,
-        data: service,
-        message: "Service added successfully",
-      });
+      return res.status(201).json({ success: true, data: service, message: "Service added successfully" });
     } catch (error) {
       next(error);
     }
   }
 
   /**
-   * Update service
    * PUT /api/services/:serviceId
-   * Access: Vendor (own) / SuperAdmin
    */
   async updateService(req, res, next) {
     try {
       const { serviceId } = req.params;
 
       const service = await prisma.accommodationService.findUnique({
+        where:  { id: serviceId },
+        select: { accommodation: { select: { id: true } } },
+      });
+      if (!service) return notFound(res, "Service not found");
+
+      const allowed = await canManageService(req.user, service.accommodation.id, serviceId, "edit");
+      if (!allowed) return forbidden(res, "You can only update services in your own accommodations");
+
+      const {
+        name, description, category, price, isIncluded, isAvailable,
+        availableStartTime, availableEndTime, daysAvailable, locationInAccommodation,
+      } = req.body;
+
+      const updated = await prisma.accommodationService.update({
         where: { id: serviceId },
-        include: {
-          accommodation: {
-            select: { id: true, vendorId: true },
-          },
+        data: {
+          ...(name                    !== undefined && { name }),
+          ...(description             !== undefined && { description }),
+          ...(category                !== undefined && { category }),
+          ...(price                   !== undefined && { price }),
+          ...(isIncluded              !== undefined && { isIncluded }),
+          ...(isAvailable             !== undefined && { isAvailable }),
+          ...(availableStartTime      !== undefined && { availableStartTime }),
+          ...(availableEndTime        !== undefined && { availableEndTime }),
+          ...(daysAvailable           !== undefined && { daysAvailable }),
+          ...(locationInAccommodation !== undefined && { locationInAccommodation }),
         },
       });
 
-      if (!service) {
-        return res.status(404).json({
-          success: false,
-          message: "Service not found",
-        });
-      }
+      redisService.client?.del(`accommodation:${service.accommodation.id}`).catch(() => {});
 
-      // Check permission
-      const canManage = await this.canManageService(
-        req.user,
-        service.accommodation.id,
-        serviceId,
-        "edit",
-      );
-
-      if (!canManage) {
-        return res.status(403).json({
-          success: false,
-          message: "You can only update services in your own accommodations",
-        });
-      }
-
-      const updatedService = await prisma.accommodationService.update({
-        where: { id: serviceId },
-        data: req.body,
-      });
-
-      // Invalidate accommodation cache
-      await redisService.client?.del(
-        `accommodation:${service.accommodation.id}`,
-      );
-
-      res.json({
-        success: true,
-        data: updatedService,
-        message: "Service updated successfully",
-      });
+      return res.json({ success: true, data: updated, message: "Service updated successfully" });
     } catch (error) {
-      if (error.code === "P2025") {
-        return res.status(404).json({
-          success: false,
-          message: "Service not found",
-        });
-      }
+      if (error.code === "P2025") return notFound(res, "Service not found");
       next(error);
     }
   }
 
   /**
-   * Delete service
    * DELETE /api/services/:serviceId
-   * Access: Vendor (own) / SuperAdmin
    */
   async deleteService(req, res, next) {
     try {
       const { serviceId } = req.params;
 
       const service = await prisma.accommodationService.findUnique({
-        where: { id: serviceId },
-        include: {
-          accommodation: {
-            select: { id: true, vendorId: true },
-          },
-        },
+        where:  { id: serviceId },
+        select: { accommodation: { select: { id: true } } },
       });
+      if (!service) return notFound(res, "Service not found");
 
-      if (!service) {
-        return res.status(404).json({
-          success: false,
-          message: "Service not found",
-        });
-      }
+      const allowed = await canManageService(req.user, service.accommodation.id, serviceId, "delete");
+      if (!allowed) return forbidden(res, "You can only delete services in your own accommodations");
 
-      // Check permission
-      const canManage = await this.canManageService(
-        req.user,
-        service.accommodation.id,
-        serviceId,
-        "delete",
-      );
+      await prisma.accommodationService.delete({ where: { id: serviceId } });
+      redisService.client?.del(`accommodation:${service.accommodation.id}`).catch(() => {});
 
-      if (!canManage) {
-        return res.status(403).json({
-          success: false,
-          message: "You can only delete services in your own accommodations",
-        });
-      }
-
-      await prisma.accommodationService.delete({
-        where: { id: serviceId },
-      });
-
-      // Invalidate accommodation cache
-      await redisService.client?.del(
-        `accommodation:${service.accommodation.id}`,
-      );
-
-      res.json({
-        success: true,
-        message: "Service deleted successfully",
-      });
+      return res.json({ success: true, message: "Service deleted successfully" });
     } catch (error) {
-      if (error.code === "P2025") {
-        return res.status(404).json({
-          success: false,
-          message: "Service not found",
-        });
-      }
+      if (error.code === "P2025") return notFound(res, "Service not found");
       next(error);
     }
   }
 
   // ==================== BOOKING MANAGEMENT ====================
-  // ... (keep all booking methods as they were - they don't change with vendor role)
 
   /**
-   * Create accommodation booking
    * POST /api/travel-plans/:travelPlanId/accommodation-bookings
-   * Access: TravelPlan Owner/Editor
+   *
+   * SCHEMA FIX: AccommodationBooking no longer has `selectedRoomNumbers[]`
+   * (removed — duplicated the rooms relation) and has no `totalNights` field
+   * (removed — derivable). Rooms are now linked via `rooms: { connect }`.
+   * Client must send `roomIds: string[]` instead of `selectedRoomNumbers`.
    */
   async createBooking(req, res, next) {
     try {
       const { travelPlanId } = req.params;
-      const bookingData = req.body;
+      const {
+        accommodationId, roomIds,
+        checkInDate, checkOutDate, totalGuests, roomType,
+        pricePerNight, taxes, serviceFee, totalCost,
+        guestName, guestEmail, guestPhone, specialRequests,
+        paymentStatus, paymentMethod, transactionId,
+      } = req.body;
 
-      // Check if user has permission to edit the travel plan
       const canEdit =
-        (await openfgaService.canEditTravelPlan?.(req.user.id, travelPlanId)) ||
-        false;
+        req.user.isSuperAdmin ||
+        !!(await openfgaService.canEditTravelPlan?.(req.user.id, travelPlanId).catch(() => false));
 
-      if (!canEdit && !req.user.isSuperAdmin) {
-        return res.status(403).json({
-          success: false,
-          message:
-            "You do not have permission to add bookings to this travel plan",
-        });
+      if (!canEdit) return forbidden(res, "You do not have permission to add bookings to this travel plan");
+
+      const checkIn  = new Date(checkInDate);
+      const checkOut = new Date(checkOutDate);
+
+      if (isNaN(checkIn.getTime()) || isNaN(checkOut.getTime())) {
+        return badRequest(res, "Invalid check-in or check-out date");
+      }
+      if (checkOut <= checkIn) return badRequest(res, "Check-out date must be after check-in date");
+      if (!Array.isArray(roomIds) || roomIds.length === 0) {
+        return badRequest(res, "At least one roomId is required");
       }
 
-      // Validate dates
-      const checkIn = new Date(bookingData.checkInDate);
-      const checkOut = new Date(bookingData.checkOutDate);
+      // Verify accommodation + room availability in one batch
+      const [accommodation, availableRooms] = await Promise.all([
+        prisma.accommodation.findUnique({
+          where:  { id: accommodationId },
+          select: { id: true, isActive: true },
+        }),
+        prisma.accommodationRoom.findMany({
+          where:  { id: { in: roomIds }, accommodationId, isAvailable: true },
+          select: { id: true },
+        }),
+      ]);
 
-      if (checkOut <= checkIn) {
-        return res.status(400).json({
-          success: false,
-          message: "Check-out date must be after check-in date",
-        });
+      if (!accommodation)          return notFound(res, "Accommodation not found");
+      if (!accommodation.isActive) return badRequest(res, "Accommodation is not currently available");
+      if (availableRooms.length !== roomIds.length) {
+        return badRequest(res, "One or more selected rooms are not available or do not belong to this accommodation");
       }
 
-      // Calculate total nights
-      const totalNights = Math.ceil(
-        (checkOut - checkIn) / (1000 * 60 * 60 * 24),
-      );
-
-      // Verify rooms are available
-      const accommodation = await prisma.accommodation.findUnique({
-        where: { id: bookingData.accommodationId },
-        include: {
-          rooms: {
-            where: {
-              roomNumber: { in: bookingData.selectedRoomNumbers },
-              isAvailable: true,
-            },
-          },
-        },
-      });
-
-      if (!accommodation) {
-        return res.status(404).json({
-          success: false,
-          message: "Accommodation not found",
-        });
-      }
-
-      if (
-        accommodation.rooms.length !== bookingData.selectedRoomNumbers.length
-      ) {
-        return res.status(400).json({
-          success: false,
-          message: "One or more selected rooms are not available",
-        });
-      }
-
-      // Check for booking conflicts
-      const conflictingBookings = await prisma.accommodationBooking.findMany({
+      // Date-overlap conflict check via the rooms relation (not selectedRoomNumbers)
+      const conflictCount = await prisma.accommodationBooking.count({
         where: {
-          accommodationId: bookingData.accommodationId,
-          bookingStatus: { in: ["PENDING", "CONFIRMED", "CHECKED_IN"] },
-          selectedRoomNumbers: { hasSome: bookingData.selectedRoomNumbers },
-          OR: [
-            {
-              AND: [
-                { checkInDate: { lte: checkOut } },
-                { checkOutDate: { gte: checkIn } },
-              ],
-            },
+          accommodationId,
+          bookingStatus: { in: ACTIVE_BOOKING_STATUSES },
+          rooms:         { some: { id: { in: roomIds } } },
+          AND: [
+            { checkInDate:  { lt: checkOut } },
+            { checkOutDate: { gt: checkIn } },
           ],
         },
       });
 
-      if (conflictingBookings.length > 0) {
-        return res.status(409).json({
-          success: false,
-          message: "One or more rooms are already booked for these dates",
-        });
+      if (conflictCount > 0) {
+        return res.status(409).json({ success: false, message: "One or more rooms are already booked for these dates" });
       }
 
-      // Create booking
       const booking = await prisma.accommodationBooking.create({
         data: {
-          ...bookingData,
-          totalNights,
           travelPlanId,
+          accommodationId,
+          checkInDate:  checkIn,
+          checkOutDate: checkOut,
+          totalGuests:  totalGuests ?? 1,
+          roomType,
+          pricePerNight,
+          ...(taxes      !== undefined && { taxes }),
+          ...(serviceFee !== undefined && { serviceFee }),
+          totalCost,
+          guestName,
+          guestEmail,
+          ...(guestPhone      !== undefined && { guestPhone }),
+          ...(specialRequests !== undefined && { specialRequests }),
+          ...(paymentStatus   !== undefined && { paymentStatus }),
+          ...(paymentMethod   !== undefined && { paymentMethod }),
+          ...(transactionId   !== undefined && { transactionId }),
+          rooms: { connect: roomIds.map((id) => ({ id })) },
         },
-        include: {
-          accommodation: true,
-          rooms: true,
-        },
+        include: { accommodation: true, rooms: true },
       });
 
-      // Set up OpenFGA relations
-      if (openfgaService.createAccommodationBookingRelations) {
-        await openfgaService.createAccommodationBookingRelations(
-          req.user.id,
-          booking.id,
-          travelPlanId,
-        );
-      }
+      Promise.allSettled([
+        openfgaService.createAccommodationBookingRelations(req.user.id, booking.id, travelPlanId),
+        redisService.client?.del(`travelplan:${travelPlanId}`),
+      ]);
 
-      // Invalidate travel plan cache
-      await redisService.client?.del(`travelplan:${travelPlanId}`);
-
-      res.status(201).json({
+      return res.status(201).json({
         success: true,
         data: booking,
         message: "Accommodation booking created successfully",
@@ -1219,9 +988,8 @@ async getAllAccommodations(req, res, next) {
   }
 
   /**
-   * Get booking by ID
    * GET /api/accommodation-bookings/:bookingId
-   * Access: TravelPlan Owner/Editor/Viewer/Suggester
+   * FIX: permission check now runs after existence check, not before
    */
   async getBookingById(req, res, next) {
     try {
@@ -1231,240 +999,228 @@ async getAllAccommodations(req, res, next) {
         where: { id: bookingId },
         include: {
           accommodation: true,
-          rooms: true,
-          travelPlan: {
-            select: {
-              id: true,
-              title: true,
-              userId: true,
-            },
-          },
+          rooms:         true,
+          travelPlan:    { select: { id: true, title: true, userId: true } },
         },
       });
 
-      if (!booking) {
-        return res.status(404).json({
-          success: false,
-          message: "Booking not found",
-        });
-      }
+      if (!booking) return notFound(res, "Booking not found");
 
-      // Check permission
       const canView =
-        (await openfgaService.canViewAccommodationBooking?.(
-          req.user.id,
-          bookingId,
-        )) || false;
+        req.user.isSuperAdmin ||
+        !!(await openfgaService.canViewAccommodationBooking?.(req.user.id, bookingId).catch(() => false));
 
-      if (!canView && !req.user.isSuperAdmin) {
-        return res.status(403).json({
-          success: false,
-          message: "You do not have permission to view this booking",
-        });
-      }
+      if (!canView) return forbidden(res, "You do not have permission to view this booking");
 
-      res.json({
-        success: true,
-        data: booking,
-      });
+      return res.json({ success: true, data: booking });
     } catch (error) {
       next(error);
     }
   }
 
   /**
-   * Update booking
    * PUT /api/accommodation-bookings/:bookingId
-   * Access: TravelPlan Owner/Editor
+   * FIX: fetch booking before permission check (avoids silent 403 on non-existent bookings)
    */
   async updateBooking(req, res, next) {
     try {
       const { bookingId } = req.params;
 
-      // Check permission
-      const canEdit =
-        (await openfgaService.canEditAccommodationBooking?.(
-          req.user.id,
-          bookingId,
-        )) || false;
-
-      if (!canEdit && !req.user.isSuperAdmin) {
-        return res.status(403).json({
-          success: false,
-          message: "You do not have permission to update this booking",
-        });
-      }
-
       const booking = await prisma.accommodationBooking.findUnique({
-        where: { id: bookingId },
-        include: { travelPlan: true },
+        where:  { id: bookingId },
+        select: { bookingStatus: true, travelPlanId: true, accommodationId: true },
       });
 
-      if (!booking) {
-        return res.status(404).json({
-          success: false,
-          message: "Booking not found",
-        });
+      if (!booking) return notFound(res, "Booking not found");
+
+      if (TERMINAL_BOOKING_STATUSES.includes(booking.bookingStatus)) {
+        return badRequest(res, `Cannot update booking with status: ${booking.bookingStatus}`);
       }
 
-      // Don't allow updates to cancelled or completed bookings
-      if (
-        ["CANCELLED", "CHECKED_OUT", "NO_SHOW"].includes(booking.bookingStatus)
-      ) {
-        return res.status(400).json({
-          success: false,
-          message: `Cannot update booking with status: ${booking.bookingStatus}`,
-        });
-      }
+      const canEdit =
+        req.user.isSuperAdmin ||
+        !!(await openfgaService.canEditAccommodationBooking?.(req.user.id, bookingId).catch(() => false));
 
-      const updatedBooking = await prisma.accommodationBooking.update({
+      if (!canEdit) return forbidden(res, "You do not have permission to update this booking");
+
+      const {
+        checkInDate, checkOutDate, totalGuests, specialRequests,
+        paymentStatus, paymentMethod, bookingStatus,
+      } = req.body;
+
+      const updated = await prisma.accommodationBooking.update({
         where: { id: bookingId },
-        data: req.body,
-        include: {
-          accommodation: true,
-          rooms: true,
+        data: {
+          ...(checkInDate     !== undefined && { checkInDate:  new Date(checkInDate) }),
+          ...(checkOutDate    !== undefined && { checkOutDate: new Date(checkOutDate) }),
+          ...(totalGuests     !== undefined && { totalGuests }),
+          ...(specialRequests !== undefined && { specialRequests }),
+          ...(paymentStatus   !== undefined && { paymentStatus }),
+          ...(paymentMethod   !== undefined && { paymentMethod }),
+          ...(bookingStatus   !== undefined && { bookingStatus }),
         },
+        include: { accommodation: true, rooms: true },
       });
 
-      // Invalidate caches
-      await Promise.all([
+      Promise.allSettled([
         redisService.client?.del(`travelplan:${booking.travelPlanId}`),
         redisService.client?.del(`accommodation:${booking.accommodationId}`),
       ]);
 
-      res.json({
-        success: true,
-        data: updatedBooking,
-        message: "Booking updated successfully",
-      });
+      return res.json({ success: true, data: updated, message: "Booking updated successfully" });
     } catch (error) {
       next(error);
     }
   }
 
   /**
-   * Cancel booking
    * DELETE /api/accommodation-bookings/:bookingId
-   * Access: TravelPlan Owner/Editor
    */
   async cancelBooking(req, res, next) {
     try {
       const { bookingId } = req.params;
 
-      // Check permission
-      const canCancel =
-        (await openfgaService.canCancelAccommodationBooking?.(
-          req.user.id,
-          bookingId,
-        )) || false;
-
-      if (!canCancel && !req.user.isSuperAdmin) {
-        return res.status(403).json({
-          success: false,
-          message: "You do not have permission to cancel this booking",
-        });
-      }
-
       const booking = await prisma.accommodationBooking.findUnique({
-        where: { id: bookingId },
-        include: { travelPlan: true },
+        where:  { id: bookingId },
+        select: { bookingStatus: true, paymentStatus: true, travelPlanId: true, accommodationId: true },
       });
 
-      if (!booking) {
-        return res.status(404).json({
-          success: false,
-          message: "Booking not found",
-        });
-      }
+      if (!booking) return notFound(res, "Booking not found");
+      if (booking.bookingStatus === "CANCELLED") return badRequest(res, "Booking is already cancelled");
 
-      // Update booking status to cancelled
-      const cancelledBooking = await prisma.accommodationBooking.update({
+      const canCancel =
+        req.user.isSuperAdmin ||
+        !!(await openfgaService.canCancelAccommodationBooking?.(req.user.id, bookingId).catch(() => false));
+
+      if (!canCancel) return forbidden(res, "You do not have permission to cancel this booking");
+
+      const cancelled = await prisma.accommodationBooking.update({
         where: { id: bookingId },
         data: {
           bookingStatus: "CANCELLED",
-          paymentStatus:
-            booking.paymentStatus === "PAID" ? "REFUNDED" : "PENDING",
+          paymentStatus: booking.paymentStatus === "PAID" ? "REFUNDED" : booking.paymentStatus,
         },
       });
 
-      // Invalidate caches
-      await Promise.all([
+      Promise.allSettled([
         redisService.client?.del(`travelplan:${booking.travelPlanId}`),
         redisService.client?.del(`accommodation:${booking.accommodationId}`),
       ]);
 
-      res.json({
-        success: true,
-        data: cancelledBooking,
-        message: "Booking cancelled successfully",
-      });
+      return res.json({ success: true, data: cancelled, message: "Booking cancelled successfully" });
     } catch (error) {
       next(error);
     }
   }
 
   /**
-   * Get available rooms for accommodation
    * GET /api/accommodations/:accommodationId/available-rooms
-   * Access: Public
+   * Public — uses room relation for conflict check (not selectedRoomNumbers)
    */
   async getAvailableRooms(req, res, next) {
     try {
       const { accommodationId } = req.params;
       const { checkIn, checkOut, guests } = req.query;
 
-      if (!checkIn || !checkOut) {
-        return res.status(400).json({
-          success: false,
-          message: "Check-in and check-out dates are required",
-        });
-      }
+      if (!checkIn || !checkOut) return badRequest(res, "Check-in and check-out dates are required");
 
-      const checkInDate = new Date(checkIn);
+      const checkInDate  = new Date(checkIn);
       const checkOutDate = new Date(checkOut);
 
-      // Get all rooms for the accommodation
-      const rooms = await prisma.accommodationRoom.findMany({
-        where: {
-          accommodationId,
-          isAvailable: true,
-          maxOccupancy: { gte: parseInt(guests) || 1 },
-        },
+      if (isNaN(checkInDate.getTime()) || isNaN(checkOutDate.getTime())) {
+        return badRequest(res, "Invalid date format");
+      }
+      if (checkOutDate <= checkInDate) return badRequest(res, "Check-out must be after check-in");
+
+      const guestCount = parseIntParam(guests, 1);
+
+      const allRooms = await prisma.accommodationRoom.findMany({
+        where: { accommodationId, isAvailable: true, maxOccupancy: { gte: guestCount } },
       });
 
-      // Find booked room IDs for the date range
-      const bookedRooms = await prisma.accommodationBooking.findMany({
+      if (allRooms.length === 0) {
+        return res.json({ success: true, data: [], totalAvailable: 0, totalRooms: 0 });
+      }
+
+      // Collect all room IDs booked during the overlap window
+      const bookedBookings = await prisma.accommodationBooking.findMany({
         where: {
           accommodationId,
-          bookingStatus: { in: ["PENDING", "CONFIRMED", "CHECKED_IN"] },
-          OR: [
-            {
-              AND: [
-                { checkInDate: { lte: checkOutDate } },
-                { checkOutDate: { gte: checkInDate } },
-              ],
-            },
+          bookingStatus: { in: ACTIVE_BOOKING_STATUSES },
+          rooms:         { some: { id: { in: allRooms.map((r) => r.id) } } },
+          AND: [
+            { checkInDate:  { lt: checkOutDate } },
+            { checkOutDate: { gt: checkInDate } },
           ],
         },
-        select: {
-          selectedRoomNumbers: true,
-        },
+        select: { rooms: { select: { id: true } } },
       });
 
-      const bookedRoomNumbers = bookedRooms.flatMap(
-        (b) => b.selectedRoomNumbers,
-      );
+      const bookedRoomIds = new Set(bookedBookings.flatMap((b) => b.rooms.map((r) => r.id)));
+      const availableRooms = allRooms.filter((r) => !bookedRoomIds.has(r.id));
 
-      // Filter available rooms
-      const availableRooms = rooms.filter(
-        (room) => !bookedRoomNumbers.includes(room.roomNumber),
-      );
-
-      res.json({
+      return res.json({
         success: true,
         data: availableRooms,
         totalAvailable: availableRooms.length,
-        totalRooms: rooms.length,
+        totalRooms:     allRooms.length,
+      });
+    } catch (error) {
+      next(error);
+    }
+  }
+
+  // ==================== SUPERADMIN ENDPOINTS ====================
+
+  /**
+   * GET /api/admin/accommodations  [NEW]
+   * SuperAdmin — full listing with vendor/status/feature filters
+   */
+  async adminGetAllAccommodations(req, res, next) {
+    try {
+      const {
+        vendorId, isActive, isVerified, isFeatured,
+        city, country, search, sortBy = "createdAt", sortOrder = "desc",
+      } = req.query;
+      const { page, limit, skip } = parsePagination(req.query, 20);
+
+      const safeSortBy    = ALLOWED_SORT_FIELDS.has(sortBy) ? sortBy : "createdAt";
+      const safeSortOrder = sortOrder === "asc" ? "asc" : "desc";
+
+      const AND = [];
+      if (vendorId)           AND.push({ vendorId });
+      if (isActive   !== undefined) AND.push({ isActive:   isActive   === "true" });
+      if (isVerified !== undefined) AND.push({ isVerified: isVerified === "true" });
+      if (isFeatured !== undefined) AND.push({ isFeatured: isFeatured === "true" });
+      if (city)    AND.push({ city:    { contains: city,    mode: "insensitive" } });
+      if (country) AND.push({ country: { contains: country, mode: "insensitive" } });
+      if (search) AND.push({
+        OR: [
+          { name:        { contains: search, mode: "insensitive" } },
+          { description: { contains: search, mode: "insensitive" } },
+        ],
+      });
+
+      const where = AND.length ? { AND } : {};
+
+      const [accommodations, total] = await Promise.all([
+        prisma.accommodation.findMany({
+          where,
+          include: {
+            vendor: { select: { id: true, businessName: true, businessEmail: true } },
+            _count: { select: { rooms: true, bookings: true } },
+          },
+          skip,
+          take: limit,
+          orderBy: { [safeSortBy]: safeSortOrder },
+        }),
+        prisma.accommodation.count({ where }),
+      ]);
+
+      return res.json({
+        success: true,
+        data: accommodations,
+        pagination: buildPaginationMeta(page, limit, total),
       });
     } catch (error) {
       next(error);
@@ -1472,15 +1228,158 @@ async getAllAccommodations(req, res, next) {
   }
 
   /**
-   * Get price category from max price
+   * PATCH /api/admin/accommodations/:id/verify  [NEW]
+   * SuperAdmin — verify or unverify an accommodation
    */
-getPriceCategoryFromMax(maxPrice) {
-  // Adjust these thresholds based on your actual pricing
-  if (maxPrice < 3000) return "BUDGET";      // Under ₹3000
-  if (maxPrice < 7000) return "MIDRANGE";    // ₹3000 - ₹7000
-  if (maxPrice < 15000) return "EXPENSIVE";  // ₹7000 - ₹15000
-  return "LUXURY";                            // Above ₹15000
-}
+  async verifyAccommodation(req, res, next) {
+    try {
+      const { id } = req.params;
+      const { isVerified } = req.body;
+
+      if (typeof isVerified !== "boolean") return badRequest(res, "isVerified must be a boolean");
+
+      const existing = await prisma.accommodation.findUnique({ where: { id }, select: { id: true } });
+      if (!existing) return notFound(res, "Accommodation not found");
+
+      const accommodation = await prisma.accommodation.update({
+        where:  { id },
+        data:   { isVerified },
+        select: { id: true, name: true, isVerified: true },
+      });
+
+      invalidateAccommodationCache(id);
+
+      return res.json({
+        success: true,
+        data: accommodation,
+        message: `Accommodation ${isVerified ? "verified" : "unverified"} successfully`,
+      });
+    } catch (error) {
+      next(error);
+    }
+  }
+
+  /**
+   * PATCH /api/admin/accommodations/:id/feature  [NEW]
+   * SuperAdmin — feature or unfeature an accommodation with optional expiry
+   */
+  async featureAccommodation(req, res, next) {
+    try {
+      const { id } = req.params;
+      const { isFeatured, featuredUntil } = req.body;
+
+      if (typeof isFeatured !== "boolean") return badRequest(res, "isFeatured must be a boolean");
+
+      const existing = await prisma.accommodation.findUnique({ where: { id }, select: { id: true } });
+      if (!existing) return notFound(res, "Accommodation not found");
+
+      const accommodation = await prisma.accommodation.update({
+        where:  { id },
+        data: {
+          isFeatured,
+          featuredUntil: isFeatured && featuredUntil ? new Date(featuredUntil) : null,
+        },
+        select: { id: true, name: true, isFeatured: true, featuredUntil: true },
+      });
+
+      invalidateAccommodationCache(id);
+
+      return res.json({
+        success: true,
+        data: accommodation,
+        message: `Accommodation ${isFeatured ? "featured" : "unfeatured"} successfully`,
+      });
+    } catch (error) {
+      next(error);
+    }
+  }
+
+  /**
+   * GET /api/admin/accommodation-bookings  [NEW]
+   * SuperAdmin — all bookings across all vendors with date/status filtering
+   */
+  async adminGetAllBookings(req, res, next) {
+    try {
+      const { status, accommodationId, from, to } = req.query;
+      const { page, limit, skip } = parsePagination(req.query, 20);
+
+      const AND = [];
+      if (accommodationId) AND.push({ accommodationId });
+      if (status)          AND.push({ bookingStatus: status });
+      if (from || to) {
+        AND.push({
+          createdAt: {
+            ...(from && { gte: new Date(from) }),
+            ...(to   && { lte: new Date(to) }),
+          },
+        });
+      }
+
+      const where = AND.length ? { AND } : {};
+
+      const [bookings, total] = await Promise.all([
+        prisma.accommodationBooking.findMany({
+          where,
+          include: {
+            accommodation: { select: { id: true, name: true, city: true } },
+            rooms:         { select: { id: true, roomNumber: true, roomType: true } },
+            travelPlan:    { select: { id: true, title: true, userId: true } },
+          },
+          orderBy: { createdAt: "desc" },
+          skip,
+          take: limit,
+        }),
+        prisma.accommodationBooking.count({ where }),
+      ]);
+
+      return res.json({
+        success: true,
+        data: bookings,
+        pagination: buildPaginationMeta(page, limit, total),
+      });
+    } catch (error) {
+      next(error);
+    }
+  }
+
+  /**
+   * PATCH /api/admin/accommodation-bookings/:bookingId/status  [NEW]
+   * SuperAdmin — force any booking to any status (e.g. resolve disputes)
+   */
+  async adminUpdateBookingStatus(req, res, next) {
+    try {
+      const { bookingId } = req.params;
+      const { bookingStatus, notes } = req.body;
+
+      const booking = await prisma.accommodationBooking.findUnique({
+        where:  { id: bookingId },
+        select: { id: true, travelPlanId: true, accommodationId: true },
+      });
+
+      if (!booking) return notFound(res, "Booking not found");
+
+      const updated = await prisma.accommodationBooking.update({
+        where: { id: bookingId },
+        data: {
+          bookingStatus,
+          ...(notes && { aiNotes: notes }),
+        },
+      });
+
+      Promise.allSettled([
+        redisService.client?.del(`travelplan:${booking.travelPlanId}`),
+        redisService.client?.del(`accommodation:${booking.accommodationId}`),
+      ]);
+
+      return res.json({
+        success: true,
+        data: updated,
+        message: `Booking status updated to ${bookingStatus}`,
+      });
+    } catch (error) {
+      next(error);
+    }
+  }
 }
 
 module.exports = new AccommodationController();

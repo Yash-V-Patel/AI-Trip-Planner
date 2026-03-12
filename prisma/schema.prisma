@@ -1,4 +1,3 @@
-// prisma/schema.prisma
 generator client {
   provider   = "prisma-client-js"
   engineType = "library"
@@ -12,14 +11,15 @@ datasource db {
 // ==================== CORE MODELS ====================
 
 model User {
-  id        String   @id @default(cuid())
-  email     String   @unique
-  name      String?
-  phone     String // Changed from Int to String
-  password  String
-  createdAt DateTime @default(now()) @db.Timestamptz(3)
-  updatedAt DateTime @updatedAt @db.Timestamptz(3)
-  lastLoginAt DateTime @default(now())
+  id          String    @id @default(cuid())
+  email       String    @unique
+  name        String?
+  phone       String
+  password    String
+  createdAt   DateTime  @default(now()) @db.Timestamptz(3)
+  updatedAt   DateTime  @updatedAt @db.Timestamptz(3)
+  lastLoginAt DateTime?
+
   // Email verification
   emailVerified           Boolean   @default(false)
   emailVerificationToken  String?   @unique
@@ -30,19 +30,14 @@ model User {
   resetPasswordExpiry DateTime? @db.Timestamptz(3)
 
   // Relations
-  notification0           Notification[]
-  travelPlans             TravelPlan[]
-  refreshTokens           RefreshToken[]
-  profile                 Profile?
-  vendorApplications      VendorApplication[]
-  vendor                  Vendor? // One-to-one with vendor
-  accommodations          Accommodation[] // As vendor
-  transportationProviders TransportationProvider[] // As vendor
-  travelPackages          TravelPackage[] // As vendor
-  vendorExperiences       VendorExperience[] // As vendor
-  vendorReviews           VendorReview[] // Reviews given
-  transactions            Transaction[] // As vendor
-  vendorTeamMembers       VendorTeamMember[]
+  notifications      Notification[]
+  travelPlans        TravelPlan[]
+  refreshTokens      RefreshToken[]
+  profile            Profile?
+  vendorApplications VendorApplication[]
+  vendor             Vendor?
+  vendorReviews      VendorReview[]
+  vendorTeamMembers  VendorTeamMember[]
 
   @@map("users")
 }
@@ -52,19 +47,17 @@ model Profile {
 
   // Personal Information
   dateOfBirth    DateTime? @db.Timestamptz(3)
-  gender         String? // Use Gender enum
+  gender         Gender?
   nationality    String?
   profilePicture String?
   bio            String?
 
   // Contact Information
-  address                  String?
-  city                     String?
-  country                  String?
-  postalCode               String?
-  emergencyContactName     String?
-  emergencyContactPhone    String?
-  emergencyContactRelation String?
+  address          String?
+  city             String?
+  country          String?
+  postalCode       String?
+  emergencyContact Json?
 
   // Preferences
   language String  @default("en")
@@ -75,8 +68,8 @@ model Profile {
   dietaryRestrictions  String[]
   mobilityNeeds        String[]
   accessibilityNeeds   String[]
-  preferredTravelStyle String? // Use TravelStyle enum
-  travelCompanionPref  String? // Use TravelCompanion enum
+  preferredTravelStyle TravelStyle?
+  travelCompanionPref  TravelCompanion?
   interests            String[]
 
   // Communication Preferences
@@ -86,9 +79,8 @@ model Profile {
   marketingEmails    Boolean @default(false)
 
   // Account Details
-  emailVerified    Boolean @default(false)
-  twoFactorEnabled Boolean @default(false)
-  accountStatus    String  @default("ACTIVE") // Use AccountStatus enum
+  twoFactorEnabled Boolean       @default(false)
+  accountStatus    AccountStatus @default(ACTIVE)
 
   // Social Media Links
   twitterHandle   String?
@@ -100,15 +92,11 @@ model Profile {
   loyaltyPrograms Json?
   travelMemberIds Json?
 
-  // Statistics
-  totalTripsPlanned    Int      @default(0)
-  totalTripsCompleted  Int      @default(0)
+  // OPT: Removed totalTripsPlanned/totalTripsCompleted -- derivable via _count on TravelPlan
   countriesVisited     String[]
   favoriteDestinations String[]
 
   // Metadata
-  lastLogin            DateTime? @db.Timestamptz(3)
-  lastActive           DateTime? @db.Timestamptz(3)
   accountDeactivatedAt DateTime? @db.Timestamptz(3)
   deactivationReason   String?
 
@@ -116,7 +104,6 @@ model Profile {
   createdAt DateTime @default(now()) @db.Timestamptz(3)
   updatedAt DateTime @updatedAt @db.Timestamptz(3)
 
-  // Relations
   userId String @unique
   user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
 
@@ -132,31 +119,34 @@ model TravelPlan {
   destination String
   description String?
 
-  // Travel details
   startDate DateTime @db.Timestamptz(3)
   endDate   DateTime @db.Timestamptz(3)
   budget    Float?
-  travelers Int      @default(1)
 
-  // AI-generated content
+  // RENAMED: travelers → numberOfTravelers (more explicit, consistent with
+  // TravelPackageBooking.numberOfTravelers throughout the codebase)
+  numberOfTravelers Int @default(1)
+
+  // NEW: preferred travel style for this specific trip
+  // Drives AI recommendations and vendor suggestions
+  travelStyle TravelStyle?
+
+  // NEW: currency this travel plan is budgeted in
+  // Allows multi-currency support across bookings
+  currency String @default("USD")
+
   itinerary       Json?
   recommendations Json?
+  interests       String[]
 
-  // User preferences
-  interests String[]
-
-  // Status
   status TravelPlanStatus @default(PLANNING)
 
-  // Timestamps
   createdAt DateTime @default(now()) @db.Timestamptz(3)
   updatedAt DateTime @updatedAt @db.Timestamptz(3)
 
-  // Relations
   userId String
   user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
 
-  // Travel components
   experiences           TravelExperience[]
   accommodations        AccommodationBooking[]
   transportServices     TransportationBooking[]
@@ -165,6 +155,7 @@ model TravelPlan {
   experienceBookings    ExperienceBooking[]
 
   @@index([userId])
+  @@index([travelStyle])
   @@map("travel_plans")
 }
 
@@ -196,12 +187,26 @@ enum VendorSubscriptionPlan {
   ENTERPRISE
 }
 
+enum DocumentType {
+  BUSINESS_LICENSE
+  TAX_CERTIFICATE
+  ID_PROOF
+  INSURANCE
+  OTHER
+}
+
+enum TeamMemberRole {
+  ADMIN
+  MANAGER
+  EDITOR
+  VIEWER
+}
+
 model Vendor {
   id     String @id @default(cuid())
   userId String @unique
   user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
 
-  // Business Information
   businessName      String
   businessRegNumber String?      @unique
   taxId             String?
@@ -214,60 +219,55 @@ model Vendor {
   logo              String?
   coverImage        String?
 
-  // Verification
   verificationStatus VendorVerificationStatus @default(PENDING)
   verifiedAt         DateTime?
-  verifiedBy         String? // SuperAdmin ID
+  verifiedBy         String?
   verificationNotes  String?
 
-  // Commission & Fees
-  commissionRate     Float                  @default(10) // Platform commission percentage
+  commissionRate     Float                  @default(10)
   subscriptionPlan   VendorSubscriptionPlan @default(FREE)
   subscriptionExpiry DateTime?
   autoRenew          Boolean                @default(true)
 
-  // Ratings & Reviews
+  // Cached aggregates — updated by rating.service.js whenever a VendorReview
+  // is created, updated, or deleted for any of this vendor's listings.
+  // overallRating = weighted avg of all non-hidden reviews across all listing types
+  // totalReviews  = count of all non-hidden reviews
   overallRating Float @default(0)
-  totalReviews  Int   @default(0)
 
-  // Payment & Payout
-  payoutMethod     String? // 'BANK_TRANSFER', 'PAYPAL', 'STRIPE'
-  payoutDetails    Json? // Store encrypted payout details
+  // NEW: total non-hidden review count across all listings
+  totalReviews Int @default(0)
+
+  payoutMethod     String?
+  payoutDetails    Json?
   minimumPayout    Float   @default(100)
   balance          Float   @default(0)
   lifetimeEarnings Float   @default(0)
 
-  // Settings
   isActive       Boolean   @default(true)
   isFeatured     Boolean   @default(false)
   featuredUntil  DateTime?
   maxListings    Int       @default(100)
   maxTeamMembers Int       @default(1)
 
-  // Social Media
   facebookUrl  String?
   instagramUrl String?
   twitterUrl   String?
   linkedInUrl  String?
 
-  // Metadata
-  lastLoginAt      DateTime?
   lastActivityAt   DateTime?
   suspensionReason String?
   suspendedUntil   DateTime?
 
-  // Timestamps
   createdAt DateTime @default(now()) @db.Timestamptz(3)
   updatedAt DateTime @updatedAt @db.Timestamptz(3)
 
-  // Relations
   documents    VendorDocument[]
   teamMembers  VendorTeamMember[]
   reviews      VendorReview[]
   transactions Transaction[]
   payouts      Payout[]
 
-  // Service listings
   accommodations          Accommodation[]
   transportationProviders TransportationProvider[]
   travelPackages          TravelPackage[]
@@ -286,7 +286,7 @@ model VendorDocument {
   vendorId String
   vendor   Vendor @relation(fields: [vendorId], references: [id], onDelete: Cascade)
 
-  documentType   String // 'BUSINESS_LICENSE', 'TAX_CERT', 'ID_PROOF', 'INSURANCE'
+  documentType   DocumentType
   documentUrl    String
   documentNumber String?
   issueDate      DateTime?
@@ -298,7 +298,6 @@ model VendorDocument {
   verifiedBy      String?
   rejectionReason String?
 
-  // Metadata
   fileSize Int?
   mimeType String?
 
@@ -318,8 +317,8 @@ model VendorTeamMember {
   userId String
   user   User   @relation(fields: [userId], references: [id])
 
-  role        String // 'ADMIN', 'MANAGER', 'EDITOR', 'VIEWER'
-  permissions Json? // Granular permissions
+  role        TeamMemberRole
+  permissions Json?
 
   isActive  Boolean   @default(true)
   invitedAt DateTime?
@@ -343,32 +342,33 @@ model VendorReview {
   userId String
   user   User   @relation(fields: [userId], references: [id])
 
-  rating     Int       @default(5) // 1-5
+  rating     Int       @default(5)
   title      String?
   comment    String?
-  response   String? // Vendor response to review
+  response   String?
   responseAt DateTime?
 
-  // Metadata
   isVerifiedPurchase Boolean @default(false)
   travelPlanId       String?
-  bookingType        String? // 'ACCOMMODATION', 'TRANSPORTATION', 'PACKAGE'
+  bookingType        String?
   bookingId          String?
 
-  // Helpfulness
   helpfulCount Int     @default(0)
   reportCount  Int     @default(0)
   isHidden     Boolean @default(false)
 
-  createdAt          DateTime          @default(now()) @db.Timestamptz(3)
-  updatedAt          DateTime          @updatedAt @db.Timestamptz(3)
   travelPackage      TravelPackage?    @relation(fields: [travelPackageId], references: [id])
   travelPackageId    String?
   vendorExperience   VendorExperience? @relation(fields: [vendorExperienceId], references: [id])
   vendorExperienceId String?
 
-  @@unique([vendorId, userId])
+  createdAt DateTime @default(now()) @db.Timestamptz(3)
+  updatedAt DateTime @updatedAt @db.Timestamptz(3)
+
+  @@unique([vendorId, userId, bookingId])
   @@index([vendorId])
+  @@index([travelPackageId])
+  @@index([vendorExperienceId])
   @@index([rating])
   @@index([createdAt])
   @@map("vendor_reviews")
@@ -379,26 +379,16 @@ model VendorApplication {
   userId String @unique
   user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
 
-  // Business details
-  businessName    String
-  businessAddress String
-  businessPhone   String
-  businessEmail   String
-  taxId           String?
-  vendorTypes     VendorType[]
-
-  // Documents
-  documents      String[] // URLs to uploaded documents
+  taxId          String?
+  vendorTypes    VendorType[]
+  documents      String[]
   additionalInfo String?
 
-  // Status
   status          ApplicationStatus @default(PENDING)
-  reviewedBy      String? // SuperAdmin ID who reviewed
+  reviewedBy      String?
   reviewedAt      DateTime?
   rejectionReason String?
-  approvedTypes   VendorType[] // Which vendor types were approved
 
-  // Timestamps
   createdAt DateTime @default(now()) @db.Timestamptz(3)
   updatedAt DateTime @updatedAt @db.Timestamptz(3)
 
@@ -417,22 +407,19 @@ enum ApplicationStatus {
 
 model Accommodation {
   id          String  @id @default(cuid())
-  name        String  @unique
+  name        String
   description String?
 
-  // Location
   address   String
   city      String
   country   String
   latitude  Float?
   longitude Float?
 
-  // Contact
   phone   String?
   email   String?
   website String?
 
-  // Details
   starRating        Int?              @default(3)
   overallRating     Float?            @default(0)
   vendorId          String
@@ -440,37 +427,27 @@ model Accommodation {
   accommodationType AccommodationType @default(HOTEL)
   priceCategory     PriceCategory     @default(MIDRANGE)
 
-  // Amenities
   amenities String[]
   images    String[]
 
-  // Policies
-  checkInTime        String? // Format: "14:00:00"
-  checkOutTime       String? // Format: "11:00:00"
+  checkInTime        String?
+  checkOutTime       String?
   policies           Json?
   cancellationPolicy String?
 
-  // Status
   isActive      Boolean   @default(true)
   isVerified    Boolean   @default(false)
   isFeatured    Boolean   @default(false)
   featuredUntil DateTime?
 
-  // Stats
-  totalBookings Int @default(0)
-  totalReviews  Int @default(0)
-
-  // Timestamps
   createdAt DateTime @default(now()) @db.Timestamptz(3)
   updatedAt DateTime @updatedAt @db.Timestamptz(3)
 
-  // Relations
   rooms    AccommodationRoom[]
   services AccommodationService[]
   bookings AccommodationBooking[]
-  user     User?                  @relation(fields: [userId], references: [id])
-  userId   String?
 
+  @@unique([name, city, country])
   @@index([city])
   @@index([country])
   @@index([accommodationType])
@@ -485,28 +462,23 @@ model AccommodationRoom {
   roomType    RoomType
   description String?
 
-  // Room details
   beds         Int     @default(1)
   maxOccupancy Int     @default(2)
   hasView      Boolean @default(false)
   hasBalcony   Boolean @default(false)
   floor        Int?
 
-  // Amenities
   roomAmenities String[]
   basePrice     Float
   isAvailable   Boolean  @default(true)
 
-  // Relations
   accommodationId String
   accommodation   Accommodation @relation(fields: [accommodationId], references: [id], onDelete: Cascade)
 
-  // Timestamps
-  createdAt DateTime @default(now()) @db.Timestamptz(3) // UTC timestamp
-  updatedAt DateTime @updatedAt @db.Timestamptz(3) // UTC timestamp
+  createdAt DateTime @default(now()) @db.Timestamptz(3)
+  updatedAt DateTime @updatedAt @db.Timestamptz(3)
 
-  // Booking relation (fix: this should be many-to-many or one-to-many, not one-to-one)
-  bookings AccommodationBooking[] // Changed from single relation to array
+  bookings AccommodationBooking[]
 
   @@index([accommodationId])
   @@index([roomType])
@@ -519,26 +491,20 @@ model AccommodationService {
   description String?
   category    ServiceCategory
 
-  // Service details
   price       Float?
   isIncluded  Boolean @default(false)
   isAvailable Boolean @default(true)
 
-  // Timing - Store as strings since they're recurring daily times
-  availableStartTime String? // Format: "09:00:00"
-  availableEndTime   String? // Format: "17:00:00"
-  daysAvailable      String[] // Days of week: ["MONDAY", "TUESDAY", etc.]
-
-  // Location
+  availableStartTime      String?
+  availableEndTime        String?
+  daysAvailable           String[]
   locationInAccommodation String?
 
-  // Relations
   accommodationId String
   accommodation   Accommodation @relation(fields: [accommodationId], references: [id], onDelete: Cascade)
 
-  // Timestamps
-  createdAt DateTime @default(now()) @db.Timestamptz(3) // UTC timestamp
-  updatedAt DateTime @updatedAt @db.Timestamptz(3) // UTC timestamp
+  createdAt DateTime @default(now()) @db.Timestamptz(3)
+  updatedAt DateTime @updatedAt @db.Timestamptz(3)
 
   @@index([accommodationId])
   @@index([category])
@@ -548,54 +514,44 @@ model AccommodationService {
 model AccommodationBooking {
   id String @id @default(cuid())
 
-  // Booking details - Store as UTC timestamps
-  checkInDate  DateTime @db.Timestamptz(3) // UTC timestamp
-  checkOutDate DateTime @db.Timestamptz(3) // UTC timestamp
-  totalNights  Int
+  checkInDate  DateTime @db.Timestamptz(3)
+  checkOutDate DateTime @db.Timestamptz(3)
+  // OPT: Removed totalNights -- derivable: ceil((checkOutDate - checkInDate) / 86400000)
   totalGuests  Int      @default(1)
 
-  // Room details
-  roomType            RoomType
-  selectedRoomNumbers String[]
+  // OPT: Removed selectedRoomNumbers String[] -- duplicates the rooms relation
+  roomType RoomType
 
-  // Pricing
   pricePerNight Float
   taxes         Float? @default(0)
   serviceFee    Float? @default(0)
   totalCost     Float
 
-  // Guest information
   guestName       String
   guestEmail      String
   guestPhone      String?
   specialRequests String?
 
-  // Payment
   paymentStatus PaymentStatus  @default(PENDING)
   paymentMethod PaymentMethod?
   transactionId String?
 
-  // Status
   bookingStatus      BookingStatus @default(PENDING)
   cancellationPolicy String?
+  aiNotes            String?
 
-  // AI-generated
-  aiNotes String?
+  createdAt DateTime @default(now()) @db.Timestamptz(3)
+  updatedAt DateTime @updatedAt @db.Timestamptz(3)
 
-  // Timestamps
-  createdAt DateTime @default(now()) @db.Timestamptz(3) // UTC timestamp
-  updatedAt DateTime @updatedAt @db.Timestamptz(3) // UTC timestamp
-
-  // Relations
-  travelPlanId String
-  travelPlan   TravelPlan @relation(fields: [travelPlanId], references: [id], onDelete: Cascade)
-
+  travelPlanId    String
+  travelPlan      TravelPlan    @relation(fields: [travelPlanId], references: [id], onDelete: Cascade)
   accommodationId String
   accommodation   Accommodation @relation(fields: [accommodationId], references: [id])
+  rooms           AccommodationRoom[]
 
-  rooms AccommodationRoom[] // Many-to-many relation through join table would be better, but this works
+  // OPT: Added back-relation to Transaction for consistency with other booking models
+  transactions Transaction[]
 
-  // Validation: Ensure checkOutDate is after checkInDate (handle in app logic)
   @@index([travelPlanId])
   @@index([accommodationId])
   @@index([bookingStatus])
@@ -606,92 +562,89 @@ model AccommodationBooking {
 
 model TransportationProvider {
   id          String  @id @default(cuid())
-  name        String  @unique
+  name        String
   description String?
 
-  // Provider details
   providerType  TransportationProviderType
   serviceArea   String[]
   contactNumber String?
   email         String?
   website       String?
 
-  // Ratings
-  rating     Float? @default(0)
-  totalTrips Int?   @default(0)
+  // NEW: physical base city and country of the provider
+  // Enables location-based search alongside serviceArea[]
+  city    String?
+  country String?
 
-  // Pricing
+  rating Float? @default(0)
+
   baseFare      Float?
   perKmRate     Float?
   perMinuteRate Float?
 
-  // Availability
   isAvailable    Boolean @default(true)
   operatingHours Json?
+  vehicleTypes   String[]
 
-  // Vehicles
-  vehicleTypes String[]
-
-  // Status
   isVerified    Boolean   @default(false)
   isFeatured    Boolean   @default(false)
   featuredUntil DateTime?
 
-  // Stats
-  totalBookings Int @default(0)
-
-  // Timestamps
   createdAt DateTime @default(now()) @db.Timestamptz(3)
   updatedAt DateTime @updatedAt @db.Timestamptz(3)
 
-  // Relations
   vendorId String
   vendor   Vendor @relation(fields: [vendorId], references: [id])
 
   vehicles TransportationVehicle[]
   bookings TransportationBooking[]
-  user     User?                   @relation(fields: [userId], references: [id])
-  userId   String?
 
   @@index([providerType])
   @@index([name])
+  @@index([city])
+  @@index([country])
   @@index([vendorId])
   @@map("transportation_providers")
 }
 
 model TransportationVehicle {
   id            String @id @default(cuid())
-  vehicleNumber String @unique
-  vehicleType   String
+  vehicleNumber String @unique // Internal fleet tracking number
 
-  // Vehicle details
-  make     String?
-  model    String?
-  year     Int?
-  color    String?
-  capacity Int     @default(4)
+  // NEW: public-facing license plate (separate from internal vehicleNumber)
+  licensePlate String?
 
-  // Amenities
-  amenities String[]
+  vehicleType String
 
-  // Driver info
+  make      String?
+  model     String?
+  year      Int?
+  color     String?
+  capacity  Int      @default(4)
+  amenities String[] // Standard: AC, WiFi, USB charging, etc.
+
+  // NEW: marketing/display features shown to customers on listing pages
+  // Examples: "Luxury leather seats", "Entertainment system", "Baby seat available"
+  features String[]
+
   driverName    String?
   driverContact String?
   driverRating  Float?  @default(0)
 
-  // Status
-  isAvailable     Boolean @default(true)
-  currentLocation Json? // Store as JSON with lat/long and timestamp
+  // NEW: per-day and per-km pricing, separate from provider-level rates
+  // Allows per-vehicle pricing overrides (e.g. luxury car vs economy car)
+  pricePerDay Float?
+  pricePerKm  Float?
 
-  // Relations
+  isAvailable     Boolean @default(true)
+  currentLocation Json?
+
   providerId String
   provider   TransportationProvider @relation(fields: [providerId], references: [id], onDelete: Cascade)
 
-  // Timestamps
-  createdAt DateTime @default(now()) @db.Timestamptz(3) // UTC timestamp
-  updatedAt DateTime @updatedAt @db.Timestamptz(3) // UTC timestamp
+  createdAt DateTime @default(now()) @db.Timestamptz(3)
+  updatedAt DateTime @updatedAt @db.Timestamptz(3)
 
-  // Relations
   bookings TransportationBooking[]
 
   @@index([providerId])
@@ -702,44 +655,36 @@ model TransportationVehicle {
 model TransportationBooking {
   id String @id @default(cuid())
 
-  // Booking details - Store as UTC timestamps
   serviceType       TransportationServiceType
   pickupLocation    String
   dropoffLocation   String
-  pickupTime        DateTime                  @db.Timestamptz(3) // UTC timestamp
-  estimatedArrival  DateTime?                 @db.Timestamptz(3) // UTC timestamp
-  actualPickupTime  DateTime?                 @db.Timestamptz(3) // UTC timestamp
-  actualDropoffTime DateTime?                 @db.Timestamptz(3) // UTC timestamp
+  pickupTime        DateTime  @db.Timestamptz(3)
+  estimatedArrival  DateTime? @db.Timestamptz(3)
+  actualPickupTime  DateTime? @db.Timestamptz(3)
+  actualDropoffTime DateTime? @db.Timestamptz(3)
 
-  // Vehicle and driver
-  vehicleType   String?
-  vehicleNumber String?
-  driverName    String?
-  driverContact String?
+  // OPT: Renamed to snapshot* -- historical record if vehicle/driver changes post-booking
+  snapshotVehicleType   String?
+  snapshotVehicleNumber String?
+  snapshotDriverName    String?
+  snapshotDriverContact String?
 
-  // Passenger info
   numberOfPassengers Int     @default(1)
   specialRequests    String?
 
-  // Pricing
   estimatedFare Float?
   actualFare    Float?
   paymentMethod PaymentMethod?
-  isPaid        Boolean        @default(false)
   paymentStatus PaymentStatus  @default(PENDING)
 
-  // Status
   status TransportationStatus @default(BOOKED)
 
-  // AI-generated
   aiNotes      String?
   alternatives Json?
 
-  // Timestamps
-  createdAt DateTime @default(now()) @db.Timestamptz(3) // UTC timestamp
-  updatedAt DateTime @updatedAt @db.Timestamptz(3) // UTC timestamp
+  createdAt DateTime @default(now()) @db.Timestamptz(3)
+  updatedAt DateTime @updatedAt @db.Timestamptz(3)
 
-  // Relations
   travelPlanId String
   travelPlan   TravelPlan @relation(fields: [travelPlanId], references: [id], onDelete: Cascade)
 
@@ -749,7 +694,6 @@ model TransportationBooking {
   vehicleId String?
   vehicle   TransportationVehicle? @relation(fields: [vehicleId], references: [id])
 
-  // Validation: Ensure estimatedArrival is after pickupTime (handle in app logic)
   @@index([travelPlanId])
   @@index([providerId])
   @@index([status])
@@ -766,59 +710,55 @@ model TravelPackage {
 
   name         String
   description  String?
-  duration     Int // Duration in days
-  destinations String[] // Array of destinations
 
-  // Pricing
-  basePrice  Float
-  currency   String @default("USD")
-  discount   Float? @default(0)
-  finalPrice Float?
+  // RENAMED: duration → durationDays (explicit unit, consistent with agent/dashboard)
+  durationDays Int
 
-  // Inclusions
-  includes Json? // What's included in the package
-  excludes Json? // What's not included
+  destinations String[]
 
-  // Media
-  images String[]
-  video  String?
+  // finalPrice = basePrice - discount, compute at query time
+  basePrice Float
+  currency  String @default("USD")
+  discount  Float? @default(0)
 
-  // Itinerary
-  itinerary Json? // Day-wise itinerary
+  includes  Json?
+  excludes  Json?
+  images    String[]
+  video     String?
+  itinerary Json?
 
-  // Availability
   startDate     DateTime?
   endDate       DateTime?
   isRecurring   Boolean   @default(true)
-  availableDays String[] // Days of week when available
+  availableDays String[]
 
-  // Capacity
   minTravelers Int @default(1)
   maxTravelers Int @default(20)
 
-  // Status
+  // NEW: cached average rating from VendorReview records linked to this package
+  // Formula: AVG(VendorReview.rating WHERE travelPackageId = this.id AND isHidden = false)
+  // Updated by: rating.service.js → recomputePackageRating(packageId)
+  // Called by: any endpoint that creates/updates/deletes/hides a VendorReview
+  //            for a travel package booking
+  averageRating Float @default(0)
+
+  // NEW: cached count of non-hidden reviews for display ("Based on 42 reviews")
+  totalReviews Int @default(0)
+
   isActive      Boolean   @default(true)
   isFeatured    Boolean   @default(false)
   featuredUntil DateTime?
 
-  // Stats
-  totalBookings Int   @default(0)
-  averageRating Float @default(0)
-  totalReviews  Int   @default(0)
-
-  // Timestamps
   createdAt DateTime @default(now()) @db.Timestamptz(3)
   updatedAt DateTime @updatedAt @db.Timestamptz(3)
 
-  // Relations
   bookings TravelPackageBooking[]
-  reviews  VendorReview[] // Reviews for this package
-  user     User?                  @relation(fields: [userId], references: [id])
-  userId   String?
+  reviews  VendorReview[]
 
   @@index([vendorId])
   @@index([isActive])
   @@index([isFeatured])
+  @@index([averageRating])
   @@index([destinations])
   @@map("travel_packages")
 }
@@ -835,29 +775,24 @@ model TravelPackageBooking {
   endDate           DateTime @db.Timestamptz(3)
   numberOfTravelers Int      @default(1)
 
-  // Pricing
   basePrice   Float
   discount    Float? @default(0)
   finalAmount Float
   currency    String @default("USD")
 
-  // Guest information
   leadGuestName   String
   leadGuestEmail  String
   leadGuestPhone  String?
   specialRequests String?
 
-  // Status
   status        BookingStatus  @default(PENDING)
   paymentStatus PaymentStatus  @default(PENDING)
   paymentMethod PaymentMethod?
   transactionId String?
 
-  // Timestamps
   createdAt DateTime @default(now()) @db.Timestamptz(3)
   updatedAt DateTime @updatedAt @db.Timestamptz(3)
 
-  // Relations
   transactions Transaction[]
 
   @@index([packageId])
@@ -877,7 +812,6 @@ model VendorExperience {
   description String?
   category    ExperienceCategory
 
-  // Location
   location     String
   city         String
   country      String
@@ -885,59 +819,54 @@ model VendorExperience {
   longitude    Float?
   meetingPoint String?
 
-  // Pricing
   pricePerPerson Float
   currency       String @default("USD")
   childPrice     Float?
-  groupDiscount  Json? // Discount for groups
+  groupDiscount  Json?
 
-  // Duration
   durationHours Float
   startTime     String?
   endTime       String?
-  
-  // Capacity
+
   minParticipants Int @default(1)
   maxParticipants Int @default(20)
 
-  // Inclusions
   includes     String[]
   excludes     String[]
   whatToBring  String[]
   restrictions String?
 
-  // Media
   images String[]
   video  String?
 
-  // Availability
-  availableDays  String[] // Days of week
-  availableDates Json? // Specific available dates
-  blackoutDates  Json? // Unavailable dates
+  availableDays  String[]
+  availableDates Json?
+  blackoutDates  Json?
 
-  // Status
+  // NEW: cached average rating from VendorReview records linked to this experience
+  // Formula: AVG(VendorReview.rating WHERE vendorExperienceId = this.id AND isHidden = false)
+  // Updated by: rating.service.js → recomputeExperienceRating(experienceId)
+  // Called by: any endpoint that creates/updates/deletes/hides a VendorReview
+  //            for an experience booking
+  averageRating Float @default(0)
+
+  // NEW: cached count of non-hidden reviews for display ("Based on 17 reviews")
+  totalReviews Int @default(0)
+
   isActive      Boolean   @default(true)
   isFeatured    Boolean   @default(false)
   featuredUntil DateTime?
 
-  // Stats
-  totalBookings Int   @default(0)
-  averageRating Float @default(0)
-  totalReviews  Int   @default(0)
-
-  // Timestamps
   createdAt DateTime @default(now()) @db.Timestamptz(3)
   updatedAt DateTime @updatedAt @db.Timestamptz(3)
 
-  // Relations
   bookings ExperienceBooking[]
-  reviews  VendorReview[] // Reviews for this experience
-  user     User?               @relation(fields: [userId], references: [id])
-  userId   String?
+  reviews  VendorReview[]
 
   @@index([vendorId])
   @@index([city])
   @@index([category])
+  @@index([averageRating])
   @@index([isFeatured])
   @@map("vendor_experiences")
 }
@@ -954,29 +883,24 @@ model ExperienceBooking {
   numberOfParticipants Int      @default(1)
   numberOfChildren     Int      @default(0)
 
-  // Pricing
   unitPrice   Float
   childPrice  Float?
   totalAmount Float
   currency    String @default("USD")
 
-  // Guest information
   leadGuestName   String
   leadGuestEmail  String
   leadGuestPhone  String?
   specialRequests String?
 
-  // Status
   status        BookingStatus  @default(PENDING)
   paymentStatus PaymentStatus  @default(PENDING)
   paymentMethod PaymentMethod?
   transactionId String?
 
-  // Timestamps
   createdAt DateTime @default(now()) @db.Timestamptz(3)
   updatedAt DateTime @updatedAt @db.Timestamptz(3)
 
-  // Relations
   transactions Transaction[]
 
   @@index([experienceId])
@@ -986,6 +910,11 @@ model ExperienceBooking {
 }
 
 // ==================== FINANCIAL MODELS ====================
+//
+// Transaction = money IN  (customer pays for a booking, platform receives funds)
+// Payout      = money OUT (platform pays vendor, batching many transactions)
+//
+// Flow:  Booking --> Transaction(s) --> batched into --> Payout
 
 enum TransactionStatus {
   PENDING
@@ -1010,47 +939,43 @@ model Transaction {
   vendor   Vendor @relation(fields: [vendorId], references: [id])
 
   amount    Float
-  fee       Float // Platform fee
-  netAmount Float // Amount after fee
+  fee       Float  // Platform commission
+  netAmount Float  // amount - fee = vendor earnings
   currency  String            @default("USD")
   status    TransactionStatus @default(PENDING)
 
-  // Related entities
-  bookingType String // 'ACCOMMODATION', 'TRANSPORTATION', 'PACKAGE', 'EXPERIENCE'
-  bookingId   String
-
-  // Payment
   paymentMethod    PaymentMethod?
   paymentReference String?
   paymentDetails   Json?
 
-  // Refund
   refundAmount Float?
   refundReason String?
   refundedAt   DateTime?
 
-  // Metadata
   description String?
   metadata    Json?
 
-  // Timestamps
   createdAt   DateTime  @default(now()) @db.Timestamptz(3)
   updatedAt   DateTime  @updatedAt @db.Timestamptz(3)
   completedAt DateTime?
 
-  // Relations
-  payout                 Payout?               @relation(fields: [payoutId], references: [id])
-  user                   User?                 @relation(fields: [userId], references: [id])
-  userId                 String?
-  travelPackageBooking   TravelPackageBooking? @relation(fields: [travelPackageBookingId], references: [id])
+  // Which payout batch this transaction was included in
+  payout   Payout? @relation(fields: [payoutId], references: [id])
+  payoutId String?
+
+  // OPT: Replaced bookingType String + bookingId String with typed FKs
+  //      Gives referential integrity and removes stringly-typed polymorphism
+  accommodationBookingId String?
+  accommodationBooking   AccommodationBooking? @relation(fields: [accommodationBookingId], references: [id])
+
   travelPackageBookingId String?
-  experienceBooking      ExperienceBooking?    @relation(fields: [experienceBookingId], references: [id])
-  experienceBookingId    String?
-  payoutId               String?
+  travelPackageBooking   TravelPackageBooking? @relation(fields: [travelPackageBookingId], references: [id])
+
+  experienceBookingId String?
+  experienceBooking   ExperienceBooking? @relation(fields: [experienceBookingId], references: [id])
 
   @@index([vendorId])
   @@index([status])
-  @@index([bookingId])
   @@index([createdAt])
   @@map("transactions")
 }
@@ -1061,38 +986,32 @@ model Payout {
   vendor   Vendor @relation(fields: [vendorId], references: [id])
 
   amount    Float
-  fee       Float? // Payout processing fee
-  netAmount Float
+  fee       Float? // Payout processing fee e.g. bank transfer fee
+  netAmount Float  // amount - fee = what vendor actually receives
   currency  String       @default("USD")
   status    PayoutStatus @default(PENDING)
 
-  // Payout method
-  payoutMethod  String // 'BANK_TRANSFER', 'PAYPAL', 'STRIPE'
-  payoutDetails Json? // Store payout destination details
+  payoutMethod  String // BANK_TRANSFER | PAYPAL | STRIPE
+  payoutDetails Json?  // Destination details (store encrypted)
 
-  // Transactions included
-  transactionIds String[]
-
-  // Processing
   processorResponse  Json?
   processorReference String?
   processedAt        DateTime?
   failureReason      String?
 
-  // Bank details (encrypted)
+  // Bank details (store encrypted)
   bankName      String?
   accountNumber String?
   accountName   String?
   routingNumber String?
   swiftCode     String?
 
-  // Timestamps
   requestedAt DateTime  @default(now()) @db.Timestamptz(3)
   completedAt DateTime?
   createdAt   DateTime  @default(now()) @db.Timestamptz(3)
   updatedAt   DateTime  @updatedAt @db.Timestamptz(3)
 
-  // Relations
+  // All transactions included in this payout batch
   transactions Transaction[]
 
   @@index([vendorId])
@@ -1108,44 +1027,34 @@ model RetailStore {
   name        String
   description String?
 
-  // Store details
   storeType RetailStoreType @default(SHOPPING_MALL)
   address   String
   city      String
   country   String
   category  String?
 
-  // Location coordinates - ADD THESE FIELDS
-  latitude  Float?   // Add this
-  longitude Float?   // Add this
+  latitude  Float?
+  longitude Float?
 
-  // Contact
   phone   String?
   email   String?
   website String?
 
-  // Store information
   openingHours Json?
   rating       Float?      @default(0)
   priceRange   PriceRange?
+  products     Json?
+  images       String[]
 
-  // Products
-  products Json?
-
-  // Images
-  images String[]
-
-  // Status
   isActive   Boolean @default(true)
   isVerified Boolean @default(false)
-  vendorId   String? // Optional - stores can be independent or vendor-owned
-  vendor     Vendor? @relation(fields: [vendorId], references: [id])
 
-  // Timestamps
+  vendorId String?
+  vendor   Vendor? @relation(fields: [vendorId], references: [id])
+
   createdAt DateTime @default(now()) @db.Timestamptz(3)
   updatedAt DateTime @updatedAt @db.Timestamptz(3)
 
-  // Relations
   visits ShoppingVisit[]
 
   @@index([city])
@@ -1158,27 +1067,20 @@ model RetailStore {
 model ShoppingVisit {
   id String @id @default(cuid())
 
-  // Visit details - Store as UTC timestamps
-  plannedDate     DateTime  @db.Timestamptz(3) // UTC timestamp
-  actualVisitDate DateTime? @db.Timestamptz(3) // UTC timestamp
-  duration        Int? // Duration in minutes
+  plannedDate     DateTime  @db.Timestamptz(3)
+  actualVisitDate DateTime? @db.Timestamptz(3)
+  duration        Int?
 
-  // Shopping intent
   purpose      String?
   plannedItems Json?
+  status       ShoppingVisitStatus @default(PLANNED)
 
-  // Status
-  status ShoppingVisitStatus @default(PLANNED)
-
-  // AI-generated
   aiNotes         String?
   recommendations Json?
 
-  // Timestamps
-  createdAt DateTime @default(now()) @db.Timestamptz(3) // UTC timestamp
-  updatedAt DateTime @updatedAt @db.Timestamptz(3) // UTC timestamp
+  createdAt DateTime @default(now()) @db.Timestamptz(3)
+  updatedAt DateTime @updatedAt @db.Timestamptz(3)
 
-  // Relations
   travelPlanId String
   travelPlan   TravelPlan @relation(fields: [travelPlanId], references: [id], onDelete: Cascade)
 
@@ -1198,24 +1100,17 @@ model TravelExperience {
   title       String
   description String?
 
-  // Experience details - Store date as UTC timestamp
-  date      DateTime @db.Timestamptz(3) // UTC timestamp
-  startTime String? // Format: "14:30:00" - since it's a recurring time within the date
-  endTime   String? // Format: "16:30:00"
+  date      DateTime           @db.Timestamptz(3)
+  startTime String?
+  endTime   String?
   location  String?
-  cost      Float?   @default(0)
+  cost      Float?             @default(0)
+  category  ExperienceCategory @default(SIGHTSEEING)
+  aiNotes   String?
 
-  // Category
-  category ExperienceCategory @default(SIGHTSEEING)
+  createdAt DateTime @default(now()) @db.Timestamptz(3)
+  updatedAt DateTime @updatedAt @db.Timestamptz(3)
 
-  // AI-generated
-  aiNotes String?
-
-  // Timestamps
-  createdAt DateTime @default(now()) @db.Timestamptz(3) // UTC timestamp
-  updatedAt DateTime @updatedAt @db.Timestamptz(3) // UTC timestamp
-
-  // Relations
   travelPlanId String
   travelPlan   TravelPlan @relation(fields: [travelPlanId], references: [id], onDelete: Cascade)
 
@@ -1228,8 +1123,8 @@ model RefreshToken {
   token     String   @unique
   userId    String
   user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
-  expiresAt DateTime @db.Timestamptz(3) // UTC timestamp
-  createdAt DateTime @default(now()) @db.Timestamptz(3) // UTC timestamp
+  expiresAt DateTime @db.Timestamptz(3)
+  createdAt DateTime @default(now()) @db.Timestamptz(3)
   isRevoked Boolean  @default(false)
 
   @@index([userId])
@@ -1237,9 +1132,35 @@ model RefreshToken {
   @@map("refresh_tokens")
 }
 
+// ==================== NOTIFICATIONS ====================
+
+model Notification {
+  id     String @id @default(cuid())
+  userId String
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  type    String
+  title   String
+  message String?
+  data    Json?
+
+  isRead Boolean   @default(false)
+  readAt DateTime? @db.Timestamptz(3)
+
+  severity NotificationSeverity @default(INFO)
+  icon     String?
+
+  createdAt DateTime @default(now()) @db.Timestamptz(3)
+  updatedAt DateTime @updatedAt @db.Timestamptz(3)
+
+  @@index([userId])
+  @@index([userId, isRead])
+  @@index([createdAt])
+  @@map("notifications")
+}
+
 // ==================== ENUMS ====================
 
-// Travel Plan enums
 enum TravelPlanStatus {
   PLANNING
   ONGOING
@@ -1258,7 +1179,6 @@ enum ExperienceCategory {
   OTHER
 }
 
-// Accommodation enums
 enum AccommodationType {
   HOTEL
   RESORT
@@ -1299,7 +1219,6 @@ enum ServiceCategory {
   OTHER
 }
 
-// Booking enums
 enum BookingStatus {
   PENDING
   CONFIRMED
@@ -1317,7 +1236,6 @@ enum PaymentStatus {
   PARTIALLY_PAID
 }
 
-// Transportation enums
 enum TransportationProviderType {
   TAXI_SERVICE
   RIDE_SHARING
@@ -1360,7 +1278,6 @@ enum PaymentMethod {
   VOUCHER
 }
 
-// Retail enums
 enum RetailStoreType {
   SHOPPING_MALL
   DEPARTMENT_STORE
@@ -1418,35 +1335,6 @@ enum TravelCompanion {
   FRIENDS
   GROUP_TOUR
   BUSINESS_COLLEAGUES
-}
-
-model Notification {
-  id        String   @id @default(cuid())
-  userId    String
-  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
-
-  // Core content
-  type      String               // e.g. "BOOKING_CONFIRMED", "PAYOUT_PROCESSED", "REVIEW_REMINDER", "VENDOR_VERIFICATION_UPDATE"
-  title     String
-  message   String?
-  data      Json?                // optional structured payload (e.g. { bookingId: "...", vendorId: "..." })
-
-  // Status
-  isRead    Boolean  @default(false)
-  readAt    DateTime? @db.Timestamptz(3)
-
-  // Priority / UI hints
-  severity  NotificationSeverity @default(INFO)  // LOW, MEDIUM, HIGH, URGENT
-  icon      String?              // optional frontend icon name
-
-  // Timestamps
-  createdAt DateTime @default(now()) @db.Timestamptz(3)
-  updatedAt DateTime @updatedAt     @db.Timestamptz(3)
-
-  @@index([userId])
-  @@index([userId, isRead])
-  @@index([createdAt])
-  @@map("notifications")
 }
 
 enum NotificationSeverity {

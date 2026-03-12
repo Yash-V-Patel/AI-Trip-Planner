@@ -1,12 +1,55 @@
-const redisConfig = require('../config/redis');
+"use strict";
+
+/**
+ * redis.service.js
+ *
+ * Intentionally minimal. Redis stores only two categories of data:
+ *
+ *   1. Refresh-token fingerprints  — enables server-side session revocation
+ *      without relying solely on JWT expiry.
+ *
+ *   2. User profile cache          — profile changes rarely; caching it
+ *      avoids a DB hit on every authenticated request that needs profile data.
+ *
+ * Access tokens are validated by verifying the JWT signature directly —
+ * no Redis round-trip required. Tokens travel via httpOnly cookies, not
+ * Authorization headers (though the header is still accepted as a fallback).
+ *
+ * Utility sections (rate-limiting, distributed lock, deletePattern, pub/sub,
+ * health checks) are kept for infrastructure use across the codebase.
+ */
+
+const crypto      = require("crypto");
+const redisConfig = require("../config/redis");
+
+// ─── TTL constants (seconds) ─────────────────────────────────────────────────
+
+const TTL = {
+  PROFILE:       2 * 60 * 60,        // 2 h — profile cache
+  REFRESH_TOKEN: 7 * 24 * 60 * 60,   // 7 d — matches JWT refresh expiry
+};
+
+// ─── internal helper ─────────────────────────────────────────────────────────
+
+/**
+ * HMAC-SHA-256 of (token + secret) — deterministic, one-way fingerprint.
+ * The raw token is never written to Redis.
+ */
+const makeFingerprint = (token) =>
+  crypto
+    .createHmac("sha256", process.env.JWT_REFRESH_SECRET ?? "fallback")
+    .update(token)
+    .digest("hex");
+
+// ─── service ─────────────────────────────────────────────────────────────────
 
 class RedisService {
   constructor() {
+    /** @type {import('ioredis').Redis | null} */
     this.client = null;
-    this.defaultTTL = 3600; // 1 hour default TTL
-    this.tokenTTL = 604800; // 7 days for tokens
-    this.permissionTTL = 300; // 5 minutes for permissions
-    this.refreshTokenTTL = 7 * 24 * 60 * 60; // 7 days for refresh tokens
+
+    // Expose so controllers can reference TTLs without magic numbers
+    this.TTL = TTL;
   }
 
   async init() {
@@ -14,526 +57,312 @@ class RedisService {
     return this.client;
   }
 
-  // ==================== TOKEN MANAGEMENT (Optimized) ====================
+  // ==================== REFRESH TOKEN FINGERPRINTS ====================
+  //
+  // Key layout:
+  //   refresh:{userId}:{fingerprint}  →  JSON metadata   TTL = 7 d
+  //   user:refresh:{userId}           →  Redis SET of active fingerprints
+  //
+  // The SET lets us enumerate / revoke ALL sessions for a user in O(n).
 
   /**
-   * Store refresh token fingerprint in Redis
-   * Instead of storing the entire token, store a fingerprint (hashed version)
-   * This is more secure and uses less memory
+   * Persist a new refresh-token fingerprint after login / register / token rotation.
+   *
+   * @param {string} userId
+   * @param {string} refreshToken   raw JWT string (never stored, only hashed)
+   * @param {object} [metadata]     e.g. { ip, userAgent, loginTime }
+   * @returns {string|null} fingerprint
    */
   async storeRefreshTokenFingerprint(userId, refreshToken, metadata = {}) {
-    // Create a fingerprint (hash) of the refresh token
-    const crypto = require('crypto');
-    const fingerprint = crypto
-      .createHash('sha256')
-      .update(refreshToken + process.env.JWT_REFRESH_SECRET)
-      .digest('hex');
-    
-    const key = `refresh:${userId}:${fingerprint}`;
-    
-    // Store with 7 days expiry (matching refresh token)
-    await this.client.setex(
-      key,
-      this.refreshTokenTTL,
-      JSON.stringify({
-        userId,
-        fingerprint,
-        createdAt: Date.now(),
-        ...metadata
-      })
-    );
+    if (!this.client) return null;
 
-    // Add to user's refresh token set for easy management
-    await this.client.sadd(`user:refresh:${userId}`, fingerprint);
-    
-    return fingerprint;
+    const fp  = makeFingerprint(refreshToken);
+    const key = `refresh:${userId}:${fp}`;
+
+    const pipeline = this.client.pipeline();
+    pipeline.setex(
+      key,
+      TTL.REFRESH_TOKEN,
+      JSON.stringify({ userId, fingerprint: fp, createdAt: Date.now(), ...metadata })
+    );
+    pipeline.sadd(`user:refresh:${userId}`, fp);
+    pipeline.expire(`user:refresh:${userId}`, TTL.REFRESH_TOKEN);
+    await pipeline.exec();
+
+    return fp;
   }
 
   /**
-   * Validate refresh token by checking fingerprint
+   * Validate a refresh token.
+   * Returns the stored metadata object if valid, or null if revoked / expired / absent.
+   *
+   * @param {string} userId
+   * @param {string} refreshToken
+   * @returns {object|null}
    */
   async validateRefreshToken(userId, refreshToken) {
-    const crypto = require('crypto');
-    const fingerprint = crypto
-      .createHash('sha256')
-      .update(refreshToken + process.env.JWT_REFRESH_SECRET)
-      .digest('hex');
-    
-    const key = `refresh:${userId}:${fingerprint}`;
-    const data = await this.client.get(key);
-    
+    if (!this.client) return null;
+
+    const fp   = makeFingerprint(refreshToken);
+    const data = await this.client.get(`refresh:${userId}:${fp}`).catch(() => null);
     return data ? JSON.parse(data) : null;
   }
 
   /**
-   * Remove refresh token fingerprint
+   * Revoke a single refresh token (single-session logout).
+   *
+   * @param {string} userId
+   * @param {string} refreshToken
    */
   async removeRefreshTokenFingerprint(userId, refreshToken) {
-    const crypto = require('crypto');
-    const fingerprint = crypto
-      .createHash('sha256')
-      .update(refreshToken + process.env.JWT_REFRESH_SECRET)
-      .digest('hex');
-    
-    const key = `refresh:${userId}:${fingerprint}`;
-    await this.client.del(key);
-    await this.client.srem(`user:refresh:${userId}`, fingerprint);
+    if (!this.client) return;
+
+    const fp       = makeFingerprint(refreshToken);
+    const pipeline = this.client.pipeline();
+    pipeline.del(`refresh:${userId}:${fp}`);
+    pipeline.srem(`user:refresh:${userId}`, fp);
+    await pipeline.exec();
   }
 
   /**
-   * Remove all refresh tokens for a user
+   * Revoke ALL refresh tokens for a user (all-session logout, password change).
+   *
+   * @param {string} userId
    */
   async removeAllUserRefreshTokens(userId) {
-    const fingerprints = await this.client.smembers(`user:refresh:${userId}`);
-    
-    if (fingerprints.length > 0) {
-      const pipeline = this.client.pipeline();
-      
-      for (const fingerprint of fingerprints) {
-        pipeline.del(`refresh:${userId}:${fingerprint}`);
-      }
-      
-      pipeline.del(`user:refresh:${userId}`);
-      await pipeline.exec();
+    if (!this.client) return;
+
+    const fingerprints = await this.client.smembers(`user:refresh:${userId}`).catch(() => []);
+    if (!fingerprints.length) return;
+
+    const pipeline = this.client.pipeline();
+    for (const fp of fingerprints) {
+      pipeline.del(`refresh:${userId}:${fp}`);
     }
+    pipeline.del(`user:refresh:${userId}`);
+    await pipeline.exec();
   }
 
   /**
-   * Get all active refresh token fingerprints for a user
+   * Return all active fingerprints for a user (useful for a "manage devices" screen).
+   *
+   * @param {string} userId
+   * @returns {string[]}
    */
   async getUserRefreshTokens(userId) {
-    return await this.client.smembers(`user:refresh:${userId}`);
+    if (!this.client) return [];
+    return this.client.smembers(`user:refresh:${userId}`).catch(() => []);
   }
 
-  // ==================== ACCESS TOKEN MANAGEMENT ====================
+  // ==================== PROFILE CACHE ====================
+  //
+  // Profile is read on nearly every authenticated request.
+  // Key: profile:{userId}   TTL: 2 h
+  // Invalidate on any profile write.
 
   /**
-   * Cache access token for quick lookup
+   * Write a user's profile to cache.
+   *
+   * @param {string} userId
+   * @param {object} profileData
    */
-  async cacheAccessToken(userId, token) {
-    const crypto = require('crypto');
-    const tokenHash = crypto
-      .createHash('sha256')
-      .update(token)
-      .digest('hex');
-    
-    const key = `token:access:${tokenHash}`;
-    await this.client.setex(
-      key,
-      this.tokenTTL,
-      JSON.stringify({ userId, type: 'access' })
-    );
-  }
-
-  /**
-   * Validate access token from cache
-   */
-  async validateAccessToken(token) {
-    const crypto = require('crypto');
-    const tokenHash = crypto
-      .createHash('sha256')
-      .update(token)
-      .digest('hex');
-    
-    const key = `token:access:${tokenHash}`;
-    const data = await this.client.get(key);
-    return data ? JSON.parse(data) : null;
-  }
-
-  /**
-   * Invalidate/remove access token
-   */
-  async invalidateAccessToken(token) {
-    const crypto = require('crypto');
-    const tokenHash = crypto
-      .createHash('sha256')
-      .update(token)
-      .digest('hex');
-    
-    const key = `token:access:${tokenHash}`;
-    await this.client.del(key);
-  }
-
-  // ==================== TOKEN BLACKLIST ====================
-
-  /**
-   * Blacklist access token until it expires
-   */
-  async blacklistAccessToken(token, expiryInSeconds) {
-    const crypto = require('crypto');
-    const tokenHash = crypto
-      .createHash('sha256')
-      .update(token)
-      .digest('hex');
-    
-    const key = `blacklist:${tokenHash}`;
-    await this.client.setex(key, expiryInSeconds, '1');
-  }
-
-  /**
-   * Check if access token is blacklisted
-   */
-  async isAccessTokenBlacklisted(token) {
-    const crypto = require('crypto');
-    const tokenHash = crypto
-      .createHash('sha256')
-      .update(token)
-      .digest('hex');
-    
-    const key = `blacklist:${tokenHash}`;
-    const result = await this.client.get(key);
-    return result !== null;
-  }
-
-  // ==================== LEGACY TOKEN METHODS (Keep for backward compatibility) ====================
-
-  async cacheUserTokens(userId, tokens) {
-    const key = `user:tokens:${userId}`;
-    await this.client.setex(
-      key, 
-      this.tokenTTL, 
-      JSON.stringify(tokens)
-    );
-    
-    // Cache individual access token using new method
-    if (tokens.accessToken) {
-      await this.cacheAccessToken(userId, tokens.accessToken);
-    }
-  }
-
-  async getUserTokens(userId) {
-    const key = `user:tokens:${userId}`;
-    const data = await this.client.get(key);
-    return data ? JSON.parse(data) : null;
-  }
-
-  async invalidateUserTokens(userId) {
-    const key = `user:tokens:${userId}`;
-    const tokens = await this.getUserTokens(userId);
-    
-    if (tokens && tokens.accessToken) {
-      await this.invalidateAccessToken(tokens.accessToken);
-    }
-    
-    // Delete user tokens key
-    await this.client.del(key);
-  }
-
-  // ==================== USER CACHING ====================
-
-  async cacheUser(userId, userData) {
-    const key = `user:data:${userId}`;
-    await this.client.setex(
-      key,
-      this.defaultTTL,
-      JSON.stringify(userData)
-    );
-  }
-
-  async getUser(userId) {
-    const key = `user:data:${userId}`;
-    const data = await this.client.get(key);
-    return data ? JSON.parse(data) : null;
-  }
-
-  async cacheUserByEmail(email, userData) {
-    const key = `user:email:${email}`;
-    await this.client.setex(
-      key,
-      this.defaultTTL,
-      JSON.stringify(userData)
-    );
-  }
-
-  async getUserByEmail(email) {
-    const key = `user:email:${email}`;
-    const data = await this.client.get(key);
-    return data ? JSON.parse(data) : null;
-  }
-
-  async invalidateUserCache(userId, email) {
-    await this.client.del(`user:data:${userId}`);
-    if (email) {
-      await this.client.del(`user:email:${email}`);
-    }
-  }
-
-  // ==================== PROFILE CACHING ====================
-
   async cacheProfile(userId, profileData) {
-    const key = `profile:${userId}`;
-    await this.client.setex(
-      key,
-      this.defaultTTL,
-      JSON.stringify(profileData)
-    );
+    if (!this.client) return;
+    this.client
+      .setex(`profile:${userId}`, TTL.PROFILE, JSON.stringify(profileData))
+      .catch(() => {});
   }
 
+  /**
+   * Read a user's profile from cache. Returns null on miss or error.
+   *
+   * @param {string} userId
+   * @returns {object|null}
+   */
   async getProfile(userId) {
-    const key = `profile:${userId}`;
-    const data = await this.client.get(key);
+    if (!this.client) return null;
+    const data = await this.client.get(`profile:${userId}`).catch(() => null);
     return data ? JSON.parse(data) : null;
   }
 
+  /**
+   * Evict a user's profile from cache. Call after any profile update.
+   *
+   * @param {string} userId
+   */
   async invalidateProfile(userId) {
-    await this.client.del(`profile:${userId}`);
-  }
-
-  // ==================== PERMISSION CACHING (OpenFGA Tuples) ====================
-
-  async cachePermission(userId, object, relation, allowed) {
-    const key = `perm:${userId}:${object}:${relation}`;
-    await this.client.setex(
-      key,
-      this.permissionTTL,
-      JSON.stringify({ allowed, timestamp: Date.now() })
-    );
-  }
-
-  async getCachedPermission(userId, object, relation) {
-    const key = `perm:${userId}:${object}:${relation}`;
-    const data = await this.client.get(key);
-    return data ? JSON.parse(data) : null;
-  }
-
-  async cacheBatchPermissions(userId, permissions) {
-    const pipeline = this.client.pipeline();
-    
-    for (const { object, relation, allowed } of permissions) {
-      const key = `perm:${userId}:${object}:${relation}`;
-      pipeline.setex(key, this.permissionTTL, JSON.stringify({ allowed, timestamp: Date.now() }));
-    }
-    
-    await pipeline.exec();
-  }
-
-  async invalidatePermission(userId, object, relation) {
-    const key = `perm:${userId}:${object}:${relation}`;
-    await this.client.del(key);
-  }
-
-  async invalidateAllUserPermissions(userId) {
-    const pattern = `perm:${userId}:*`;
-    const keys = await this.client.keys(pattern);
-    if (keys.length > 0) {
-      await this.client.del(keys);
-    }
-  }
-
-  // ==================== TRAVEL PLAN CACHING ====================
-
-  async cacheTravelPlan(planId, planData) {
-    const key = `travelplan:${planId}`;
-    await this.client.setex(
-      key,
-      this.defaultTTL,
-      JSON.stringify(planData)
-    );
-  }
-
-  async getTravelPlan(planId) {
-    const key = `travelplan:${planId}`;
-    const data = await this.client.get(key);
-    return data ? JSON.parse(data) : null;
-  }
-
-  async cacheUserTravelPlans(userId, plans) {
-    const key = `user:travelplans:${userId}`;
-    await this.client.setex(
-      key,
-      this.defaultTTL / 2,
-      JSON.stringify(plans)
-    );
-  }
-
-  async getUserTravelPlans(userId) {
-    const key = `user:travelplans:${userId}`;
-    const data = await this.client.get(key);
-    return data ? JSON.parse(data) : null;
-  }
-
-  async invalidateTravelPlan(planId, userId) {
-    await this.client.del(`travelplan:${planId}`);
-    await this.client.del(`user:travelplans:${userId}`);
-  }
-
-  // ==================== SESSION MANAGEMENT ====================
-
-  async createSession(userId, sessionData) {
-    const sessionId = require('crypto').randomBytes(32).toString('hex');
-    const key = `session:${sessionId}`;
-    
-    await this.client.setex(
-      key,
-      this.tokenTTL,
-      JSON.stringify({ userId, ...sessionData, createdAt: Date.now() })
-    );
-    
-    await this.client.sadd(`user:sessions:${userId}`, sessionId);
-    
-    return sessionId;
-  }
-
-  async getSession(sessionId) {
-    const key = `session:${sessionId}`;
-    const data = await this.client.get(key);
-    return data ? JSON.parse(data) : null;
-  }
-
-  async destroySession(sessionId) {
-    const session = await this.getSession(sessionId);
-    if (session) {
-      await this.client.srem(`user:sessions:${session.userId}`, sessionId);
-    }
-    await this.client.del(`session:${sessionId}`);
-  }
-
-  async destroyAllUserSessions(userId) {
-    const sessions = await this.client.smembers(`user:sessions:${userId}`);
-    
-    const pipeline = this.client.pipeline();
-    for (const sessionId of sessions) {
-      pipeline.del(`session:${sessionId}`);
-    }
-    pipeline.del(`user:sessions:${userId}`);
-    
-    await pipeline.exec();
+    if (!this.client) return;
+    this.client.del(`profile:${userId}`).catch(() => {});
   }
 
   // ==================== RATE LIMITING ====================
 
+  /**
+   * Increment the request counter for `key` and return the window state.
+   * Uses a pipeline to keep the incr + ttl check in a single round-trip.
+   *
+   * @param {string} key
+   * @param {number} windowSeconds
+   * @param {number} maxRequests
+   * @returns {{ current: number, remaining: number, reset: number }}
+   */
   async incrementRateLimit(key, windowSeconds = 60, maxRequests = 60) {
-    const current = await this.client.incr(key);
-    
+    if (!this.client) return { current: 0, remaining: maxRequests, reset: windowSeconds };
+
+    const pipeline                       = this.client.pipeline();
+    pipeline.incr(key);
+    pipeline.ttl(key);
+    const [[, current], [, ttl]]         = await pipeline.exec();
+
+    // Set expiry only on the very first request in a new window
     if (current === 1) {
-      await this.client.expire(key, windowSeconds);
+      this.client.expire(key, windowSeconds).catch(() => {});
     }
-    
-    const ttl = await this.client.ttl(key);
-    
+
+    const resetIn = ttl > 0 ? ttl : windowSeconds;
     return {
       current,
       remaining: Math.max(0, maxRequests - current),
-      reset: ttl
+      reset:     resetIn,
     };
   }
 
+  /**
+   * Peek at the rate-limit state without incrementing.
+   *
+   * @param {string} key
+   * @param {number} windowSeconds
+   * @param {number} maxRequests
+   * @returns {{ allowed: boolean, remaining: number, reset: number }}
+   */
   async checkRateLimit(key, windowSeconds = 60, maxRequests = 60) {
-    const current = await this.client.get(key);
-    const count = current ? parseInt(current) : 0;
-    
-    if (count >= maxRequests) {
-      const ttl = await this.client.ttl(key);
-      return {
-        allowed: false,
-        remaining: 0,
-        reset: ttl
-      };
-    }
-    
+    if (!this.client) return { allowed: true, remaining: maxRequests, reset: 0 };
+
+    const [raw, ttl] = await Promise.all([
+      this.client.get(key).catch(() => null),
+      this.client.ttl(key).catch(() => -1),
+    ]);
+
+    const count   = raw ? parseInt(raw, 10) : 0;
+    const resetIn = ttl > 0 ? ttl : windowSeconds;
+
+    return count >= maxRequests
+      ? { allowed: false, remaining: 0, reset: resetIn }
+      : { allowed: true,  remaining: maxRequests - count, reset: resetIn };
+  }
+
+  // ==================== DISTRIBUTED LOCK ====================
+
+  /**
+   * Acquire a Redis lock for `resource`.
+   * Returns `{ success: true, release }` on success, `{ success: false }` otherwise.
+   *
+   * @param {string} resource   logical name, e.g. "payout:vendor:abc"
+   * @param {number} ttl        lock expiry in seconds
+   */
+  async acquireLock(resource, ttl = 10) {
+    if (!this.client) return { success: false };
+
+    const lockKey   = `lock:${resource}`;
+    const lockValue = crypto.randomBytes(16).toString("hex");
+    const acquired  = await this.client.set(lockKey, lockValue, "NX", "EX", ttl);
+
+    if (acquired !== "OK") return { success: false };
+
     return {
-      allowed: true,
-      remaining: maxRequests - count,
-      reset: await this.client.ttl(key)
+      success: true,
+      value:   lockValue,
+      release: async () => {
+        const current = await this.client.get(lockKey).catch(() => null);
+        if (current === lockValue) {
+          this.client.del(lockKey).catch(() => {});
+        }
+      },
     };
   }
 
-  // ==================== LOCKING MECHANISM ====================
+  // ==================== PATTERN DELETE ====================
 
-  async acquireLock(resource, ttl = 10) {
-    const lockKey = `lock:${resource}`;
-    const lockValue = require('crypto').randomBytes(16).toString('hex');
-    
-    const acquired = await this.client.set(
-      lockKey,
-      lockValue,
-      'NX',
-      'EX',
-      ttl
-    );
-    
-    if (acquired === 'OK') {
-      return {
-        success: true,
-        value: lockValue,
-        release: async () => {
-          const currentValue = await this.client.get(lockKey);
-          if (currentValue === lockValue) {
-            await this.client.del(lockKey);
-          }
-        }
-      };
-    }
-    
-    return { success: false };
+  /**
+   * Delete all keys matching a glob pattern using a non-blocking SCAN cursor.
+   * NEVER use KEYS in production — it blocks the entire Redis server.
+   *
+   * Used by controllers to invalidate list caches after mutations, e.g.:
+   *   redisService.deletePattern("accommodations:list:*")
+   *
+   * @param {string} pattern
+   * @returns {number} count of deleted keys
+   */
+  async deletePattern(pattern) {
+    if (!this.client) return 0;
+
+    let cursor  = "0";
+    let deleted = 0;
+
+    do {
+      const [next, keys] = await this.client.scan(cursor, "MATCH", pattern, "COUNT", 200);
+      cursor = next;
+
+      // Batch at 500 to avoid an oversized single DEL command
+      for (let i = 0; i < keys.length; i += 500) {
+        const batch = keys.slice(i, i + 500);
+        if (batch.length) deleted += await this.client.del(...batch).catch(() => 0);
+      }
+    } while (cursor !== "0");
+
+    return deleted;
   }
 
-  // ==================== PUB/SUB ====================
+  // ==================== PUB / SUB ====================
 
   async publish(channel, message) {
-    await this.client.publish(channel, JSON.stringify(message));
+    if (!this.client) return;
+    await this.client.publish(channel, JSON.stringify(message)).catch(() => {});
   }
 
   async subscribe(channel, callback) {
     const subscriber = redisConfig.getSubscriber();
     await subscriber.subscribe(channel);
-    
-    subscriber.on('message', (ch, message) => {
-      if (ch === channel) {
-        callback(JSON.parse(message));
-      }
+    subscriber.on("message", (ch, message) => {
+      if (ch === channel) callback(JSON.parse(message));
     });
   }
 
-  // ==================== HEALTH CHECK ====================
+  // ==================== HEALTH ====================
 
   async ping() {
-    return await this.client.ping();
+    if (!this.client) return null;
+    return this.client.ping().catch(() => null);
   }
 
   async getStats() {
-    const info = await this.client.info();
-    const stats = {
-      connected: redisConfig.isConnected,
-      memory: await this.client.info('memory'),
-      stats: await this.client.info('stats')
+    if (!this.client) return { connected: false };
+    return {
+      connected: redisConfig.isConnected ?? true,
+      memory:    await this.client.info("memory").catch(() => null),
+      stats:     await this.client.info("stats").catch(() => null),
     };
-    return stats;
   }
 
-  // ==================== BATCH OPERATIONS ====================
+  // ==================== BATCH HELPERS ====================
 
   async mget(keys) {
-    return await this.client.mget(keys);
+    if (!this.client) return keys.map(() => null);
+    return this.client.mget(keys).catch(() => keys.map(() => null));
   }
-
-  async mset(entries, ttl = this.defaultTTL) {
-    const pipeline = this.client.pipeline();
-    
-    for (const [key, value] of Object.entries(entries)) {
-      pipeline.setex(key, ttl, JSON.stringify(value));
-    }
-    
-    return await pipeline.exec();
-  }
-
-  async deletePattern(pattern) {
-    const keys = await this.client.keys(pattern);
-    if (keys.length > 0) {
-      return await this.client.del(keys);
-    }
-    return 0;
-  }
-
-  // ==================== CLEANUP METHODS ====================
 
   /**
-   * Clean up expired tokens (can be called periodically)
+   * @param {Record<string, any>} entries
+   * @param {number|null}         ttl     defaults to TTL.PROFILE
    */
-  async cleanupExpiredTokens() {
-    // This is handled automatically by Redis TTL
-    // But we can add manual cleanup if needed
-    return { success: true, message: 'Redis handles TTL automatically' };
+  async mset(entries, ttl = null) {
+    if (!this.client) return;
+    const resolvedTtl = ttl ?? TTL.PROFILE;
+    const pipeline    = this.client.pipeline();
+    for (const [key, value] of Object.entries(entries)) {
+      pipeline.setex(key, resolvedTtl, JSON.stringify(value));
+    }
+    return pipeline.exec().catch(() => {});
   }
 }
 

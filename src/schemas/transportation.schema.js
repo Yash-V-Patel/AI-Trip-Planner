@@ -1,5 +1,7 @@
+// Updated schemas file: schemas/transportation.schema.js
 const Joi = require('joi');
 
+// Enums (as defined in original)
 const providerTypeEnum = [
   'TAXI_SERVICE', 'RIDE_SHARING', 'CAR_RENTAL', 'BUS_COMPANY',
   'TRAIN_SERVICE', 'AIRLINE', 'FERRY_SERVICE', 'BICYCLE_RENTAL', 'OTHER'
@@ -15,8 +17,9 @@ const transportationStatusEnum = [
 
 const paymentMethodEnum = ['CASH', 'CARD', 'DIGITAL_WALLET', 'ONLINE_PAYMENT', 'VOUCHER'];
 const paymentStatusEnum = ['PENDING', 'PAID', 'REFUNDED', 'FAILED', 'PARTIALLY_PAID'];
+const daysOfWeekEnum = ['MONDAY', 'TUESDAY', 'WEDNESDAY', 'THURSDAY', 'FRIDAY', 'SATURDAY', 'SUNDAY'];
 
-// Create provider schema
+// ==================== Provider Schemas ====================
 const createProviderSchema = Joi.object({
   name: Joi.string().required().max(255),
   description: Joi.string().max(2000).allow(''),
@@ -25,6 +28,7 @@ const createProviderSchema = Joi.object({
   contactNumber: Joi.string().pattern(/^[0-9+\-\s()]{10,20}$/),
   email: Joi.string().email().max(255),
   website: Joi.string().uri().max(255),
+  rating: Joi.number().min(0).max(5),
   baseFare: Joi.number().positive().precision(2),
   perKmRate: Joi.number().positive().precision(2),
   perMinuteRate: Joi.number().positive().precision(2),
@@ -34,13 +38,26 @@ const createProviderSchema = Joi.object({
   isVerified: Joi.boolean().default(false)
 });
 
-// Update provider schema
 const updateProviderSchema = createProviderSchema.fork(
   ['name', 'providerType', 'serviceArea'],
   (field) => field.optional()
 );
 
-// Create vehicle schema
+const toggleProviderStatusSchema = Joi.object({
+  isAvailable: Joi.boolean().required()
+});
+
+const providerStatsSchema = Joi.object({
+  id: Joi.string().required()
+}).unknown(true); // for path params
+
+const providerBookingsQuerySchema = Joi.object({
+  status: Joi.string().valid(...transportationStatusEnum).optional(),
+  page: Joi.number().integer().min(1).default(1),
+  limit: Joi.number().integer().min(1).max(100).default(20)
+});
+
+// ==================== Vehicle Schemas ====================
 const createVehicleSchema = Joi.object({
   vehicleNumber: Joi.string().required().max(50),
   vehicleType: Joi.string().required().max(50),
@@ -60,90 +77,142 @@ const createVehicleSchema = Joi.object({
   })
 });
 
-// Update vehicle schema
 const updateVehicleSchema = createVehicleSchema.fork(
   ['vehicleNumber', 'vehicleType'],
   (field) => field.optional()
 );
 
-// Bulk vehicles schema
 const bulkVehiclesSchema = Joi.object({
   vehicles: Joi.array().items(createVehicleSchema).min(1).max(100).required()
 });
 
-// Update location schema
 const updateLocationSchema = Joi.object({
   lat: Joi.number().min(-90).max(90).required(),
   lng: Joi.number().min(-180).max(180).required()
 });
 
-// Create booking schema
-const createBookingSchema = Joi.object({
-  serviceType: Joi.string().valid(...serviceTypeEnum).required(),
-  pickupLocation: Joi.string().required().max(500),
-  dropoffLocation: Joi.string().required().max(500),
-  pickupTime: Joi.date().iso().required(),
-  estimatedArrival: Joi.date().iso().greater(Joi.ref('pickupTime')),
-  numberOfPassengers: Joi.number().integer().min(1).max(100).default(1),
-  specialRequests: Joi.string().max(1000).allow(''),
-  estimatedFare: Joi.number().positive().precision(2),
-  paymentMethod: Joi.string().valid(...paymentMethodEnum),
-  providerId: Joi.string().required(),
-  vehicleId: Joi.string(),
-  vehicleType: Joi.string(),
-  vehicleNumber: Joi.string(),
-  driverName: Joi.string(),
-  driverContact: Joi.string().pattern(/^[0-9+\-\s()]{10,20}$/)
+const bulkUpdateVehicleAvailabilitySchema = Joi.object({
+  vehicleIds: Joi.array().items(Joi.string()).min(1).required(),
+  isAvailable: Joi.boolean().required()
 });
 
-// Update booking schema
-const updateBookingSchema = Joi.object({
-  pickupTime: Joi.date().iso(),
-  estimatedArrival: Joi.date().iso(),
-  specialRequests: Joi.string().max(1000).allow(''),
-  estimatedFare: Joi.number().positive().precision(2),
-  actualFare: Joi.number().positive().precision(2),
-  actualPickupTime: Joi.date().iso(),
-  actualDropoffTime: Joi.date().iso(),
-  status: Joi.string().valid(...transportationStatusEnum),
-  paymentMethod: Joi.string().valid(...paymentMethodEnum),
-  paymentStatus: Joi.string().valid(...paymentStatusEnum),
-  isPaid: Joi.boolean()
-}).min(1);
-
-// Fare calculation schema
-const fareCalculationSchema = Joi.object({
-  providerId: Joi.string().required(),
-  distance: Joi.number().positive(),
-  duration: Joi.number().positive(),
-  vehicleType: Joi.string()
-}).min(2);
-
-// Available vehicles query schema
-const availableVehiclesQuerySchema = Joi.object({
-  pickupTime: Joi.date().iso().required(),
-  dropoffTime: Joi.date().iso().greater(Joi.ref('pickupTime')).required(),
-  passengers: Joi.number().integer().min(1).max(100).default(1),
-  vehicleType: Joi.string()
-});
-
-// Vehicle history query schema
 const vehicleHistoryQuerySchema = Joi.object({
   from: Joi.date().iso(),
   to: Joi.date().iso(),
   limit: Joi.number().integer().min(1).max(200).default(50)
 });
 
+// ==================== Booking Schemas ====================
+const createBookingSchema = Joi.object({
+  providerId: Joi.string().required(),
+  vehicleId: Joi.string().optional(),
+  serviceType: Joi.string().valid(...serviceTypeEnum).required(),
+  pickupLocation: Joi.string().required().max(500),
+  dropoffLocation: Joi.string().required().max(500),
+  pickupTime: Joi.date().iso().required(),
+  estimatedArrival: Joi.date().iso().greater(Joi.ref('pickupTime')).optional(),
+  numberOfPassengers: Joi.number().integer().min(1).max(100).default(1),
+  specialRequests: Joi.string().max(1000).allow(''),
+  estimatedFare: Joi.number().positive().precision(2).optional(),
+  paymentMethod: Joi.string().valid(...paymentMethodEnum).optional()
+  // Snapshot fields are not expected from client; they are stamped from vehicle record.
+});
+
+const updateBookingSchema = Joi.object({
+  pickupLocation: Joi.string().max(500),
+  dropoffLocation: Joi.string().max(500),
+  pickupTime: Joi.date().iso(),
+  estimatedArrival: Joi.date().iso(),
+  numberOfPassengers: Joi.number().integer().min(1).max(100),
+  specialRequests: Joi.string().max(1000).allow(''),
+  status: Joi.string().valid(...transportationStatusEnum),
+  paymentMethod: Joi.string().valid(...paymentMethodEnum),
+  paymentStatus: Joi.string().valid(...paymentStatusEnum),
+  actualFare: Joi.number().positive().precision(2),
+  actualPickupTime: Joi.date().iso(),
+  actualDropoffTime: Joi.date().iso()
+}).min(1);
+
+// Fare calculation schema
+const fareCalculationSchema = Joi.object({
+  providerId: Joi.string().required(),
+  distance: Joi.number().positive().optional(),
+  duration: Joi.number().positive().optional(),
+  vehicleType: Joi.string().optional()
+}).min(2); // at least providerId + one other field
+
+// Available vehicles query schema
+const availableVehiclesQuerySchema = Joi.object({
+  pickupTime: Joi.date().iso().required(),
+  dropoffTime: Joi.date().iso().greater(Joi.ref('pickupTime')).required(),
+  passengers: Joi.number().integer().min(1).max(100).default(1),
+  vehicleType: Joi.string().optional()
+});
+
+// ==================== Admin Schemas ====================
+const adminProvidersQuerySchema = Joi.object({
+  vendorId: Joi.string(),
+  isAvailable: Joi.boolean(),
+  isVerified: Joi.boolean(),
+  isFeatured: Joi.boolean(),
+  providerType: Joi.string().valid(...providerTypeEnum),
+  search: Joi.string(),
+  sortBy: Joi.string().valid('createdAt', 'name', 'rating', 'baseFare'),
+  sortOrder: Joi.string().valid('asc', 'desc'),
+  page: Joi.number().integer().min(1).default(1),
+  limit: Joi.number().integer().min(1).max(100).default(20)
+});
+
+const adminVerifyProviderSchema = Joi.object({
+  isVerified: Joi.boolean().required()
+});
+
+const adminFeatureProviderSchema = Joi.object({
+  isFeatured: Joi.boolean().required(),
+  featuredUntil: Joi.date().iso().optional()
+});
+
+const adminBookingsQuerySchema = Joi.object({
+  status: Joi.string().valid(...transportationStatusEnum),
+  providerId: Joi.string(),
+  vehicleId: Joi.string(),
+  from: Joi.date().iso(),
+  to: Joi.date().iso(),
+  page: Joi.number().integer().min(1).default(1),
+  limit: Joi.number().integer().min(1).max(100).default(20)
+});
+
+const adminUpdateBookingStatusSchema = Joi.object({
+  status: Joi.string().valid(...transportationStatusEnum).required(),
+  notes: Joi.string().max(1000)
+});
+
 module.exports = {
+  // Provider
   createProviderSchema,
   updateProviderSchema,
+  toggleProviderStatusSchema,
+  providerStatsSchema,
+  providerBookingsQuerySchema,
+  
+  // Vehicle
   createVehicleSchema,
   updateVehicleSchema,
   bulkVehiclesSchema,
   updateLocationSchema,
+  bulkUpdateVehicleAvailabilitySchema,
+  vehicleHistoryQuerySchema,
+  
+  // Booking
   createBookingSchema,
   updateBookingSchema,
   fareCalculationSchema,
   availableVehiclesQuerySchema,
-  vehicleHistoryQuerySchema
+  
+  // Admin
+  adminProvidersQuerySchema,
+  adminVerifyProviderSchema,
+  adminFeatureProviderSchema,
+  adminBookingsQuerySchema,
+  adminUpdateBookingStatusSchema
 };

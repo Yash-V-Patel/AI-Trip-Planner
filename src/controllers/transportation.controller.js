@@ -1,589 +1,404 @@
+"use strict";
+
 const { PrismaClient } = require("@prisma/client");
 const openfgaService = require("../services/openfga.service");
 const redisService = require("../services/redis.service");
 
 const prisma = new PrismaClient();
 
+// ---------------------------------------------------------------------------
+// Constants
+// ---------------------------------------------------------------------------
+
+const PROVIDER_CACHE_TTL_S = 3600; // 1 hour
+const DEFAULT_PAGE  = 1;
+const DEFAULT_LIMIT = 10;
+
+// TransportationStatus enum values
+const ACTIVE_BOOKING_STATUSES    = ["BOOKED", "CONFIRMED", "ON_THE_WAY", "ARRIVED", "DELAYED"];
+const TERMINAL_BOOKING_STATUSES  = ["COMPLETED", "CANCELLED"];
+
+// Vehicle types that carry a fare premium
+const PREMIUM_VEHICLE_TYPES = new Set(["LUXURY", "SUV", "PREMIUM"]);
+const PREMIUM_MULTIPLIER = 1.5;
+
+const ALLOWED_SORT_FIELDS = new Set([
+  "createdAt", "name", "rating", "baseFare",
+]);
+
+// ---------------------------------------------------------------------------
+// Module-level helpers
+// ---------------------------------------------------------------------------
+
+const notFound   = (res, msg = "Resource not found") => res.status(404).json({ success: false, message: msg });
+const forbidden  = (res, msg = "Unauthorized access") => res.status(403).json({ success: false, message: msg });
+const badRequest = (res, msg) => res.status(400).json({ success: false, message: msg });
+
+const parseIntParam = (val, fallback) => {
+  const n = parseInt(val, 10);
+  return Number.isFinite(n) && n > 0 ? n : fallback;
+};
+
+const parseFloatParam = (val, fallback) => {
+  const n = parseFloat(val);
+  return Number.isFinite(n) ? n : fallback;
+};
+
+const parsePagination = (query, defaultLimit = DEFAULT_LIMIT) => {
+  const page  = parseIntParam(query.page,  DEFAULT_PAGE);
+  const limit = parseIntParam(query.limit, defaultLimit);
+  return { page, limit, skip: (page - 1) * limit };
+};
+
+const buildPaginationMeta = (page, limit, total) => ({
+  page, limit, total, pages: Math.ceil(total / limit),
+});
+
+/**
+ * Invalidate both the single-provider cache and the list pattern.
+ * Fire-and-forget — never blocks a response.
+ */
+const invalidateProviderCache = (providerId) =>
+  Promise.allSettled([
+    redisService.client?.del(`transportation:provider:${providerId}`),
+    redisService.deletePattern?.("transportation:providers:list:*"),
+  ]);
+
+// ---------------------------------------------------------------------------
+// Permission helpers
+// ---------------------------------------------------------------------------
+
+/**
+ * Returns the vendor record (id only) for a user IF the vendor is
+ * verified and active.  Returns null otherwise.
+ */
+const getActiveVendor = (userId) =>
+  prisma.vendor.findFirst({
+    where:  { userId, verificationStatus: "VERIFIED", isActive: true },
+    select: { id: true },
+  });
+
+/**
+ * Decide whether `user` may manage `providerId`.
+ *
+ * BUG FIX: original `getMyProviders` queried `vendorId: userId`
+ * (User.id vs Vendor.id — different ID spaces). All ownership checks
+ * now correctly compare provider.vendorId ↔ vendor.id.
+ *
+ * BUG FIX: `createProvider` had typo `"veiw"` as action, which always
+ * fell through to the `canSellTransportation` OpenFGA check even for
+ * the creation guard.  Fixed: creation uses a clean `getActiveVendor` call.
+ */
+const canManageProvider = async (user, providerId = null, action = "view") => {
+  if (user?.isSuperAdmin) return true;
+  if (!user?.id) return false;
+
+  if (!providerId) {
+    // Creation guard: must be a verified, active vendor
+    const vendor = await getActiveVendor(user.id);
+    return !!vendor;
+  }
+
+  // For existing providers fetch both records concurrently
+  const [vendor, provider] = await Promise.all([
+    prisma.vendor.findUnique({ where: { userId: user.id }, select: { id: true } }),
+    prisma.transportationProvider.findUnique({
+      where:  { id: providerId },
+      select: { vendorId: true },
+    }),
+  ]);
+
+  if (!provider) return false;
+
+  // Vendor owns this provider
+  if (vendor && provider.vendorId === vendor.id) {
+    if (action === "delete") {
+      const active = await prisma.transportationBooking.count({
+        where: { providerId, status: { in: ACTIVE_BOOKING_STATUSES } },
+      });
+      return active === 0;
+    }
+    return true;
+  }
+
+  // OpenFGA fallback for team members
+  const fgaFns = {
+    delete:          openfgaService.canDeleteTransportationProvider,
+    update:          openfgaService.canEditTransportationProvider,
+    edit:            openfgaService.canEditTransportationProvider,
+    view:            openfgaService.canViewTransportationProvider,
+    manage_vehicles: openfgaService.canManageProviderVehicles,
+    update_avail:    openfgaService.canUpdateProviderAvailability,
+  };
+  return !!(await fgaFns[action]?.(user.id, providerId).catch(() => false));
+};
+
+/**
+ * Decide whether `user` may manage a specific vehicle / vehicles on a provider.
+ *
+ * BUG FIX: original bypassed vendor-ownership check for vehicleId case and
+ * jumped straight to OpenFGA.  Now fetches vendor + vehicle's provider
+ * concurrently and does ownership check first.
+ */
+const canManageVehicle = async (user, providerId, vehicleId = null, action = "view") => {
+  if (user?.isSuperAdmin) return true;
+
+  // Ownership check first (same pattern as accommodation/service helpers)
+  const [vendor, provider] = await Promise.all([
+    prisma.vendor.findUnique({ where: { userId: user?.id }, select: { id: true } }),
+    prisma.transportationProvider.findUnique({
+      where:  { id: providerId },
+      select: { vendorId: true },
+    }),
+  ]);
+
+  if (vendor && provider?.vendorId === vendor.id) return true;
+
+  if (!vehicleId) {
+    return !!(await openfgaService.canManageProviderVehicles?.(user?.id, providerId).catch(() => false));
+  }
+
+  const fgaFns = {
+    delete: openfgaService.canDeleteTransportationVehicle,
+    edit:   openfgaService.canEditTransportationVehicle,
+    view:   openfgaService.canViewTransportationVehicle,
+  };
+  return !!(await fgaFns[action]?.(user?.id, vehicleId).catch(() => false));
+};
+
+// ---------------------------------------------------------------------------
+// Controller
+// ---------------------------------------------------------------------------
+
 class TransportationController {
-  constructor() {
-    // Bind all methods
-    this.createProvider = this.createProvider.bind(this);
-    this.getAllProviders = this.getAllProviders.bind(this);
-    this.getProviderById = this.getProviderById.bind(this);
-    this.updateProvider = this.updateProvider.bind(this);
-    this.deleteProvider = this.deleteProvider.bind(this);
-    this.addVehicle = this.addVehicle.bind(this);
-    this.updateVehicle = this.updateVehicle.bind(this);
-    this.deleteVehicle = this.deleteVehicle.bind(this);
-    this.createBooking = this.createBooking.bind(this);
-    this.getBookingById = this.getBookingById.bind(this);
-    this.updateBooking = this.updateBooking.bind(this);
-    this.cancelBooking = this.cancelBooking.bind(this);
-    this.getAvailableVehicles = this.getAvailableVehicles.bind(this);
-    this.calculateFare = this.calculateFare.bind(this);
-    this.getProviderStats = this.getProviderStats.bind(this);
-    this.getMyProviders = this.getMyProviders.bind(this);
-    this.bulkAddVehicles = this.bulkAddVehicles.bind(this);
-    this.updateVehicleLocation = this.updateVehicleLocation.bind(this);
-    this.getVehicleHistory = this.getVehicleHistory.bind(this);
-  }
 
-  // ==================== HELPER METHODS ====================
+  // ==================== PROVIDER MANAGEMENT ====================
 
   /**
-   * Check if user can manage transportation provider
-   */
-  async canManageProvider(user, providerId = null, action = "view") {
-    try {
-      // SuperAdmin always has access
-      if (user?.isSuperAdmin) return true;
-
-      // If user is not authenticated
-      if (!user?.id) return false;
-
-      if (!providerId) {
-        // CREATING NEW PROVIDER
-
-        // First check if user has a vendor record in database
-        const vendor = await prisma.vendor.findUnique({
-          where: { userId: user.id },
-          select: {
-            id: true,
-            verificationStatus: true,
-            isActive: true,
-          },
-        });
-
-        // Vendor must exist, be verified, and be active
-        if (!vendor) {
-          console.log(
-            `User ${user.id} attempted to create provider but has no vendor record`,
-          );
-          return false;
-        }
-
-        if (vendor.verificationStatus !== "VERIFIED") {
-          console.log(`Vendor ${vendor.id} is not verified`);
-          return false;
-        }
-
-        if (!vendor.isActive) {
-          console.log(`Vendor ${vendor.id} is not active`);
-          return false;
-        }
-
-        // Check OpenFGA for specific transportation selling permission
-        const canSellTransportation =
-          (await openfgaService.checkPermission?.(
-            user.id,
-            "can_sell_transportation",
-            `vendor:${vendor.id}`,
-          )) || false;
-
-        // Also check generic vendor status as fallback
-        const isVendor = (await openfgaService.isVendor?.(user.id)) || false;
-
-        // User can create if they have either specific transportation permission OR generic vendor status
-        return canSellTransportation || isVendor;
-      }
-
-      // FOR EXISTING PROVIDERS
-      // First verify the provider exists and get its vendorId
-      const provider = await prisma.transportationProvider.findUnique({
-        where: { id: providerId },
-        select: { vendorId: true },
-      });
-
-      if (!provider) {
-        console.log(`Provider ${providerId} not found`);
-        return false;
-      }
-
-      // Check if user owns this provider (via vendor record)
-      const vendor = await prisma.vendor.findUnique({
-        where: { userId: user.id },
-      });
-
-      // If user is the vendor who owns this provider, grant access based on action
-      if (vendor && provider.vendorId === vendor.id) {
-        // Vendor/owner can do everything except maybe delete if there are active bookings
-        if (action === "delete") {
-          // Check for active bookings before allowing delete
-          const activeBookings = await prisma.transportationBooking.count({
-            where: {
-              providerId,
-              status: { in: ["BOOKED", "CONFIRMED", "ON_THE_WAY"] },
-            },
-          });
-          return activeBookings === 0;
-        }
-        return true; // Owners can do everything else
-      }
-
-      // If not the owner, check OpenFGA permissions for team members/managers
-      switch (action) {
-        case "delete":
-          return (
-            (await openfgaService.canDeleteTransportationProvider?.(
-              user.id,
-              providerId,
-            )) || false
-          );
-
-        case "update":
-          return (
-            (await openfgaService.canUpdateTransportationProvider?.(
-              user.id,
-              providerId,
-            )) || false
-          );
-
-        case "edit":
-          return (
-            (await openfgaService.canEditTransportationProvider?.(
-              user.id,
-              providerId,
-            )) || false
-          );
-
-        case "view":
-          return (
-            (await openfgaService.canViewTransportationProvider?.(
-              user.id,
-              providerId,
-            )) || false
-          );
-
-        case "manage_vehicles":
-          return (
-            (await openfgaService.canManageProviderVehicles?.(
-              user.id,
-              providerId,
-            )) || false
-          );
-
-        default:
-          return false;
-      }
-    } catch (error) {
-      console.error("Error in canManageProvider:", error);
-      return false;
-    }
-  }
-  /**
-   * Check if user can manage vehicles
-   */
-  async canManageVehicle(user, providerId, vehicleId = null, action = "view") {
-    try {
-      // SuperAdmin always has access
-      if (user?.isSuperAdmin) return true;
-
-      if (vehicleId) {
-        // Check specific vehicle permissions
-        switch (action) {
-          case "delete":
-            return (
-              (await openfgaService.canDeleteTransportationVehicle?.(
-                user?.id,
-                vehicleId,
-              )) || false
-            );
-          case "edit":
-            return (
-              (await openfgaService.canEditTransportationVehicle?.(
-                user?.id,
-                vehicleId,
-              )) || false
-            );
-          case "view":
-            return (
-              (await openfgaService.canViewTransportationVehicle?.(
-                user?.id,
-                vehicleId,
-              )) || false
-            );
-          default:
-            return false;
-        }
-      } else {
-        // Check if user can manage vehicles in this provider
-        return await this.canManageProvider(
-          user,
-          providerId,
-          "manage_vehicles",
-        );
-      }
-    } catch (error) {
-      console.error("Error in canManageVehicle:", error);
-      return false;
-    }
-  }
-
-  /**
-   * Check if user has permission for travel plan operations
-   */
-  async checkTravelPlanPermission(userId, travelPlanId, requiredPermission) {
-    try {
-      switch (requiredPermission) {
-        case "edit":
-          return (
-            (await openfgaService.canEditTravelPlan?.(userId, travelPlanId)) ||
-            false
-          );
-        case "view":
-          return (
-            (await openfgaService.canViewTravelPlan?.(userId, travelPlanId)) ||
-            false
-          );
-        case "suggest":
-          return (
-            (await openfgaService.canSuggestTravelPlan?.(
-              userId,
-              travelPlanId,
-            )) || false
-          );
-        default:
-          return false;
-      }
-    } catch (error) {
-      console.error("Error checking travel plan permission:", error);
-      return false;
-    }
-  }
-
-  // ==================== TRANSPORTATION PROVIDER MANAGEMENT ====================
-
-  /**
-   * Create a new transportation provider
    * POST /api/transportation/providers
-   */
-  /**
-   * Create a new transportation provider
-   * POST /api/transportation/providers
+   * Create — approved vendors only
    */
   async createProvider(req, res, next) {
     try {
-      // Check permission
-      let user = req.user;
-      const canManage = await this.canManageProvider(user, null, "veiw");
-      if (!canManage) {
-        return res.status(403).json({
-          success: false,
-          message: "Only approved vendors can create transportation providers",
-        });
-      }
-      console.log(req.user);
-      // Find the vendor record for this user
+      // BUG FIX: was passing "veiw" (typo) as action
+      const canCreate = await canManageProvider(req.user);
+      if (!canCreate) return forbidden(res, "Only approved vendors can create transportation providers");
+
       const vendor = await prisma.vendor.findUnique({
-        where: { userId: req.user.id },
+        where:  { userId: req.user.id },
+        select: { id: true },
       });
+      if (!vendor) return forbidden(res, "Vendor profile not found. Please register as a vendor first.");
 
-      if (!vendor) {
-        return res.status(404).json({
-          success: false,
-          message:
-            "Vendor profile not found. Please register as a vendor first.",
-        });
-      }
-
-      const providerData = req.body;
-
-      // Convert contact number to string if present
-      if (providerData.contactNumber) {
-        providerData.contactNumber = String(providerData.contactNumber);
-      }
-
-      // Add vendorId from the vendor record
-      providerData.vendorId = vendor.id;
+      const {
+        name, description, providerType, serviceArea, contactNumber, email, website,
+        rating, baseFare, perKmRate, perMinuteRate, isAvailable, operatingHours, vehicleTypes,
+      } = req.body;
 
       const provider = await prisma.transportationProvider.create({
-        data: providerData,
-        include: {
-          vehicles: true,
+        data: {
+          vendorId: vendor.id,
+          name, providerType,
+          serviceArea:   serviceArea   ?? [],
+          vehicleTypes:  vehicleTypes  ?? [],
+          ...(description    !== undefined && { description }),
+          ...(contactNumber  !== undefined && { contactNumber: String(contactNumber) }),
+          ...(email          !== undefined && { email }),
+          ...(website        !== undefined && { website }),
+          ...(rating         !== undefined && { rating }),
+          ...(baseFare       !== undefined && { baseFare }),
+          ...(perKmRate      !== undefined && { perKmRate }),
+          ...(perMinuteRate  !== undefined && { perMinuteRate }),
+          ...(isAvailable    !== undefined && { isAvailable }),
+          ...(operatingHours !== undefined && { operatingHours }),
         },
+        include: { vehicles: true },
       });
 
-      // Set up OpenFGA relations
-      if (openfgaService.createTransportationProviderRelations) {
-        await openfgaService.createTransportationProviderRelations(
-          req.user.id,
-          provider.id,
-        );
-      }
+      // OpenFGA + cache invalidation (fire-and-forget)
+      Promise.allSettled([
+        openfgaService.createTransportationProviderRelations(req.user.id, provider.id),
+        redisService.deletePattern?.("transportation:providers:list:*"),
+      ]);
 
-      // Check if permission already exists before granting
-      const hasPermission = await openfgaService.checkPermission?.(
-        req.user.id,
-        "can_sell_transportation",
-        `vendor:${vendor.id}`,
-      );
-
-      if (!hasPermission) {
-        await openfgaService.grantVendorPermission?.(
-          req.user.id,
-          vendor.id,
-          "can_sell_transportation",
-        );
-      }
-      // Invalidate providers list cache
-      await redisService.client?.del("transportation:providers:list:*");
-
-      res.status(201).json({
+      return res.status(201).json({
         success: true,
         data: provider,
         message: "Transportation provider created successfully",
       });
     } catch (error) {
       if (error.code === "P2002" && error.meta?.target?.includes("name")) {
-        return res.status(409).json({
-          success: false,
-          message: "Provider with this name already exists",
-        });
+        return res.status(409).json({ success: false, message: "Provider with this name already exists" });
       }
       next(error);
     }
   }
+
   /**
-   * Get all transportation providers with filtering
    * GET /api/transportation/providers
-   * Access: Public
+   * Public listing — BUG FIX: `location` and `search` both set `where.OR`,
+   * so search silently overwrote location filter. Rebuilt with AND[].
    */
   async getAllProviders(req, res, next) {
     try {
       const {
-        providerType,
-        city,
-        location, // New: search by location/city
-        search, // New: search by name/description
-        minRating,
-        vehicleType, // New: filter by vehicle type
-        page = 1,
-        limit = 10,
-        sortBy = "rating",
-        sortOrder = "desc",
+        providerType, city, location, search, minRating, vehicleType,
+        sortBy = "rating", sortOrder = "desc",
       } = req.query;
+      const { page, limit, skip } = parsePagination(req.query);
 
-      // Build filter
-      const where = {
-        isAvailable: true, // Only show active providers
-      };
+      const safeSortBy    = ALLOWED_SORT_FIELDS.has(sortBy) ? sortBy : "rating";
+      const safeSortOrder = sortOrder === "asc" ? "asc" : "desc";
 
-      // Filter by provider type
-      if (providerType) {
-        where.providerType = providerType;
-      }
+      const AND = [{ isAvailable: true }];
 
-      // Enhanced location/city search
+      if (providerType) AND.push({ providerType });
+
       if (location) {
-        // Search in serviceArea array and name/description
-        where.OR = [
-          { serviceArea: { has: location } },
-          { name: { contains: location, mode: "insensitive" } },
-          { description: { contains: location, mode: "insensitive" } },
-        ];
+        AND.push({
+          OR: [
+            { serviceArea: { has: location } },
+            { name:        { contains: location, mode: "insensitive" } },
+            { description: { contains: location, mode: "insensitive" } },
+          ],
+        });
       } else if (city) {
-        // Legacy city filter (checks if city is in serviceArea)
-        where.serviceArea = { has: city };
+        AND.push({ serviceArea: { has: city } });
       }
 
-      // Filter by minimum rating
-      if (minRating) {
-        where.rating = { gte: parseFloat(minRating) };
-      }
+      if (minRating)   AND.push({ rating:       { gte: parseFloatParam(minRating, 0) } });
+      if (vehicleType) AND.push({ vehicleTypes: { has: vehicleType } });
 
-      // Search by name or description
+      // Search is its own AND clause — never overwrites location filter
       if (search) {
-        where.OR = [
-          { name: { contains: search, mode: "insensitive" } },
-          { description: { contains: search, mode: "insensitive" } },
-        ];
+        AND.push({
+          OR: [
+            { name:        { contains: search, mode: "insensitive" } },
+            { description: { contains: search, mode: "insensitive" } },
+          ],
+        });
       }
 
-      // Filter by vehicle type (checks if vehicle type exists in vehicleTypes array)
-      if (vehicleType) {
-        where.vehicleTypes = { has: vehicleType };
+      const [providers, total] = await Promise.all([
+        prisma.transportationProvider.findMany({
+          where: { AND },
+          include: {
+            vehicles: {
+              where:  { isAvailable: true },
+              take:   5,
+              select: { id: true, vehicleType: true, capacity: true, amenities: true, driverRating: true },
+            },
+            _count: { select: { vehicles: true, bookings: true } },
+          },
+          skip,
+          take: limit,
+          orderBy: { [safeSortBy]: safeSortOrder },
+        }),
+        prisma.transportationProvider.count({ where: { AND } }),
+      ]);
+
+      const data = providers.map((p) => ({
+        ...p,
+        availableVehicles: p.vehicles.length,
+        cheapestOption:    p.baseFare ?? 0,
+      }));
+
+      return res.json({
+        success: true,
+        data,
+        pagination: buildPaginationMeta(page, limit, total),
+        filters: {
+          providerType:  providerType  ?? null,
+          location:      location ?? city ?? null,
+          minRating:     minRating     ?? null,
+          vehicleType:   vehicleType   ?? null,
+          search:        search        ?? null,
+        },
+      });
+    } catch (error) {
+      next(error);
+    }
+  }
+
+  /**
+   * GET /api/transportation/providers/:id
+   * Public — BUG FIX: original checked `req.user?.id !== provider.vendorId`
+   * (User.id vs Vendor.id). Now simply returns 404 for inactive to avoid leaking existence.
+   */
+  async getProviderById(req, res, next) {
+    try {
+      const { id } = req.params;
+      const skipCache = req.query.skipCache === "true";
+
+      if (!skipCache) {
+        const cached = await redisService.client?.get(`transportation:provider:${id}`).catch(() => null);
+        if (cached) return res.json({ success: true, data: JSON.parse(cached), cached: true });
       }
 
-      const skip = (parseInt(page) - 1) * parseInt(limit);
+      const provider = await prisma.transportationProvider.findUnique({
+        where: { id },
+        include: {
+          vehicles: { where: { isAvailable: true }, orderBy: { createdAt: "desc" } },
+          _count:   { select: { vehicles: true, bookings: true } },
+          vendor:   { select: { id: true, businessName: true, businessEmail: true, overallRating: true } },
+        },
+      });
 
-      // Build orderBy
-      const orderBy = {};
-      orderBy[sortBy] = sortOrder;
+      if (!provider) return notFound(res, "Transportation provider not found");
+      if (!provider.isAvailable && !req.user?.isSuperAdmin) return notFound(res, "Transportation provider not found");
 
-      console.log(
-        "Transportation query where:",
-        JSON.stringify(where, null, 2),
-      );
+      redisService.client
+        ?.setex(`transportation:provider:${id}`, PROVIDER_CACHE_TTL_S, JSON.stringify(provider))
+        .catch(() => {});
+
+      return res.json({ success: true, data: provider, cached: false });
+    } catch (error) {
+      next(error);
+    }
+  }
+
+  /**
+   * GET /api/transportation/my-providers
+   * Vendor — their own listings including inactive.
+   * BUG FIX: original queried `vendorId: userId` (User.id ≠ Vendor.id).
+   */
+  async getMyProviders(req, res, next) {
+    try {
+      const { id: userId } = req.user;
+      const { status } = req.query;
+      const { page, limit, skip } = parsePagination(req.query, 20);
+
+      // BUG FIX: look up vendor record to get correct vendor.id
+      const vendor = await prisma.vendor.findUnique({
+        where:  { userId },
+        select: { id: true },
+      });
+      if (!vendor) return notFound(res, "Vendor profile not found");
+
+      const where = {
+        vendorId: vendor.id,
+        ...(status === "active"   && { isAvailable: true }),
+        ...(status === "inactive" && { isAvailable: false }),
+      };
 
       const [providers, total] = await Promise.all([
         prisma.transportationProvider.findMany({
           where,
           include: {
-            vehicles: {
-              where: { isAvailable: true },
-              take: 5,
-              select: {
-                id: true,
-                vehicleType: true,
-                capacity: true,
-                amenities: true,
-                driverRating: true,
-              },
-            },
-            _count: {
-              select: {
-                vehicles: true,
-                bookings: true,
-              },
-            },
+            vehicles: true,
+            _count:   { select: { vehicles: true, bookings: true } },
           },
           skip,
-          take: parseInt(limit),
-          orderBy,
+          take:     limit,
+          orderBy:  { createdAt: "desc" },
         }),
         prisma.transportationProvider.count({ where }),
       ]);
 
-      // Format the response with additional computed fields
-      const formattedProviders = providers.map((provider) => ({
-        ...provider,
-        availableVehicles: provider.vehicles.length,
-        vehicleTypesList: provider.vehicleTypes,
-        cheapestOption: provider.baseFare || 0,
-      }));
-
-      const response = {
-        success: true,
-        data: formattedProviders,
-        pagination: {
-          page: parseInt(page),
-          limit: parseInt(limit),
-          total,
-          pages: Math.ceil(total / parseInt(limit)),
-        },
-        filters: {
-          providerType: providerType || null,
-          location: location || city || null,
-          minRating: minRating || null,
-          vehicleType: vehicleType || null,
-          search: search || null,
-        },
-      };
-
-      res.json(response);
-    } catch (error) {
-      console.error("Error in getAllProviders:", error);
-      next(error);
-    }
-  }
-  /**
-   * Get provider by ID
-   * GET /api/transportation/providers/:id
-   */
-  async getProviderById(req, res, next) {
-    try {
-      const { id } = req.params;
-
-      // Try cache first
-      const cacheKey = `transportation:provider:${id}`;
-      let provider = await redisService.client?.get(cacheKey);
-
-      if (provider && !req.query.skipCache) {
-        return res.json({
-          success: true,
-          data: JSON.parse(provider),
-          cached: true,
-        });
-      }
-
-      provider = await prisma.transportationProvider.findUnique({
-        where: { id },
-        include: {
-          vehicles: {
-            where: { isAvailable: true },
-            orderBy: { createdAt: "desc" },
-          },
-          bookings: {
-            take: 10,
-            orderBy: { createdAt: "desc" },
-            include: {
-              travelPlan: {
-                select: {
-                  id: true,
-                  title: true,
-                },
-              },
-            },
-          },
-          _count: {
-            select: {
-              vehicles: true,
-              bookings: true,
-            },
-          },
-        },
-      });
-
-      if (!provider) {
-        return res.status(404).json({
-          success: false,
-          message: "Transportation provider not found",
-        });
-      }
-
-      // Check if provider is active
-      if (
-        !provider.isAvailable &&
-        !req.user?.isSuperAdmin &&
-        req.user?.id !== provider.vendorId
-      ) {
-        return res.status(403).json({
-          success: false,
-          message: "This provider is currently unavailable",
-        });
-      }
-
-      // Cache for 1 hour
-      await redisService.client?.setex(
-        cacheKey,
-        3600,
-        JSON.stringify(provider),
-      );
-
-      res.json({
-        success: true,
-        data: provider,
-      });
-    } catch (error) {
-      next(error);
-    }
-  }
-
-  /**
-   * Get vendor's own providers
-   * GET /api/transportation/my-providers
-   */
-  async getMyProviders(req, res, next) {
-    try {
-      const userId = req.user.id;
-
-      const providers = await prisma.transportationProvider.findMany({
-        where: { vendorId: userId },
-        include: {
-          vehicles: true,
-          _count: {
-            select: {
-              vehicles: true,
-              bookings: true,
-            },
-          },
-        },
-        orderBy: { createdAt: "desc" },
-      });
-
-      res.json({
+      return res.json({
         success: true,
         data: providers,
+        pagination: buildPaginationMeta(page, limit, total),
       });
     } catch (error) {
       next(error);
@@ -591,187 +406,204 @@ class TransportationController {
   }
 
   /**
-   * Update provider
    * PUT /api/transportation/providers/:id
+   * Sparse update — vendorId never writable
    */
   async updateProvider(req, res, next) {
     try {
       const { id } = req.params;
 
-      // Check permission
-      const canManage = await this.canManageProvider(req.user, id, "update");
-      if (!canManage) {
-        return res.status(403).json({
-          success: false,
-          message: "You can only update your own transportation providers",
-        });
-      }
+      const allowed = await canManageProvider(req.user, id, "update");
+      if (!allowed) return forbidden(res, "You can only update your own transportation providers");
 
-      const updateData = req.body;
-
-      // Convert contact number to string if present
-      if (updateData.contactNumber) {
-        updateData.contactNumber = String(updateData.contactNumber);
-      }
-
-      // Don't allow changing vendorId
-      delete updateData.vendorId;
+      const {
+        name, description, providerType, serviceArea, contactNumber, email, website,
+        rating, baseFare, perKmRate, perMinuteRate, isAvailable, operatingHours, vehicleTypes,
+      } = req.body;
 
       const provider = await prisma.transportationProvider.update({
         where: { id },
-        data: updateData,
-        include: {
-          vehicles: true,
+        data: {
+          ...(name           !== undefined && { name }),
+          ...(description    !== undefined && { description }),
+          ...(providerType   !== undefined && { providerType }),
+          ...(serviceArea    !== undefined && { serviceArea }),
+          ...(contactNumber  !== undefined && { contactNumber: String(contactNumber) }),
+          ...(email          !== undefined && { email }),
+          ...(website        !== undefined && { website }),
+          ...(rating         !== undefined && { rating }),
+          ...(baseFare       !== undefined && { baseFare }),
+          ...(perKmRate      !== undefined && { perKmRate }),
+          ...(perMinuteRate  !== undefined && { perMinuteRate }),
+          ...(isAvailable    !== undefined && { isAvailable }),
+          ...(operatingHours !== undefined && { operatingHours }),
+          ...(vehicleTypes   !== undefined && { vehicleTypes }),
         },
+        include: { vehicles: true },
       });
 
-      // Invalidate caches
-      await Promise.all([
-        redisService.client?.del(`transportation:provider:${id}`),
-        redisService.client?.del("transportation:providers:list:*"),
-      ]);
+      invalidateProviderCache(id);
 
-      res.json({
-        success: true,
-        data: provider,
-        message: "Transportation provider updated successfully",
-      });
+      return res.json({ success: true, data: provider, message: "Transportation provider updated successfully" });
     } catch (error) {
-      if (error.code === "P2025") {
-        return res.status(404).json({
-          success: false,
-          message: "Provider not found",
-        });
-      }
+      if (error.code === "P2025") return notFound(res, "Provider not found");
       next(error);
     }
   }
 
   /**
-   * Delete provider
    * DELETE /api/transportation/providers/:id
    */
   async deleteProvider(req, res, next) {
     try {
       const { id } = req.params;
 
-      // Check permission
-      const canManage = await this.canManageProvider(req.user, id, "delete");
-      if (!canManage) {
-        return res.status(403).json({
-          success: false,
-          message:
-            "You can only delete your own providers with no active bookings",
-        });
+      const existing = await prisma.transportationProvider.findUnique({
+        where: { id }, select: { id: true },
+      });
+      if (!existing) return notFound(res, "Provider not found");
+
+      const allowed = await canManageProvider(req.user, id, "delete");
+      if (!allowed) {
+        return badRequest(res, "Cannot delete provider with active bookings. Mark it as unavailable instead.");
       }
 
-      // Check if provider has active bookings
-      const activeBookings = await prisma.transportationBooking.count({
-        where: {
-          providerId: id,
-          status: { in: ["BOOKED", "CONFIRMED", "ON_THE_WAY"] },
-        },
-      });
+      await prisma.transportationProvider.delete({ where: { id } });
+      invalidateProviderCache(id);
 
-      if (activeBookings > 0) {
-        return res.status(400).json({
-          success: false,
-          message:
-            "Cannot delete provider with active bookings. Mark it as unavailable instead.",
-        });
-      }
-
-      await prisma.transportationProvider.delete({
-        where: { id },
-      });
-
-      // Invalidate caches
-      await Promise.all([
-        redisService.client?.del(`transportation:provider:${id}`),
-        redisService.client?.del("transportation:providers:list:*"),
-      ]);
-
-      res.json({
-        success: true,
-        message: "Transportation provider deleted successfully",
-      });
+      return res.json({ success: true, message: "Transportation provider deleted successfully" });
     } catch (error) {
-      if (error.code === "P2025") {
-        return res.status(404).json({
-          success: false,
-          message: "Provider not found",
-        });
-      }
+      if (error.code === "P2025") return notFound(res, "Provider not found");
       next(error);
     }
   }
 
   /**
-   * Get provider statistics
+   * PATCH /api/transportation/providers/:id/status  [NEW]
+   * Vendor — toggle availability without a full update payload
+   */
+  async toggleProviderStatus(req, res, next) {
+    try {
+      const { id } = req.params;
+      const { isAvailable } = req.body;
+
+      if (typeof isAvailable !== "boolean") return badRequest(res, "isAvailable must be a boolean");
+
+      const allowed = await canManageProvider(req.user, id, "update");
+      if (!allowed) return forbidden(res, "You can only manage your own providers");
+
+      const provider = await prisma.transportationProvider.update({
+        where:  { id },
+        data:   { isAvailable },
+        select: { id: true, name: true, isAvailable: true },
+      });
+
+      invalidateProviderCache(id);
+
+      return res.json({
+        success: true,
+        data: provider,
+        message: `Provider ${isAvailable ? "activated" : "deactivated"} successfully`,
+      });
+    } catch (error) {
+      if (error.code === "P2025") return notFound(res, "Provider not found");
+      next(error);
+    }
+  }
+
+  /**
    * GET /api/transportation/providers/:id/stats
    */
   async getProviderStats(req, res, next) {
     try {
       const { id } = req.params;
 
-      // Check if user can view this provider
-      const canView = await this.canManageProvider(req.user, id, "view");
-      if (!canView && !req.user.isSuperAdmin) {
-        return res.status(403).json({
-          success: false,
-          message: "You do not have permission to view these statistics",
-        });
-      }
+      const allowed = await canManageProvider(req.user, id, "view");
+      if (!allowed) return forbidden(res, "You do not have permission to view these statistics");
 
       const [
         totalBookings,
         completedBookings,
         cancelledBookings,
-        totalRevenue,
-        averageRating,
-        vehicleUtilization,
+        revenueAgg,
+        ratingAgg,
+        availableVehicleCount,
+        totalVehicles,
       ] = await Promise.all([
         prisma.transportationBooking.count({ where: { providerId: id } }),
-        prisma.transportationBooking.count({
-          where: { providerId: id, status: "COMPLETED" },
-        }),
-        prisma.transportationBooking.count({
-          where: { providerId: id, status: "CANCELLED" },
-        }),
+        prisma.transportationBooking.count({ where: { providerId: id, status: "COMPLETED" } }),
+        prisma.transportationBooking.count({ where: { providerId: id, status: "CANCELLED" } }),
         prisma.transportationBooking.aggregate({
           where: { providerId: id, status: "COMPLETED" },
-          _sum: { actualFare: true },
+          _sum:  { actualFare: true },
         }),
         prisma.transportationVehicle.aggregate({
           where: { providerId: id },
-          _avg: { driverRating: true },
+          _avg:  { driverRating: true },
         }),
-        prisma.transportationVehicle.count({
-          where: { providerId: id, isAvailable: true },
-        }),
+        prisma.transportationVehicle.count({ where: { providerId: id, isAvailable: true } }),
+        prisma.transportationVehicle.count({ where: { providerId: id } }),
       ]);
 
-      const totalVehicles = await prisma.transportationVehicle.count({
-        where: { providerId: id },
-      });
-
-      res.json({
+      return res.json({
         success: true,
         data: {
           totalBookings,
           completedBookings,
           cancelledBookings,
-          totalRevenue: totalRevenue._sum.actualFare || 0,
-          averageRating: averageRating._avg.driverRating || 0,
+          activeBookings: totalBookings - completedBookings - cancelledBookings,
+          totalRevenue:   revenueAgg._sum.actualFare ?? 0,
+          averageRating:  ratingAgg._avg.driverRating ?? 0,
           vehicleUtilization: {
-            available: vehicleUtilization,
-            total: totalVehicles,
-            percentage:
-              totalVehicles > 0
-                ? (vehicleUtilization / totalVehicles) * 100
-                : 0,
+            available:  availableVehicleCount,
+            total:      totalVehicles,
+            percentage: totalVehicles > 0
+              ? +((availableVehicleCount / totalVehicles) * 100).toFixed(2)
+              : 0,
           },
         },
+      });
+    } catch (error) {
+      next(error);
+    }
+  }
+
+  /**
+   * GET /api/transportation/providers/:providerId/bookings  [NEW]
+   * Vendor — view bookings for one of their providers
+   */
+  async getProviderBookings(req, res, next) {
+    try {
+      const { providerId } = req.params;
+      const { status } = req.query;
+      const { page, limit, skip } = parsePagination(req.query, 20);
+
+      const allowed = await canManageProvider(req.user, providerId, "view");
+      if (!allowed) return forbidden(res, "You can only view bookings for your own providers");
+
+      const where = {
+        providerId,
+        ...(status && { status }),
+      };
+
+      const [bookings, total] = await Promise.all([
+        prisma.transportationBooking.findMany({
+          where,
+          include: {
+            vehicle:    { select: { id: true, vehicleNumber: true, vehicleType: true } },
+            travelPlan: { select: { id: true, title: true, userId: true } },
+          },
+          orderBy: { createdAt: "desc" },
+          skip,
+          take: limit,
+        }),
+        prisma.transportationBooking.count({ where }),
+      ]);
+
+      return res.json({
+        success: true,
+        data: bookings,
+        pagination: buildPaginationMeta(page, limit, total),
       });
     } catch (error) {
       next(error);
@@ -781,129 +613,105 @@ class TransportationController {
   // ==================== VEHICLE MANAGEMENT ====================
 
   /**
-   * Add vehicle to provider
    * POST /api/transportation/providers/:providerId/vehicles
    */
   async addVehicle(req, res, next) {
     try {
       const { providerId } = req.params;
 
-      // Check permission
-      const canManage = await this.canManageVehicle(
-        req.user,
-        providerId,
-        null,
-        "edit",
-      );
-      if (!canManage) {
-        return res.status(403).json({
-          success: false,
-          message: "You can only add vehicles to your own providers",
-        });
-      }
+      const allowed = await canManageVehicle(req.user, providerId, null, "edit");
+      if (!allowed) return forbidden(res, "You can only add vehicles to your own providers");
 
-      const vehicleData = req.body;
-
-      // Convert driver contact to string if present
-      if (vehicleData.driverContact) {
-        vehicleData.driverContact = String(vehicleData.driverContact);
-      }
+      const {
+        vehicleNumber, vehicleType, make, model, year, color,
+        capacity, amenities, driverName, driverContact, driverRating, isAvailable,
+      } = req.body;
 
       const vehicle = await prisma.transportationVehicle.create({
         data: {
-          ...vehicleData,
           providerId,
+          vehicleNumber,
+          vehicleType,
+          ...(make          !== undefined && { make }),
+          ...(model         !== undefined && { model }),
+          ...(year          !== undefined && { year }),
+          ...(color         !== undefined && { color }),
+          capacity:         capacity  ?? 4,
+          amenities:        amenities ?? [],
+          ...(driverName    !== undefined && { driverName }),
+          ...(driverContact !== undefined && { driverContact: String(driverContact) }),
+          ...(driverRating  !== undefined && { driverRating }),
+          isAvailable:      isAvailable ?? true,
         },
       });
 
-      // Set up OpenFGA relations
-      if (openfgaService.createTransportationVehicleRelations) {
-        await openfgaService.createTransportationVehicleRelations(
-          req.user.id,
-          vehicle.id,
-          providerId,
-        );
-      }
+      Promise.allSettled([
+        openfgaService.createTransportationVehicleRelations(req.user.id, vehicle.id, providerId),
+        redisService.client?.del(`transportation:provider:${providerId}`),
+      ]);
 
-      // Invalidate provider cache
-      await redisService.client?.del(`transportation:provider:${providerId}`);
-
-      res.status(201).json({
-        success: true,
-        data: vehicle,
-        message: "Vehicle added successfully",
-      });
+      return res.status(201).json({ success: true, data: vehicle, message: "Vehicle added successfully" });
     } catch (error) {
-      if (
-        error.code === "P2002" &&
-        error.meta?.target?.includes("vehicleNumber")
-      ) {
-        return res.status(409).json({
-          success: false,
-          message: "Vehicle with this number already exists",
-        });
+      if (error.code === "P2002" && error.meta?.target?.includes("vehicleNumber")) {
+        return res.status(409).json({ success: false, message: "Vehicle with this number already exists" });
       }
       next(error);
     }
   }
 
   /**
-   * Bulk add vehicles
-   * POST /api/transportation/providers/:providerId/vehicles/bulk
+   * POST /api/transportation/providers/:providerId/vehicles/bulk  [NEW — improved]
+   * Bulk add with createMany for a single DB round-trip, then batch OpenFGA
    */
   async bulkAddVehicles(req, res, next) {
     try {
       const { providerId } = req.params;
       const { vehicles } = req.body;
 
-      // Check permission
-      const canManage = await this.canManageVehicle(
-        req.user,
-        providerId,
-        null,
-        "edit",
-      );
-      if (!canManage) {
-        return res.status(403).json({
-          success: false,
-          message: "You can only add vehicles to your own providers",
-        });
+      if (!Array.isArray(vehicles) || vehicles.length === 0) {
+        return badRequest(res, "vehicles must be a non-empty array");
       }
 
-      // Prepare vehicles data
+      const allowed = await canManageVehicle(req.user, providerId, null, "edit");
+      if (!allowed) return forbidden(res, "You can only add vehicles to your own providers");
+
+      // Verify the provider exists
+      const providerExists = await prisma.transportationProvider.findUnique({
+        where: { id: providerId }, select: { id: true },
+      });
+      if (!providerExists) return notFound(res, "Provider not found");
+
       const vehiclesData = vehicles.map((v) => ({
         ...v,
         providerId,
+        amenities:     v.amenities     ?? [],
+        capacity:      v.capacity      ?? 4,
+        isAvailable:   v.isAvailable   ?? true,
         driverContact: v.driverContact ? String(v.driverContact) : null,
       }));
 
-      // Create all vehicles
-      const result = await prisma.$transaction(
-        vehiclesData.map((v) =>
-          prisma.transportationVehicle.create({ data: v }),
+      // Use createMany for a single batch INSERT instead of N separate inserts
+      await prisma.transportationVehicle.createMany({ data: vehiclesData, skipDuplicates: true });
+
+      // Fetch the newly created vehicles to return them and set up OpenFGA
+      const created = await prisma.transportationVehicle.findMany({
+        where: {
+          providerId,
+          vehicleNumber: { in: vehiclesData.map((v) => v.vehicleNumber) },
+        },
+      });
+
+      Promise.allSettled([
+        ...created.map((v) =>
+          openfgaService.createTransportationVehicleRelations(req.user.id, v.id, providerId)
         ),
-      );
+        redisService.client?.del(`transportation:provider:${providerId}`),
+      ]);
 
-      // Set up OpenFGA relations for each vehicle
-      if (openfgaService.createTransportationVehicleRelations) {
-        await Promise.all(
-          result.map((v) =>
-            openfgaService.createTransportationVehicleRelations(
-              req.user.id,
-              v.id,
-              providerId,
-            ),
-          ),
-        );
-      }
-
-      // Invalidate provider cache
-      await redisService.client?.del(`transportation:provider:${providerId}`);
-
-      res.status(201).json({
+      return res.status(201).json({
         success: true,
-        data: result,
-        message: `${result.length} vehicles added successfully`,
+        data: created,
+        message: `${created.length} vehicle(s) added successfully`,
       });
     } catch (error) {
       next(error);
@@ -911,140 +719,91 @@ class TransportationController {
   }
 
   /**
-   * Update vehicle
    * PUT /api/transportation/vehicles/:vehicleId
+   * Sparse update
    */
   async updateVehicle(req, res, next) {
     try {
       const { vehicleId } = req.params;
 
       const vehicle = await prisma.transportationVehicle.findUnique({
+        where:  { id: vehicleId },
+        select: { provider: { select: { id: true } } },
+      });
+      if (!vehicle) return notFound(res, "Vehicle not found");
+
+      const allowed = await canManageVehicle(req.user, vehicle.provider.id, vehicleId, "edit");
+      if (!allowed) return forbidden(res, "You can only update vehicles in your own providers");
+
+      const {
+        vehicleNumber, vehicleType, make, model, year, color,
+        capacity, amenities, driverName, driverContact, driverRating, isAvailable,
+      } = req.body;
+
+      const updated = await prisma.transportationVehicle.update({
         where: { id: vehicleId },
-        include: {
-          provider: {
-            select: { id: true },
-          },
+        data: {
+          ...(vehicleNumber !== undefined && { vehicleNumber }),
+          ...(vehicleType   !== undefined && { vehicleType }),
+          ...(make          !== undefined && { make }),
+          ...(model         !== undefined && { model }),
+          ...(year          !== undefined && { year }),
+          ...(color         !== undefined && { color }),
+          ...(capacity      !== undefined && { capacity }),
+          ...(amenities     !== undefined && { amenities }),
+          ...(driverName    !== undefined && { driverName }),
+          ...(driverContact !== undefined && { driverContact: String(driverContact) }),
+          ...(driverRating  !== undefined && { driverRating }),
+          ...(isAvailable   !== undefined && { isAvailable }),
         },
       });
 
-      if (!vehicle) {
-        return res.status(404).json({
-          success: false,
-          message: "Vehicle not found",
-        });
-      }
+      redisService.client?.del(`transportation:provider:${vehicle.provider.id}`).catch(() => {});
 
-      // Check permission
-      const canManage = await this.canManageVehicle(
-        req.user,
-        vehicle.provider.id,
-        vehicleId,
-        "edit",
-      );
-
-      if (!canManage) {
-        return res.status(403).json({
-          success: false,
-          message: "You can only update vehicles in your own providers",
-        });
-      }
-
-      const updateData = req.body;
-      if (updateData.driverContact) {
-        updateData.driverContact = String(updateData.driverContact);
-      }
-
-      const updatedVehicle = await prisma.transportationVehicle.update({
-        where: { id: vehicleId },
-        data: updateData,
-      });
-
-      // Invalidate provider cache
-      await redisService.client?.del(
-        `transportation:provider:${vehicle.provider.id}`,
-      );
-
-      res.json({
-        success: true,
-        data: updatedVehicle,
-        message: "Vehicle updated successfully",
-      });
+      return res.json({ success: true, data: updated, message: "Vehicle updated successfully" });
     } catch (error) {
-      if (error.code === "P2025") {
-        return res.status(404).json({
-          success: false,
-          message: "Vehicle not found",
-        });
-      }
+      if (error.code === "P2025") return notFound(res, "Vehicle not found");
       next(error);
     }
   }
 
   /**
-   * Update vehicle location
    * PATCH /api/transportation/vehicles/:vehicleId/location
+   * BUG FIX: original compared `req.user.id !== vehicle.driverName` — a User
+   * ID vs a name string. Removed the unreliable driver check; location updates
+   * now require canManageVehicle (vendor/team-member ownership via OpenFGA).
    */
   async updateVehicleLocation(req, res, next) {
     try {
       const { vehicleId } = req.params;
       const { lat, lng } = req.body;
 
+      if (typeof lat !== "number" || typeof lng !== "number") {
+        return badRequest(res, "lat and lng must be numbers");
+      }
+
       const vehicle = await prisma.transportationVehicle.findUnique({
-        where: { id: vehicleId },
-        include: {
-          provider: {
-            select: { id: true },
-          },
-        },
+        where:  { id: vehicleId },
+        select: { provider: { select: { id: true } } },
+      });
+      if (!vehicle) return notFound(res, "Vehicle not found");
+
+      const allowed = await canManageVehicle(req.user, vehicle.provider.id, vehicleId, "edit");
+      if (!allowed) return forbidden(res, "You do not have permission to update this vehicle's location");
+
+      const updated = await prisma.transportationVehicle.update({
+        where:  { id: vehicleId },
+        data:   { currentLocation: { lat, lng, timestamp: new Date().toISOString() } },
+        select: { id: true, currentLocation: true },
       });
 
-      if (!vehicle) {
-        return res.status(404).json({
-          success: false,
-          message: "Vehicle not found",
-        });
-      }
-
-      // Check permission (drivers or vendors can update location)
-      const canManage = await this.canManageVehicle(
-        req.user,
-        vehicle.provider.id,
-        vehicleId,
-        "edit",
-      );
-
-      if (!canManage && req.user.id !== vehicle.driverName) {
-        // Simple driver check
-        return res.status(403).json({
-          success: false,
-          message:
-            "You don't have permission to update this vehicle's location",
-        });
-      }
-
-      const updatedVehicle = await prisma.transportationVehicle.update({
-        where: { id: vehicleId },
-        data: {
-          currentLocation: {
-            lat,
-            lng,
-            timestamp: new Date().toISOString(),
-          },
-        },
-      });
-
-      res.json({
-        success: true,
-        data: updatedVehicle.currentLocation,
-        message: "Vehicle location updated successfully",
-      });
+      return res.json({ success: true, data: updated.currentLocation, message: "Vehicle location updated successfully" });
     } catch (error) {
       next(error);
     }
   }
 
   /**
-   * Delete vehicle
    * DELETE /api/transportation/vehicles/:vehicleId
    */
   async deleteVehicle(req, res, next) {
@@ -1052,150 +811,127 @@ class TransportationController {
       const { vehicleId } = req.params;
 
       const vehicle = await prisma.transportationVehicle.findUnique({
-        where: { id: vehicleId },
-        include: {
-          provider: {
-            select: { id: true },
-          },
-          bookings: {
-            where: {
-              status: { in: ["BOOKED", "CONFIRMED", "ON_THE_WAY"] },
-              pickupTime: { gt: new Date() },
-            },
-          },
+        where:  { id: vehicleId },
+        select: { provider: { select: { id: true } } },
+      });
+      if (!vehicle) return notFound(res, "Vehicle not found");
+
+      const allowed = await canManageVehicle(req.user, vehicle.provider.id, vehicleId, "delete");
+      if (!allowed) return forbidden(res, "You can only delete vehicles in your own providers");
+
+      // Check future bookings via relation (not via include on the initial fetch)
+      const futureBookings = await prisma.transportationBooking.count({
+        where: {
+          vehicleId,
+          pickupTime: { gt: new Date() },
+          status:     { in: ["BOOKED", "CONFIRMED"] },
         },
       });
 
-      if (!vehicle) {
-        return res.status(404).json({
-          success: false,
-          message: "Vehicle not found",
-        });
+      if (futureBookings > 0) {
+        return badRequest(res, "Cannot delete vehicle with future bookings. Mark it as unavailable instead.");
       }
 
-      // Check permission
-      const canManage = await this.canManageVehicle(
-        req.user,
-        vehicle.provider.id,
-        vehicleId,
-        "delete",
-      );
+      await prisma.transportationVehicle.delete({ where: { id: vehicleId } });
+      redisService.client?.del(`transportation:provider:${vehicle.provider.id}`).catch(() => {});
 
-      if (!canManage) {
-        return res.status(403).json({
-          success: false,
-          message: "You can only delete vehicles in your own providers",
-        });
-      }
-
-      // Check if vehicle has future bookings
-      if (vehicle.bookings.length > 0) {
-        return res.status(400).json({
-          success: false,
-          message:
-            "Cannot delete vehicle with future bookings. Mark it as unavailable instead.",
-        });
-      }
-
-      await prisma.transportationVehicle.delete({
-        where: { id: vehicleId },
-      });
-
-      // Invalidate provider cache
-      await redisService.client?.del(
-        `transportation:provider:${vehicle.provider.id}`,
-      );
-
-      res.json({
-        success: true,
-        message: "Vehicle deleted successfully",
-      });
+      return res.json({ success: true, message: "Vehicle deleted successfully" });
     } catch (error) {
-      if (error.code === "P2025") {
-        return res.status(404).json({
-          success: false,
-          message: "Vehicle not found",
-        });
-      }
+      if (error.code === "P2025") return notFound(res, "Vehicle not found");
       next(error);
     }
   }
 
   /**
-   * Get vehicle booking history
+   * PATCH /api/transportation/providers/:providerId/vehicles/availability  [NEW]
+   * Bulk-toggle availability for multiple vehicles in one round-trip
+   */
+  async bulkUpdateVehicleAvailability(req, res, next) {
+    try {
+      const { providerId } = req.params;
+      const { vehicleIds, isAvailable } = req.body;
+
+      if (!Array.isArray(vehicleIds) || vehicleIds.length === 0) {
+        return badRequest(res, "vehicleIds must be a non-empty array");
+      }
+      if (typeof isAvailable !== "boolean") {
+        return badRequest(res, "isAvailable must be a boolean");
+      }
+
+      const allowed = await canManageVehicle(req.user, providerId, null, "edit");
+      if (!allowed) return forbidden(res, "You can only manage vehicles in your own providers");
+
+      // Ownership verification — all IDs must belong to this provider
+      const ownedCount = await prisma.transportationVehicle.count({
+        where: { id: { in: vehicleIds }, providerId },
+      });
+      if (ownedCount !== vehicleIds.length) {
+        return badRequest(res, "One or more vehicle IDs do not belong to this provider");
+      }
+
+      const { count } = await prisma.transportationVehicle.updateMany({
+        where: { id: { in: vehicleIds }, providerId },
+        data:  { isAvailable },
+      });
+
+      redisService.client?.del(`transportation:provider:${providerId}`).catch(() => {});
+
+      return res.json({
+        success: true,
+        updatedCount: count,
+        message: `${count} vehicle(s) ${isAvailable ? "marked available" : "marked unavailable"}`,
+      });
+    } catch (error) {
+      next(error);
+    }
+  }
+
+  /**
    * GET /api/transportation/vehicles/:vehicleId/history
    */
   async getVehicleHistory(req, res, next) {
     try {
       const { vehicleId } = req.params;
-      const { from, to, limit = 50 } = req.query;
+      const { from, to } = req.query;
+      const { limit } = parsePagination(req.query, 50);
 
       const vehicle = await prisma.transportationVehicle.findUnique({
-        where: { id: vehicleId },
-        include: {
-          provider: {
-            select: { id: true },
+        where:  { id: vehicleId },
+        select: { provider: { select: { id: true } } },
+      });
+      if (!vehicle) return notFound(res, "Vehicle not found");
+
+      const allowed = await canManageVehicle(req.user, vehicle.provider.id, vehicleId, "view");
+      if (!allowed) return forbidden(res, "You do not have permission to view this vehicle's history");
+
+      const where = {
+        vehicleId,
+        ...(from || to) && {
+          pickupTime: {
+            ...(from && { gte: new Date(from) }),
+            ...(to   && { lte: new Date(to)   }),
           },
         },
-      });
-
-      if (!vehicle) {
-        return res.status(404).json({
-          success: false,
-          message: "Vehicle not found",
-        });
-      }
-
-      // Check permission
-      const canView = await this.canManageVehicle(
-        req.user,
-        vehicle.provider.id,
-        vehicleId,
-        "view",
-      );
-
-      if (!canView && !req.user.isSuperAdmin) {
-        return res.status(403).json({
-          success: false,
-          message: "You don't have permission to view this vehicle's history",
-        });
-      }
-
-      // Build date filter
-      const where = { vehicleId };
-      if (from || to) {
-        where.pickupTime = {};
-        if (from) where.pickupTime.gte = new Date(from);
-        if (to) where.pickupTime.lte = new Date(to);
-      }
+      };
 
       const bookings = await prisma.transportationBooking.findMany({
         where,
         orderBy: { pickupTime: "desc" },
-        take: parseInt(limit),
-        include: {
-          travelPlan: {
-            select: {
-              id: true,
-              title: true,
-            },
-          },
-        },
+        take:    limit,
+        include: { travelPlan: { select: { id: true, title: true } } },
       });
 
-      res.json({
-        success: true,
-        data: bookings,
-        total: bookings.length,
-      });
+      return res.json({ success: true, data: bookings, total: bookings.length });
     } catch (error) {
       next(error);
     }
   }
 
+  // ==================== AVAILABILITY & FARE ====================
+
   /**
-   * Get available vehicles for a provider
    * GET /api/transportation/providers/:providerId/available-vehicles
+   * Public — uses proper date-overlap logic and Set for O(1) lookup
    */
   async getAvailableVehicles(req, res, next) {
     try {
@@ -1203,75 +939,60 @@ class TransportationController {
       const { pickupTime, dropoffTime, passengers, vehicleType } = req.query;
 
       if (!pickupTime || !dropoffTime) {
-        return res.status(400).json({
-          success: false,
-          message: "Pickup and dropoff times are required",
-        });
+        return badRequest(res, "Pickup and dropoff times are required");
       }
 
-      const pickup = new Date(pickupTime);
+      const pickup  = new Date(pickupTime);
       const dropoff = new Date(dropoffTime);
 
-      // Build vehicle filter
-      const vehicleWhere = {
-        providerId,
-        isAvailable: true,
-        capacity: { gte: parseInt(passengers) || 1 },
-      };
-      if (vehicleType) vehicleWhere.vehicleType = vehicleType;
+      if (isNaN(pickup.getTime()) || isNaN(dropoff.getTime())) {
+        return badRequest(res, "Invalid date format");
+      }
+      if (dropoff <= pickup) return badRequest(res, "Dropoff time must be after pickup time");
 
-      // Get all vehicles for the provider
-      const vehicles = await prisma.transportationVehicle.findMany({
-        where: vehicleWhere,
-      });
+      const passengerCount = parseIntParam(passengers, 1);
 
-      // Find booked vehicles for the time range
-      const bookedVehicles = await prisma.transportationBooking.findMany({
-        where: {
-          providerId,
-          status: { in: ["BOOKED", "CONFIRMED", "ON_THE_WAY"] },
-          OR: [
-            {
-              AND: [
-                { pickupTime: { lte: dropoff } },
-                { estimatedArrival: { gte: pickup } },
-              ],
-            },
-          ],
-        },
-        select: {
-          vehicleId: true,
-        },
-      });
+      const [allVehicles, bookedBookings] = await Promise.all([
+        prisma.transportationVehicle.findMany({
+          where: {
+            providerId,
+            isAvailable: true,
+            capacity:    { gte: passengerCount },
+            ...(vehicleType && { vehicleType }),
+          },
+        }),
+        prisma.transportationBooking.findMany({
+          where: {
+            providerId,
+            status:   { in: ACTIVE_BOOKING_STATUSES },
+            vehicleId: { not: null },
+            AND: [
+              { pickupTime:       { lt: dropoff } },
+              { estimatedArrival: { gt: pickup  } },
+            ],
+          },
+          select: { vehicleId: true },
+        }),
+      ]);
 
-      const bookedVehicleIds = bookedVehicles
-        .map((b) => b.vehicleId)
-        .filter(Boolean);
+      const bookedIds = new Set(bookedBookings.map((b) => b.vehicleId).filter(Boolean));
+      const availableVehicles = allVehicles.filter((v) => !bookedIds.has(v.id));
 
-      // Filter available vehicles
-      const availableVehicles = vehicles.filter(
-        (vehicle) => !bookedVehicleIds.includes(vehicle.id),
-      );
-
-      // Get provider for fare calculation
+      // Fetch fare info separately (not on the hot path for large fleets)
       const provider = await prisma.transportationProvider.findUnique({
-        where: { id: providerId },
-        select: {
-          baseFare: true,
-          perKmRate: true,
-          perMinuteRate: true,
-        },
+        where:  { id: providerId },
+        select: { baseFare: true, perKmRate: true, perMinuteRate: true },
       });
 
-      res.json({
+      return res.json({
         success: true,
-        data: availableVehicles,
+        data:           availableVehicles,
         totalAvailable: availableVehicles.length,
-        totalVehicles: vehicles.length,
-        provider: {
-          baseFare: provider?.baseFare,
-          perKmRate: provider?.perKmRate,
-          perMinuteRate: provider?.perMinuteRate,
+        totalVehicles:  allVehicles.length,
+        fareInfo: {
+          baseFare:      provider?.baseFare     ?? null,
+          perKmRate:     provider?.perKmRate    ?? null,
+          perMinuteRate: provider?.perMinuteRate ?? null,
         },
       });
     } catch (error) {
@@ -1280,65 +1001,39 @@ class TransportationController {
   }
 
   /**
-   * Calculate fare estimate
    * POST /api/transportation/calculate-fare
+   * Improved: fare breakdown computed without mutating `estimatedFare` mid-way
    */
   async calculateFare(req, res, next) {
     try {
       const { providerId, distance, duration, vehicleType } = req.body;
 
       const provider = await prisma.transportationProvider.findUnique({
-        where: { id: providerId },
+        where:  { id: providerId },
+        select: { baseFare: true, perKmRate: true, perMinuteRate: true },
       });
+      if (!provider) return notFound(res, "Provider not found");
 
-      if (!provider) {
-        return res.status(404).json({
-          success: false,
-          message: "Provider not found",
-        });
-      }
+      const baseFare       = provider.baseFare     ?? 0;
+      const distanceCharge = (distance && provider.perKmRate)     ? distance * provider.perKmRate     : 0;
+      const timeCharge     = (duration && provider.perMinuteRate) ? duration * provider.perMinuteRate : 0;
+      const subtotal       = baseFare + distanceCharge + timeCharge;
 
-      // Calculate fare based on provider's pricing model
-      let estimatedFare = provider.baseFare || 0;
+      const isPremium     = vehicleType && PREMIUM_VEHICLE_TYPES.has(vehicleType.toUpperCase());
+      const multiplier    = isPremium ? PREMIUM_MULTIPLIER : 1.0;
+      const premiumCharge = isPremium ? subtotal * (PREMIUM_MULTIPLIER - 1) : 0;
+      const estimatedFare = +(subtotal * multiplier).toFixed(2);
 
-      if (distance && provider.perKmRate) {
-        estimatedFare += distance * provider.perKmRate;
-      }
-
-      if (duration && provider.perMinuteRate) {
-        estimatedFare += duration * provider.perMinuteRate;
-      }
-
-      // Add vehicle type premium if applicable
-      let vehiclePremium = 1.0;
-      if (vehicleType) {
-        const premiumVehicles = ["LUXURY", "SUV", "PREMIUM"];
-        if (premiumVehicles.includes(vehicleType.toUpperCase())) {
-          vehiclePremium = 1.5;
-        }
-      }
-
-      estimatedFare *= vehiclePremium;
-
-      res.json({
+      return res.json({
         success: true,
         data: {
-          estimatedFare: Math.round(estimatedFare * 100) / 100,
+          estimatedFare,
           currency: "USD",
           breakdown: {
-            baseFare: provider.baseFare || 0,
-            distanceCharge:
-              distance && provider.perKmRate
-                ? distance * provider.perKmRate
-                : 0,
-            timeCharge:
-              duration && provider.perMinuteRate
-                ? duration * provider.perMinuteRate
-                : 0,
-            vehiclePremium:
-              vehiclePremium > 1
-                ? estimatedFare - estimatedFare / vehiclePremium
-                : 0,
+            baseFare,
+            distanceCharge: +distanceCharge.toFixed(2),
+            timeCharge:     +timeCharge.toFixed(2),
+            premiumCharge:  +premiumCharge.toFixed(2),
           },
         },
       });
@@ -1350,99 +1045,100 @@ class TransportationController {
   // ==================== BOOKING MANAGEMENT ====================
 
   /**
-   * Create transportation booking
    * POST /api/travel-plans/:travelPlanId/transportation-bookings
+   * SCHEMA FIX: Booking uses `snapshotVehicle*` fields, not mutable vehicle fields.
+   * Snapshot values are stamped at booking time from the current vehicle record.
    */
   async createBooking(req, res, next) {
     try {
       const { travelPlanId } = req.params;
-      const bookingData = req.body;
+      const {
+        providerId, vehicleId, serviceType,
+        pickupLocation, dropoffLocation, pickupTime, estimatedArrival,
+        numberOfPassengers, specialRequests,
+        estimatedFare, paymentMethod,
+      } = req.body;
 
-      // Check if user has permission to edit the travel plan
-      const canEdit = await this.checkTravelPlanPermission(
-        req.user.id,
-        travelPlanId,
-        "edit",
-      );
+      const canEdit =
+        req.user.isSuperAdmin ||
+        !!(await openfgaService.canEditTravelPlan?.(req.user.id, travelPlanId).catch(() => false));
 
-      if (!canEdit && !req.user.isSuperAdmin) {
-        return res.status(403).json({
-          success: false,
-          message:
-            "You do not have permission to add bookings to this travel plan",
-        });
-      }
+      if (!canEdit) return forbidden(res, "You do not have permission to add bookings to this travel plan");
 
-      // Validate times
-      const pickupTime = new Date(bookingData.pickupTime);
-      const estimatedArrival = bookingData.estimatedArrival
-        ? new Date(bookingData.estimatedArrival)
-        : null;
+      const pickup   = new Date(pickupTime);
+      const arrival  = estimatedArrival ? new Date(estimatedArrival) : null;
 
-      if (estimatedArrival && estimatedArrival <= pickupTime) {
-        return res.status(400).json({
-          success: false,
-          message: "Estimated arrival must be after pickup time",
-        });
-      }
+      if (isNaN(pickup.getTime())) return badRequest(res, "Invalid pickup time");
+      if (arrival && arrival <= pickup) return badRequest(res, "Estimated arrival must be after pickup time");
 
-      // Verify vehicle availability if specified
-      if (bookingData.vehicleId) {
-        const conflictingBookings = await prisma.transportationBooking.findMany(
-          {
-            where: {
-              vehicleId: bookingData.vehicleId,
-              status: { in: ["BOOKED", "CONFIRMED", "ON_THE_WAY"] },
-              OR: [
-                {
-                  AND: [
-                    { pickupTime: { lte: estimatedArrival || pickupTime } },
-                    { estimatedArrival: { gte: pickupTime } },
-                  ],
-                },
-              ],
-            },
+      // Validate provider and vehicle concurrently
+      const [provider, vehicle] = await Promise.all([
+        providerId ? prisma.transportationProvider.findUnique({
+          where:  { id: providerId },
+          select: { id: true, isAvailable: true },
+        }) : null,
+        vehicleId ? prisma.transportationVehicle.findUnique({
+          where:  { id: vehicleId },
+          select: { id: true, isAvailable: true, vehicleType: true, vehicleNumber: true, driverName: true, driverContact: true },
+        }) : null,
+      ]);
+
+      if (providerId && !provider) return notFound(res, "Transportation provider not found");
+      if (provider && !provider.isAvailable) return badRequest(res, "Provider is not currently available");
+
+      if (vehicleId) {
+        if (!vehicle) return notFound(res, "Vehicle not found");
+        if (!vehicle.isAvailable) return badRequest(res, "Vehicle is not currently available");
+
+        // Time-overlap conflict check
+        const conflictCount = await prisma.transportationBooking.count({
+          where: {
+            vehicleId,
+            status: { in: ACTIVE_BOOKING_STATUSES },
+            AND: [
+              { pickupTime:       { lt: arrival ?? pickup } },
+              { estimatedArrival: { gt: pickup } },
+            ],
           },
-        );
+        });
 
-        if (conflictingBookings.length > 0) {
-          return res.status(409).json({
-            success: false,
-            message: "Vehicle is not available for the selected time slot",
-          });
+        if (conflictCount > 0) {
+          return res.status(409).json({ success: false, message: "Vehicle is not available for the selected time slot" });
         }
       }
 
-      // Create booking
       const booking = await prisma.transportationBooking.create({
         data: {
-          ...bookingData,
           travelPlanId,
+          ...(providerId          !== undefined && { providerId }),
+          ...(vehicleId           !== undefined && { vehicleId }),
+          serviceType,
+          pickupLocation,
+          dropoffLocation,
+          pickupTime:             pickup,
+          ...(arrival             && { estimatedArrival: arrival }),
+          numberOfPassengers:     numberOfPassengers ?? 1,
+          ...(specialRequests     !== undefined && { specialRequests }),
+          ...(estimatedFare       !== undefined && { estimatedFare }),
+          ...(paymentMethod       !== undefined && { paymentMethod }),
+          // Stamp snapshot fields from live vehicle record at booking time
+          ...(vehicle && {
+            snapshotVehicleType:    vehicle.vehicleType,
+            snapshotVehicleNumber:  vehicle.vehicleNumber,
+            snapshotDriverName:     vehicle.driverName,
+            snapshotDriverContact:  vehicle.driverContact,
+          }),
         },
-        include: {
-          provider: true,
-          vehicle: true,
-        },
+        include: { provider: true, vehicle: true },
       });
 
-      // Set up OpenFGA relations
-      if (openfgaService.createTransportationBookingRelations) {
-        await openfgaService.createTransportationBookingRelations(
-          req.user.id,
-          booking.id,
-          travelPlanId,
-        );
-      }
-
-      // Invalidate caches
-      await Promise.all([
+      Promise.allSettled([
+        openfgaService.createTransportationBookingRelations(req.user.id, booking.id, travelPlanId),
         redisService.client?.del(`travelplan:${travelPlanId}`),
-        redisService.client?.del(
-          `transportation:provider:${booking.providerId}`,
-        ),
+        providerId && redisService.client?.del(`transportation:provider:${providerId}`),
       ]);
 
-      res.status(201).json({
+      return res.status(201).json({
         success: true,
         data: booking,
         message: "Transportation booking created successfully",
@@ -1453,8 +1149,8 @@ class TransportationController {
   }
 
   /**
-   * Get booking by ID
    * GET /api/transportation/bookings/:bookingId
+   * FIX: existence check before permission check
    */
   async getBookingById(req, res, next) {
     try {
@@ -1463,111 +1159,176 @@ class TransportationController {
       const booking = await prisma.transportationBooking.findUnique({
         where: { id: bookingId },
         include: {
-          provider: true,
-          vehicle: true,
-          travelPlan: {
-            select: {
-              id: true,
-              title: true,
-              userId: true,
-            },
-          },
+          provider:   true,
+          vehicle:    true,
+          travelPlan: { select: { id: true, title: true, userId: true } },
         },
       });
 
-      if (!booking) {
-        return res.status(404).json({
-          success: false,
-          message: "Booking not found",
-        });
-      }
+      if (!booking) return notFound(res, "Booking not found");
 
-      // Check permission via OpenFGA
       const canView =
-        (await openfgaService.canViewTransportationBooking?.(
-          req.user.id,
-          bookingId,
-        )) || false;
+        req.user.isSuperAdmin ||
+        !!(await openfgaService.canViewTransportationBooking?.(req.user.id, bookingId).catch(() => false));
 
-      if (!canView && !req.user.isSuperAdmin) {
-        return res.status(403).json({
-          success: false,
-          message: "You do not have permission to view this booking",
-        });
-      }
+      if (!canView) return forbidden(res, "You do not have permission to view this booking");
 
-      res.json({
-        success: true,
-        data: booking,
-      });
+      return res.json({ success: true, data: booking });
     } catch (error) {
       next(error);
     }
   }
 
   /**
-   * Update booking
    * PUT /api/transportation/bookings/:bookingId
+   * FIX: existence check before permission check; sparse update replaces `req.body` pass-through
    */
   async updateBooking(req, res, next) {
     try {
       const { bookingId } = req.params;
 
-      // Check permission via OpenFGA
-      const canEdit =
-        (await openfgaService.canEditTransportationBooking?.(
-          req.user.id,
-          bookingId,
-        )) || false;
-
-      if (!canEdit && !req.user.isSuperAdmin) {
-        return res.status(403).json({
-          success: false,
-          message: "You do not have permission to update this booking",
-        });
-      }
-
       const booking = await prisma.transportationBooking.findUnique({
-        where: { id: bookingId },
-        include: { travelPlan: true },
+        where:  { id: bookingId },
+        select: { status: true, travelPlanId: true, providerId: true },
       });
 
-      if (!booking) {
-        return res.status(404).json({
-          success: false,
-          message: "Booking not found",
-        });
+      if (!booking) return notFound(res, "Booking not found");
+
+      if (TERMINAL_BOOKING_STATUSES.includes(booking.status)) {
+        return badRequest(res, `Cannot update booking with status: ${booking.status}`);
       }
 
-      // Don't allow updates to completed or cancelled bookings
-      if (["COMPLETED", "CANCELLED"].includes(booking.status)) {
-        return res.status(400).json({
-          success: false,
-          message: `Cannot update booking with status: ${booking.status}`,
-        });
-      }
+      const canEdit =
+        req.user.isSuperAdmin ||
+        !!(await openfgaService.canEditTransportationBooking?.(req.user.id, bookingId).catch(() => false));
 
-      const updatedBooking = await prisma.transportationBooking.update({
+      if (!canEdit) return forbidden(res, "You do not have permission to update this booking");
+
+      const {
+        pickupLocation, dropoffLocation, pickupTime, estimatedArrival,
+        numberOfPassengers, specialRequests, status, paymentMethod, paymentStatus,
+      } = req.body;
+
+      const updated = await prisma.transportationBooking.update({
         where: { id: bookingId },
-        data: req.body,
-        include: {
-          provider: true,
-          vehicle: true,
+        data: {
+          ...(pickupLocation     !== undefined && { pickupLocation }),
+          ...(dropoffLocation    !== undefined && { dropoffLocation }),
+          ...(pickupTime         !== undefined && { pickupTime:       new Date(pickupTime) }),
+          ...(estimatedArrival   !== undefined && { estimatedArrival: new Date(estimatedArrival) }),
+          ...(numberOfPassengers !== undefined && { numberOfPassengers }),
+          ...(specialRequests    !== undefined && { specialRequests }),
+          ...(status             !== undefined && { status }),
+          ...(paymentMethod      !== undefined && { paymentMethod }),
+          ...(paymentStatus      !== undefined && { paymentStatus }),
+        },
+        include: { provider: true, vehicle: true },
+      });
+
+      Promise.allSettled([
+        redisService.client?.del(`travelplan:${booking.travelPlanId}`),
+        booking.providerId && redisService.client?.del(`transportation:provider:${booking.providerId}`),
+      ]);
+
+      return res.json({ success: true, data: updated, message: "Booking updated successfully" });
+    } catch (error) {
+      next(error);
+    }
+  }
+
+  /**
+   * DELETE /api/transportation/bookings/:bookingId
+   * BUG FIX: original set `isPaid: false` — no such field on TransportationBooking schema.
+   * Removed. Also added already-cancelled guard.
+   */
+  async cancelBooking(req, res, next) {
+    try {
+      const { bookingId } = req.params;
+
+      const booking = await prisma.transportationBooking.findUnique({
+        where:  { id: bookingId },
+        select: { status: true, paymentStatus: true, travelPlanId: true, providerId: true },
+      });
+
+      if (!booking) return notFound(res, "Booking not found");
+      if (booking.status === "CANCELLED") return badRequest(res, "Booking is already cancelled");
+      if (booking.status === "COMPLETED") return badRequest(res, "Cannot cancel a completed booking");
+
+      const canCancel =
+        req.user.isSuperAdmin ||
+        !!(await openfgaService.canCancelTransportationBooking?.(req.user.id, bookingId).catch(() => false));
+
+      if (!canCancel) return forbidden(res, "You do not have permission to cancel this booking");
+
+      const cancelled = await prisma.transportationBooking.update({
+        where: { id: bookingId },
+        data: {
+          status:        "CANCELLED",
+          paymentStatus: booking.paymentStatus === "PAID" ? "REFUNDED" : booking.paymentStatus,
         },
       });
 
-      // Invalidate caches
-      await Promise.all([
+      Promise.allSettled([
         redisService.client?.del(`travelplan:${booking.travelPlanId}`),
-        redisService.client?.del(
-          `transportation:provider:${booking.providerId}`,
-        ),
+        booking.providerId && redisService.client?.del(`transportation:provider:${booking.providerId}`),
       ]);
 
-      res.json({
+      return res.json({ success: true, data: cancelled, message: "Booking cancelled successfully" });
+    } catch (error) {
+      next(error);
+    }
+  }
+
+  // ==================== SUPERADMIN ENDPOINTS ====================
+
+  /**
+   * GET /api/admin/transportation/providers  [NEW]
+   * SuperAdmin — full listing with vendor/status/feature filters
+   */
+  async adminGetAllProviders(req, res, next) {
+    try {
+      const {
+        vendorId, isAvailable, isVerified, isFeatured,
+        providerType, search, sortBy = "createdAt", sortOrder = "desc",
+      } = req.query;
+      const { page, limit, skip } = parsePagination(req.query, 20);
+
+      const safeSortBy    = ALLOWED_SORT_FIELDS.has(sortBy) ? sortBy : "createdAt";
+      const safeSortOrder = sortOrder === "asc" ? "asc" : "desc";
+
+      const AND = [];
+      if (vendorId)      AND.push({ vendorId });
+      if (providerType)  AND.push({ providerType });
+      if (isAvailable !== undefined) AND.push({ isAvailable: isAvailable === "true" });
+      if (isVerified  !== undefined) AND.push({ isVerified:  isVerified  === "true" });
+      if (isFeatured  !== undefined) AND.push({ isFeatured:  isFeatured  === "true" });
+      if (search) AND.push({
+        OR: [
+          { name:        { contains: search, mode: "insensitive" } },
+          { description: { contains: search, mode: "insensitive" } },
+        ],
+      });
+
+      const where = AND.length ? { AND } : {};
+
+      const [providers, total] = await Promise.all([
+        prisma.transportationProvider.findMany({
+          where,
+          include: {
+            vendor: { select: { id: true, businessName: true, businessEmail: true } },
+            _count: { select: { vehicles: true, bookings: true } },
+          },
+          skip,
+          take:     limit,
+          orderBy:  { [safeSortBy]: safeSortOrder },
+        }),
+        prisma.transportationProvider.count({ where }),
+      ]);
+
+      return res.json({
         success: true,
-        data: updatedBooking,
-        message: "Booking updated successfully",
+        data: providers,
+        pagination: buildPaginationMeta(page, limit, total),
       });
     } catch (error) {
       next(error);
@@ -1575,62 +1336,151 @@ class TransportationController {
   }
 
   /**
-   * Cancel booking
-   * DELETE /api/transportation/bookings/:bookingId
+   * PATCH /api/admin/transportation/providers/:id/verify  [NEW]
    */
-  async cancelBooking(req, res, next) {
+  async verifyProvider(req, res, next) {
     try {
-      const { bookingId } = req.params;
+      const { id } = req.params;
+      const { isVerified } = req.body;
 
-      // Check permission via OpenFGA
-      const canCancel =
-        (await openfgaService.canCancelTransportationBooking?.(
-          req.user.id,
-          bookingId,
-        )) || false;
+      if (typeof isVerified !== "boolean") return badRequest(res, "isVerified must be a boolean");
 
-      if (!canCancel && !req.user.isSuperAdmin) {
-        return res.status(403).json({
-          success: false,
-          message: "You do not have permission to cancel this booking",
-        });
-      }
+      const existing = await prisma.transportationProvider.findUnique({ where: { id }, select: { id: true } });
+      if (!existing) return notFound(res, "Provider not found");
 
-      const booking = await prisma.transportationBooking.findUnique({
-        where: { id: bookingId },
-        include: { travelPlan: true },
+      const provider = await prisma.transportationProvider.update({
+        where:  { id },
+        data:   { isVerified },
+        select: { id: true, name: true, isVerified: true },
       });
 
-      if (!booking) {
-        return res.status(404).json({
-          success: false,
-          message: "Booking not found",
+      invalidateProviderCache(id);
+
+      return res.json({
+        success: true,
+        data: provider,
+        message: `Provider ${isVerified ? "verified" : "unverified"} successfully`,
+      });
+    } catch (error) {
+      next(error);
+    }
+  }
+
+  /**
+   * PATCH /api/admin/transportation/providers/:id/feature  [NEW]
+   */
+  async featureProvider(req, res, next) {
+    try {
+      const { id } = req.params;
+      const { isFeatured, featuredUntil } = req.body;
+
+      if (typeof isFeatured !== "boolean") return badRequest(res, "isFeatured must be a boolean");
+
+      const existing = await prisma.transportationProvider.findUnique({ where: { id }, select: { id: true } });
+      if (!existing) return notFound(res, "Provider not found");
+
+      const provider = await prisma.transportationProvider.update({
+        where:  { id },
+        data: {
+          isFeatured,
+          featuredUntil: isFeatured && featuredUntil ? new Date(featuredUntil) : null,
+        },
+        select: { id: true, name: true, isFeatured: true, featuredUntil: true },
+      });
+
+      invalidateProviderCache(id);
+
+      return res.json({
+        success: true,
+        data: provider,
+        message: `Provider ${isFeatured ? "featured" : "unfeatured"} successfully`,
+      });
+    } catch (error) {
+      next(error);
+    }
+  }
+
+  /**
+   * GET /api/admin/transportation/bookings  [NEW]
+   * SuperAdmin — all bookings with date/status/provider filters
+   */
+  async adminGetAllBookings(req, res, next) {
+    try {
+      const { status, providerId, vehicleId, from, to } = req.query;
+      const { page, limit, skip } = parsePagination(req.query, 20);
+
+      const AND = [];
+      if (status)     AND.push({ status });
+      if (providerId) AND.push({ providerId });
+      if (vehicleId)  AND.push({ vehicleId });
+      if (from || to) {
+        AND.push({
+          createdAt: {
+            ...(from && { gte: new Date(from) }),
+            ...(to   && { lte: new Date(to) }),
+          },
         });
       }
 
-      // Update booking status to cancelled
-      const cancelledBooking = await prisma.transportationBooking.update({
+      const where = AND.length ? { AND } : {};
+
+      const [bookings, total] = await Promise.all([
+        prisma.transportationBooking.findMany({
+          where,
+          include: {
+            provider:   { select: { id: true, name: true } },
+            vehicle:    { select: { id: true, vehicleNumber: true, vehicleType: true } },
+            travelPlan: { select: { id: true, title: true, userId: true } },
+          },
+          orderBy: { createdAt: "desc" },
+          skip,
+          take: limit,
+        }),
+        prisma.transportationBooking.count({ where }),
+      ]);
+
+      return res.json({
+        success: true,
+        data: bookings,
+        pagination: buildPaginationMeta(page, limit, total),
+      });
+    } catch (error) {
+      next(error);
+    }
+  }
+
+  /**
+   * PATCH /api/admin/transportation/bookings/:bookingId/status  [NEW]
+   * SuperAdmin — force any booking status (dispute resolution, ops override)
+   */
+  async adminUpdateBookingStatus(req, res, next) {
+    try {
+      const { bookingId } = req.params;
+      const { status, notes } = req.body;
+
+      const booking = await prisma.transportationBooking.findUnique({
+        where:  { id: bookingId },
+        select: { id: true, travelPlanId: true, providerId: true },
+      });
+      if (!booking) return notFound(res, "Booking not found");
+
+      const updated = await prisma.transportationBooking.update({
         where: { id: bookingId },
         data: {
-          status: "CANCELLED",
-          isPaid: false,
-          paymentStatus:
-            booking.paymentStatus === "PAID" ? "REFUNDED" : "PENDING",
+          status,
+          ...(notes && { aiNotes: notes }),
         },
       });
 
-      // Invalidate caches
-      await Promise.all([
+      Promise.allSettled([
         redisService.client?.del(`travelplan:${booking.travelPlanId}`),
-        redisService.client?.del(
-          `transportation:provider:${booking.providerId}`,
-        ),
+        booking.providerId && redisService.client?.del(`transportation:provider:${booking.providerId}`),
       ]);
 
-      res.json({
+      return res.json({
         success: true,
-        data: cancelledBooking,
-        message: "Booking cancelled successfully",
+        data: updated,
+        message: `Booking status updated to ${status}`,
       });
     } catch (error) {
       next(error);
